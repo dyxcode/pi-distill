@@ -5,6 +5,11 @@
   "description": "Adaptive memory and context for Pi.",
   "license": "UNLICENSED",
   "type": "module",
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
   "engines": {
     "node": ">=22.19.0"
   },
@@ -13,6 +18,10 @@
     "check": "npm run typecheck"
   },
   "devDependencies": {
+    "@earendil-works/pi-coding-agent": "1.3.0",
     "typescript": "5.9.3"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
   }
 }

@@ -7,7 +7,8 @@ coverage/
 
 # Credentials and local agent state
 /AGENTS.md
-/agent-local/
+/agent-docs/
+/tests/
 .env
 .env.*
 !.env.example

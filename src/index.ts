@@ -1,2 +1,3 @@
-// Repository scaffold only. Add the Pi adapter after checking the target API.
-export {};
+export default function piDistill(): void {
+  // Pi handles loading and display. Memory behavior will be added incrementally.
+}
