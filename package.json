@@ -1,0 +1,18 @@
+{
+  "name": "pi-distill",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Adaptive memory and context for Pi.",
+  "license": "UNLICENSED",
+  "type": "module",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "check": "npm run typecheck"
+  },
+  "devDependencies": {
+    "typescript": "5.9.3"
+  }
+}

@@ -1,0 +1,58 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="930" viewBox="0 0 1600 930">
+<rect width="1600" height="930" fill="#f6f8fb"/>
+<text x="60" y="88.8" font-family="Arial,sans-serif" font-size="48" font-weight="700" fill="#163c40">pi-distill</text>
+<text x="62" y="132.25" font-family="Arial,sans-serif" font-size="25" font-weight="400" fill="#465569">Adaptive memory and context for Pi.</text>
+<text x="62" y="200.9" font-family="Arial,sans-serif" font-size="14" font-weight="700" fill="#64748b">INTENDED WORKFLOW</text>
+<rect x="60" y="240" width="300" height="170" rx="18" fill="#ffffff" stroke="#d9e1ec"/>
+<text x="84" y="287.25" font-family="Arial,sans-serif" font-size="25" font-weight="700" fill="#23354b">Conversations</text>
+<text x="84" y="333.15" font-family="Arial,sans-serif" font-size="19" font-weight="400" fill="#465569">Mixed topics, fresh sessions</text>
+<text x="84" y="362.15" font-family="Arial,sans-serif" font-size="19" font-weight="400" fill="#465569">Including compacted history</text>
+<rect x="440" y="240" width="300" height="170" rx="18" fill="#ffffff" stroke="#d9e1ec"/>
+<text x="464" y="287.25" font-family="Arial,sans-serif" font-size="25" font-weight="700" fill="#23354b">Distill</text>
+<text x="464" y="333.15" font-family="Arial,sans-serif" font-size="19" font-weight="400" fill="#465569">Decisions, lessons, tasks</text>
+<text x="464" y="362.15" font-family="Arial,sans-serif" font-size="19" font-weight="400" fill="#465569">and stable preferences</text>
+<rect x="820" y="240" width="300" height="170" rx="18" fill="#e3f3ee" stroke="#9bcdbd"/>
+<text x="844" y="287.25" font-family="Arial,sans-serif" font-size="25" font-weight="700" fill="#155f50">Managed memory</text>
+<text x="844" y="333.15" font-family="Arial,sans-serif" font-size="19" font-weight="400" fill="#465569">Retain useful knowledge</text>
+<text x="844" y="362.15" font-family="Arial,sans-serif" font-size="19" font-weight="400" fill="#465569">Update, correct, or forget</text>
+<rect x="1200" y="240" width="300" height="170" rx="18" fill="#ffffff" stroke="#d9e1ec"/>
+<text x="1224" y="287.25" font-family="Arial,sans-serif" font-size="25" font-weight="700" fill="#23354b">Memory inspector</text>
+<text x="1224" y="333.15" font-family="Arial,sans-serif" font-size="19" font-weight="400" fill="#465569">What was used and why</text>
+<text x="1224" y="362.15" font-family="Arial,sans-serif" font-size="19" font-weight="400" fill="#465569">Extraction and update dates</text>
+<polyline points="365,325 430,325" fill="none" stroke="#7c8ca3" stroke-width="3"/>
+<polygon points="430,325 418.0,319.0 418.0,331.0" fill="#7c8ca3"/>
+<polyline points="745,325 810,325" fill="none" stroke="#7c8ca3" stroke-width="3"/>
+<polygon points="810,325 798.0,319.0 798.0,331.0" fill="#7c8ca3"/>
+<polyline points="1125,325 1190,325" fill="none" stroke="#7c8ca3" stroke-width="3"/>
+<polygon points="1190,325 1178.0,319.0 1178.0,331.0" fill="#7c8ca3"/>
+<rect x="60" y="620" width="300" height="170" rx="18" fill="#fff3e7" stroke="#e3c9aa"/>
+<text x="84" y="667.25" font-family="Arial,sans-serif" font-size="25" font-weight="700" fill="#80512a">Delete chat history</text>
+<text x="84" y="713.15" font-family="Arial,sans-serif" font-size="19" font-weight="400" fill="#465569">Remove managed raw copies</text>
+<text x="84" y="742.15" font-family="Arial,sans-serif" font-size="19" font-weight="400" fill="#465569">Keep distilled memories</text>
+<rect x="440" y="620" width="300" height="170" rx="18" fill="#ffffff" stroke="#d9e1ec"/>
+<text x="464" y="667.25" font-family="Arial,sans-serif" font-size="25" font-weight="700" fill="#23354b">New input</text>
+<text x="464" y="713.15" font-family="Arial,sans-serif" font-size="19" font-weight="400" fill="#465569">Current message</text>
+<text x="464" y="742.15" font-family="Arial,sans-serif" font-size="19" font-weight="400" fill="#465569">and recent conversation</text>
+<rect x="820" y="620" width="300" height="170" rx="18" fill="#e3f3ee" stroke="#9bcdbd"/>
+<text x="844" y="667.25" font-family="Arial,sans-serif" font-size="25" font-weight="700" fill="#155f50">Relevant context</text>
+<text x="844" y="713.15" font-family="Arial,sans-serif" font-size="19" font-weight="400" fill="#465569">Select useful memories</text>
+<text x="844" y="742.15" font-family="Arial,sans-serif" font-size="19" font-weight="400" fill="#465569">within size and time limits</text>
+<rect x="1200" y="620" width="300" height="170" rx="18" fill="#ffffff" stroke="#d9e1ec"/>
+<text x="1224" y="667.25" font-family="Arial,sans-serif" font-size="25" font-weight="700" fill="#23354b">Pi responds</text>
+<text x="1224" y="713.15" font-family="Arial,sans-serif" font-size="19" font-weight="400" fill="#465569">Continue with useful</text>
+<text x="1224" y="742.15" font-family="Arial,sans-serif" font-size="19" font-weight="400" fill="#465569">background available</text>
+<polyline points="970,416 970,610" fill="none" stroke="#287c66" stroke-width="3"/>
+<polygon points="970,610 976.0,598.0 964.0,598.0" fill="#287c66"/>
+<text x="991" y="522.3" font-family="Arial,sans-serif" font-size="18" font-weight="400" fill="#287c66">Retrieve</text>
+<polyline points="745,705 810,705" fill="none" stroke="#7c8ca3" stroke-width="3"/>
+<polygon points="810,705 798.0,699.0 798.0,711.0" fill="#7c8ca3"/>
+<polyline points="1125,705 1190,705" fill="none" stroke="#7c8ca3" stroke-width="3"/>
+<polygon points="1190,705 1178.0,699.0 1178.0,711.0" fill="#7c8ca3"/>
+<polyline points="210,416 210,451" fill="none" stroke="#b78b59" stroke-width="3" stroke-dasharray="9 9"/>
+<polyline points="210,566 210,610" fill="none" stroke="#b78b59" stroke-width="3" stroke-dasharray="9 9"/>
+<polygon points="210,610 216.0,598.0 204.0,598.0" fill="#b78b59"/>
+<text x="74" y="481.45" font-family="Arial,sans-serif" font-size="17" font-weight="400" fill="#80512a">Only after durable processing,</text>
+<text x="74" y="508.45" font-family="Arial,sans-serif" font-size="17" font-weight="400" fill="#80512a">inactivity checks, and an</text>
+<text x="74" y="535.45" font-family="Arial,sans-serif" font-size="17" font-weight="400" fill="#80512a">explicit deletion policy.</text>
+<text x="60" y="866.15" font-family="Arial,sans-serif" font-size="19" font-weight="400" fill="#526276">Local memory  /  No permanent chat archive  /  User-controlled correction and forgetting</text>
+</svg>
