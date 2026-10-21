@@ -1,7 +1,9 @@
 import { getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { existsSync } from "node:fs";
 import { MemoryTools } from "./memory-tools.js";
-import { openMemoryStore } from "./memory-path.js";
+import { openMemoryStore, resolveMemoryDatabasePath } from "./memory-path.js";
+import { ConsolidationCoordinator } from "./consolidation.ts";
 
 const searchParameters = Type.Object({
   terms: Type.Array(Type.String({ minLength: 1, maxLength: 128 }), {
@@ -34,6 +36,10 @@ const searchGuidelines = [
 
 export default function piDistill(pi: ExtensionAPI): void {
   const memoryTools = new MemoryTools(() => openMemoryStore(getAgentDir()));
+  const consolidation = new ConsolidationCoordinator({
+    openStore: () => openMemoryStore(getAgentDir()),
+    hasStore: () => existsSync(resolveMemoryDatabasePath(getAgentDir())),
+  });
 
   pi.registerTool({
     name: "memory_search",
@@ -67,5 +73,14 @@ export default function piDistill(pi: ExtensionAPI): void {
   });
 
   pi.on("agent_start", () => memoryTools.reset());
-  pi.on("session_shutdown", () => memoryTools.close());
+  pi.on("session_start", (_event, ctx) => consolidation.start(ctx));
+  pi.on("message_end", (_event, ctx) => consolidation.observe(ctx));
+  pi.on("agent_end", (_event, ctx) => consolidation.observe(ctx));
+  pi.on("session_before_compact", (_event, ctx) => consolidation.beforeCompact(ctx));
+  pi.on("session_compact", (_event, ctx) => consolidation.afterCompact(ctx));
+  pi.on("session_compact_failed", () => consolidation.compactFailed());
+  pi.on("session_shutdown", async (event, ctx) => {
+    await consolidation.shutdown(ctx, event.reason);
+    memoryTools.close();
+  });
 }
