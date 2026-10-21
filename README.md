@@ -4,18 +4,18 @@ English | [简体中文](docs/i18n/README.zh-CN.md)
 
 **Adaptive memory and context for Pi.**
 
-pi-distill is a planned extension for [Pi](https://github.com/earendil-works/pi), designed to carry useful knowledge across conversations. Start a fresh session, talk naturally, and continue with relevant background already available.
+pi-distill is an extension for [Pi](https://github.com/earendil-works/pi) that brings memory into everyday conversations.
 
-![pi-distill workflow: conversations become memories, which supply relevant context to Pi; chat history can be deleted after processing and policy checks.](docs/assets/pi-distill-workflow.svg)
+![Conversations become memories that supply context to future Pi sessions.](docs/assets/pi-distill-workflow.svg)
 
-## Intended experience
+## Vision
 
-Conversations can cover multiple topics. There is no need to name sessions, organize them by project, or manually request a memory search.
+Start a fresh session and move freely between topics and projects. Pi brings useful knowledge from earlier conversations into the work at hand.
 
 pi-distill aims to:
 
 - **Remember useful knowledge:** distill decisions, lessons, preferences, and task state from conversations, including history that has been compacted.
-- **Bring back relevant context:** use the current message and recent conversation to select helpful memories before Pi answers, within context and latency limits.
+- **Bring back relevant context:** use the current message and recent conversation to bring back helpful memories.
 - **Keep memory current:** incorporate corrections, replace outdated conclusions, resolve duplicates, and distinguish completed, paused, and unresolved work.
 - **Make memory understandable:** explain which memories were used, why they were selected, and when they were extracted or updated. Let users inspect, correct, and forget them.
 - **Let chats go:** delete chat history while retaining distilled memories and the metadata needed to manage them.
@@ -32,19 +32,26 @@ Conversations --> Distill --> Memories
       |                    - Why was it selected?
       v
 Delete chat history
-(after durable processing,
- inactivity checks, and explicit policy)
 ```
 
-## Memory without a chat archive
+### Keep the knowledge, let the chats go
 
-The goal is to retain useful knowledge after removing the conversations it came from. Chat deletion should also remove managed raw copies, excerpts, and full-conversation summaries.
+Distilled memories carry useful knowledge after the original conversations are deleted. Chat cleanup follows your retention policy, removing the original chats and managed copies after processing is complete and the sessions are inactive.
 
-Deletion requires durable processing and an explicit policy that protects sessions still in use. After deletion, the original chats are unavailable for verification, making memory inspection and correction essential.
+### Design principles
 
-## Design principles
+- Store and manage memory locally.
+- Apply memories in the context of the current request.
+- Preserve conditions, uncertainty, and alternative conversation branches.
 
-- Keep memory storage and management local.
-- Give current user instructions priority over remembered preferences.
-- Preserve uncertainty and distinguish alternative conversation branches.
-- Keep ordinary Pi conversation usable when memory retrieval or consolidation fails.
+## Available today
+
+- Pi extension loading and reload through Pi's normal extension system.
+- A local SQLite store for saving, reading, correcting, and forgetting memories.
+- Agentic memory search through `memory_search` and `memory_read`.
+
+### Agentic memory search
+
+Pi's current model can choose search terms, try alternate expressions and languages, inspect candidates, and read their current content before judging applicability. SQLite performs literal matching across the personal memory store. Memories remain searchable across projects, with their original context available for interpretation.
+
+Search results include original text previews, with pagination and full reads for further exploration. See [Agentic memory search](docs/agentic-search.md) for the tool contracts and retrieval behavior.
