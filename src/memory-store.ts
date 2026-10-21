@@ -29,6 +29,11 @@ export interface MemoryUpdate {
   readonly updatedAt: string;
 }
 
+export interface MemoryForget {
+  readonly id: string;
+  readonly expectedRevision: number;
+}
+
 export class MemoryConflictError extends Error {
   readonly memoryId: string;
 
@@ -119,11 +124,19 @@ function parseUpdate(value: unknown): MemoryUpdate {
   return { id, expectedRevision, content, updatedAt };
 }
 
+function parseForget(value: unknown): MemoryForget {
+  const { id, expectedRevision } = fields(value, ["id", "expectedRevision"]);
+  validateText(id, "ID");
+  validateRevision(expectedRevision);
+  return { id, expectedRevision };
+}
+
 export class SQLiteMemoryStore {
   readonly #database: DatabaseSync;
   readonly #select: StatementSync;
   readonly #insert: StatementSync;
   readonly #update: StatementSync;
+  readonly #delete: StatementSync;
 
   constructor(path: string) {
     if (typeof path !== "string" || !isAbsolute(path)) {
@@ -146,6 +159,7 @@ export class SQLiteMemoryStore {
       this.#update = this.#database.prepare(
         "UPDATE memories SET content = ?, revision = ?, updated_at = ? WHERE id = ?",
       );
+      this.#delete = this.#database.prepare("DELETE FROM memories WHERE id = ?");
     } catch (error) {
       this.#database.close();
       throw error;
@@ -194,6 +208,19 @@ export class SQLiteMemoryStore {
       };
       this.#update.run(result.content, result.revision, result.updatedAt, result.id);
       return result;
+    });
+  }
+
+  forget(forget: MemoryForget): void {
+    this.#ensureOpen();
+    const request = parseForget(forget);
+    this.#transaction(() => {
+      const current = this.get(request.id);
+      if (current === undefined) return;
+      if (current.revision !== request.expectedRevision) {
+        throw new MemoryConflictError(request.id);
+      }
+      this.#delete.run(request.id);
     });
   }
 
