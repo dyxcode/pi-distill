@@ -10,6 +10,7 @@ const currentSchema = `CREATE TABLE memories (${initialColumns},
   revision INTEGER NOT NULL,
   updated_at TEXT NOT NULL
 ) STRICT`;
+const maxSearchBatchSize = 128;
 
 export interface MemoryInput {
   readonly id: string;
@@ -32,6 +33,18 @@ export interface MemoryUpdate {
 export interface MemoryForget {
   readonly id: string;
   readonly expectedRevision: number;
+}
+
+export interface MemorySearchRequest {
+  readonly terms: readonly string[];
+  readonly match: "any" | "all";
+  readonly after?: string;
+  readonly limit?: number;
+}
+
+export interface MemorySearchRow {
+  readonly memory: Memory;
+  readonly matchedTerms: readonly string[];
 }
 
 export class MemoryConflictError extends Error {
@@ -129,6 +142,66 @@ function parseForget(value: unknown): MemoryForget {
   validateText(id, "ID");
   validateRevision(expectedRevision);
   return { id, expectedRevision };
+}
+
+function validateSearchTerm(value: unknown, index: number): asserts value is string {
+  if (typeof value !== "string" || value.trim().length === 0) {
+    throw new TypeError(`Memory search term ${index + 1} must be a nonempty string.`);
+  }
+  if (/[\uD800-\uDFFF]/u.test(value)) {
+    throw new TypeError(`Memory search term ${index + 1} must contain well-formed Unicode.`);
+  }
+  if ([...value].length > 128) {
+    throw new TypeError(`Memory search term ${index + 1} must not exceed 128 Unicode code points.`);
+  }
+}
+
+function parseSearchRequest(value: unknown): MemorySearchRequest {
+  const allowedFields: readonly string[] = ["terms", "match", "after", "limit"];
+  if (
+    !isRecord(value) ||
+    Reflect.ownKeys(value).some((key) => typeof key !== "string" || !allowedFields.includes(key)) ||
+    !Object.hasOwn(value, "terms") || !Object.hasOwn(value, "match")
+  ) {
+    throw new TypeError("Memory search requires terms and match, with optional after and limit fields.");
+  }
+
+  const rawTerms = value["terms"];
+  if (!Array.isArray(rawTerms) || rawTerms.length < 1 || rawTerms.length > 8) {
+    throw new TypeError("Memory search requires between 1 and 8 terms.");
+  }
+  const terms: string[] = [];
+  for (let index = 0; index < rawTerms.length; index += 1) {
+    const term: unknown = rawTerms[index];
+    validateSearchTerm(term, index);
+    terms.push(term);
+  }
+
+  const match = value["match"];
+  if (match !== "any" && match !== "all") {
+    throw new TypeError('Memory search match must be "any" or "all".');
+  }
+
+  const parsed: { terms: readonly string[]; match: "any" | "all"; after?: string; limit?: number } = {
+    terms,
+    match,
+  };
+  if (Object.hasOwn(value, "after")) {
+    const after = value["after"];
+    validateText(after, "search cursor ID");
+    parsed.after = after;
+  }
+  if (Object.hasOwn(value, "limit")) {
+    const limit = value["limit"];
+    if (
+      typeof limit !== "number" || !Number.isSafeInteger(limit) ||
+      limit < 1 || limit > maxSearchBatchSize
+    ) {
+      throw new TypeError("Memory search limit must be an integer from 1 to 128.");
+    }
+    parsed.limit = limit;
+  }
+  return parsed;
 }
 
 export class SQLiteMemoryStore {
@@ -229,6 +302,54 @@ export class SQLiteMemoryStore {
     validateText(id, "ID");
     const row = this.#select.get(id);
     return row === undefined ? undefined : parseMemory(row);
+  }
+
+  searchBatch(request: MemorySearchRequest): readonly MemorySearchRow[] {
+    this.#ensureOpen();
+    const search = parseSearchRequest(request);
+    const limit = search.limit ?? maxSearchBatchSize;
+    const afterClause = search.after === undefined ? "" : "WHERE id COLLATE BINARY > ?";
+    const matchedTermColumns = search.terms.map((_, index) =>
+      `CASE WHEN instr(lower(content), lower(?)) > 0 THEN 1 ELSE 0 END AS matched_${index}`,
+    ).join(",\n       ");
+    const statement = this.#database.prepare(`
+      WITH examined AS (
+        SELECT id, content, created_at AS createdAt, revision, updated_at AS updatedAt
+        FROM memories
+        ${afterClause}
+        ORDER BY id COLLATE BINARY
+        LIMIT ?
+      )
+      SELECT id, content, createdAt, revision, updatedAt,
+        ${matchedTermColumns}
+      FROM examined
+      ORDER BY id COLLATE BINARY
+    `);
+    const parameters: (string | number)[] = [];
+    if (search.after !== undefined) parameters.push(search.after);
+    parameters.push(limit, ...search.terms);
+
+    return statement.all(...parameters).map((row) => {
+      const memory = parseMemory({
+        id: row["id"],
+        content: row["content"],
+        createdAt: row["createdAt"],
+        revision: row["revision"],
+        updatedAt: row["updatedAt"],
+      });
+      const matchedTerms: string[] = [];
+      for (let index = 0; index < search.terms.length; index += 1) {
+        const flag = row[`matched_${index}`];
+        if (flag === 1) {
+          const term = search.terms[index];
+          if (term === undefined) throw new Error("Memory search term index exceeded the validated input.");
+          matchedTerms.push(term);
+        } else if (flag !== 0) {
+          throw new Error("SQLite returned an invalid memory search match flag.");
+        }
+      }
+      return { memory, matchedTerms };
+    });
   }
 
   close(): void {
