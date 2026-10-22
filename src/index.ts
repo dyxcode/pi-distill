@@ -4,6 +4,7 @@ import { existsSync } from "node:fs";
 import { MemoryTools, memorySearchDescription, memorySearchGuidance, memorySearchTermsDescription } from "./memory-tools.js";
 import { openMemoryStore, resolveMemoryDatabasePath } from "./memory-path.js";
 import { ConsolidationCoordinator } from "./consolidation.ts";
+import { memoryReadRenderers, memorySearchRenderers } from "./memory-rendering.ts";
 
 const searchParameters = Type.Object({
   terms: Type.Array(Type.String({ minLength: 1, maxLength: 128 }), {
@@ -42,6 +43,7 @@ export default function piDistill(pi: ExtensionAPI): void {
   });
 
   pi.registerTool({
+    ...memorySearchRenderers,
     name: "memory_search",
     label: "Search memories",
     description: memorySearchDescription,
@@ -55,6 +57,7 @@ export default function piDistill(pi: ExtensionAPI): void {
   });
 
   pi.registerTool({
+    ...memoryReadRenderers,
     name: "memory_read",
     label: "Read a memory",
     description: "Read the current memory content at an expected revision, in bounded exact chunks.",
