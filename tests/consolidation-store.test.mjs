@@ -326,6 +326,33 @@ test("an empty change set still marks every source processed and completes the j
   assert.deepEqual(store.listConsolidationJobs(), []);
 });
 
+test("processing assessments read committed progress while another connection holds the writer reservation", async (t) => {
+  const f = await fixture(t);
+  const store = f.open();
+  const first = job("finished");
+  const second = job("waiting");
+  store.enqueueConsolidation(first);
+  store.claimConsolidation(first.id, "worker", 100, 100);
+  store.commitConsolidation(commit(first.id, "worker"));
+  store.enqueueConsolidation(second);
+  const writer = database(f.path);
+  try {
+    writer.exec("BEGIN IMMEDIATE");
+    writer.prepare("DELETE FROM consolidation_progress WHERE source_key = ?").run(first.sourceKeys[0]);
+    assert.deepEqual(store.readConsolidationStatus([...first.sourceKeys, ...second.sourceKeys]), {
+      processedSources: first.sourceKeys,
+      pendingJobs: [second],
+      observations: [],
+    });
+    writer.exec("ROLLBACK");
+  } finally {
+    if (writer.isTransaction) writer.exec("ROLLBACK");
+    writer.close();
+  }
+  assert.throws(() => store.readConsolidationStatus(["duplicate", "duplicate"]), TypeError);
+  assert.deepEqual(store.readConsolidationStatus(first.sourceKeys).processedSources, first.sourceKeys);
+});
+
 test("a stale owner cannot commit after a lease takeover", async (t) => {
   const f = await fixture(t);
   const store = f.open();

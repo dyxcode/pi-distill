@@ -883,6 +883,22 @@ export class SQLiteMemoryStore {
     return result;
   }
 
+  /** One read snapshot for processing coverage and outstanding consolidation work. */
+  readConsolidationStatus(keys: readonly string[]): {
+    readonly processedSources: readonly string[];
+    readonly pendingJobs: readonly ConsolidationJob[];
+    readonly observations: readonly SessionObservation[];
+  } {
+    this.#ensureOpen();
+    return this.#transaction(() => ({
+      processedSources: this.processedSources(keys),
+      pendingJobs: this.listConsolidationJobs(),
+      observations: this.#database.prepare(
+        `SELECT ${observationColumns} FROM session_observations ORDER BY session_id COLLATE BINARY`,
+      ).all().map(row => parseStoredSessionObservation(this.#decodeRow(row)).observation),
+    }), "DEFERRED");
+  }
+
   commitConsolidation(commit: ConsolidationCommit): boolean {
     this.#ensureOpen();
     const request = parseConsolidationCommit(commit);
@@ -1251,9 +1267,9 @@ export class SQLiteMemoryStore {
     ).iterate()) parseStoredSessionObservation(this.#decodeRow(row));
   }
 
-  #transaction<T>(operation: () => T): T {
-    // Reserve the writer before reading so competing changes cannot race our checks.
-    this.#database.exec("BEGIN IMMEDIATE");
+  #transaction<T>(operation: () => T, mode: "IMMEDIATE" | "DEFERRED" = "IMMEDIATE"): T {
+    // Mutations reserve the writer; read-only assessments use a SQLite read snapshot.
+    this.#database.exec(mode === "IMMEDIATE" ? "BEGIN IMMEDIATE" : "BEGIN DEFERRED");
     try {
       const result = operation();
       this.#database.exec("COMMIT");

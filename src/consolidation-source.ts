@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { closeSync, openSync, readSync } from "node:fs";
-import { open } from "node:fs/promises";
+import { lstat, open } from "node:fs/promises";
 import { TextDecoder } from "node:util";
 import { dirname, resolve } from "node:path";
 import {
@@ -9,7 +9,7 @@ import {
   type SessionHeader,
   type SessionProjection,
 } from "@earendil-works/pi-coding-agent";
-import type { SourceBatch, SourcePart } from "./consolidation-types.js";
+import type { SessionObservation, SourceBatch, SourcePart } from "./consolidation-types.js";
 
 const MAX_PART_TEXT_BYTES = 1024;
 const MAX_PART_JSON_BYTES = 2 * 1024;
@@ -71,7 +71,7 @@ interface ParsedSession {
 interface SessionGraph {
   readonly header: SessionHeader;
   readonly entries: readonly SessionEntry[];
-  readonly entriesById: ReadonlyMap<string, SessionEntry>;
+  readonly entriesById: Map<string, SessionEntry>;
   readonly signatures: ReadonlyMap<string, string>;
   readonly origins: ReadonlyMap<string, SourceOrigin>;
   readonly pending: boolean;
@@ -142,6 +142,15 @@ export function snapshotSession(manager: ReadonlySessionManager): SourceSnapshot
 export async function loadSnapshot(sessionFile: string, leafId?: string | null): Promise<SourceSnapshot> {
   const budget: AggregateBudget = { bytes: 0, entries: 0 };
   const graph = await loadSessionGraph(resolve(sessionFile), new Set(), 0, budget);
+  return snapshotFromGraph(graph, sessionFile, leafId);
+}
+
+function snapshotFromGraph(
+  graph: SessionGraph & { readonly parentSessionPending: boolean },
+  sessionFile: string,
+  leafId?: string | null,
+  budget?: AggregateBudget,
+): SourceSnapshot {
   const selectedLeaf = leafId === undefined ? graph.entries.at(-1)?.id ?? null : leafId;
   if (selectedLeaf !== null && !graph.entriesById.has(selectedLeaf)) {
     return {
@@ -158,8 +167,12 @@ export async function loadSnapshot(sessionFile: string, leafId?: string | null):
   }
 
   const branch = selectedLeaf === null ? [] : branchForLeaf(graph.entriesById, selectedLeaf);
+  if (budget && !consumeAggregateBudget(budget,
+    [graph.header.id, resolve(sessionFile), graph.header.cwd, branch], branch.length)) {
+    throw new Error("Session branch coverage exceeds the aggregate size or entry limit.");
+  }
   const editStatus = validateContextEdits(branch);
-  const projection = buildSessionProjection([...graph.entries], selectedLeaf);
+  const projection = buildSessionProjection(branch, selectedLeaf, graph.entriesById);
   const pendingReason = graph.pending
     ? "Session file has an incomplete trailing JSONL record."
     : graph.parentSessionPending
@@ -178,6 +191,61 @@ export async function loadSnapshot(sessionFile: string, leafId?: string | null):
   };
   projections.set(snapshot, projection);
   return snapshot;
+}
+
+/** Content-free processing coverage for terminal branches and observed checkpoints. */
+export interface SessionCoverage {
+  readonly sessionId: string;
+  readonly sourceKeys: readonly string[];
+  /** Includes the session itself and every ancestor read to resolve its source identities. */
+  readonly fileVersions: ReadonlyMap<string, string>;
+}
+
+export async function loadSessionCoverage(
+  sessionFile: string,
+  observations: readonly SessionObservation[] = [],
+  budget: AggregateBudget = { bytes: 0, entries: 0 },
+): Promise<SessionCoverage> {
+  const path = resolve(sessionFile);
+  const fileVersions = new Map<string, string>();
+  const graph = await loadSessionGraph(path, new Set(), 0, budget, fileVersions);
+  const parents = new Set(graph.entries.map(entry => entry.parentId));
+  const leaves: readonly (string | null)[] = graph.entries.length === 0
+    ? [null]
+    : graph.entries.filter(entry => !parents.has(entry.id)).map(entry => entry.id);
+  const checkpoints = observations.filter(observation =>
+    observation.sessionId === graph.header.id || resolve(observation.sessionFile) === path);
+  if (checkpoints.some(observation => observation.sessionId !== graph.header.id)) {
+    throw new Error("Observed session identity does not match its current file.");
+  }
+  const keys = new Set<string>();
+  for (const leaf of new Set([...leaves, ...checkpoints.map(observation => observation.leafId)])) {
+    // Shared prefixes count again; the caller can share this budget across files.
+    const snapshot = snapshotFromGraph(graph, path, leaf, budget);
+    if (snapshot.pending) throw new Error(snapshot.pendingReason ?? "Incomplete session branch.");
+    for (const batch of planSources(snapshot, new Set())) {
+      for (const key of batch.sourceKeys) keys.add(key);
+    }
+  }
+  return { sessionId: graph.header.id, sourceKeys: [...keys], fileVersions };
+}
+
+/** Recheck the read versions; this is not a lock or permission to delete. */
+export async function sessionCoverageUnchanged(coverage: SessionCoverage): Promise<boolean> {
+  try {
+    for (const [path, version] of coverage.fileVersions) {
+      if (await sessionFileVersion(path) !== version) return false;
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function sessionFileVersion(path: string): Promise<string> {
+  const info = await lstat(path, { bigint: true });
+  if (!info.isFile()) throw new Error("Session coverage requires a regular file.");
+  return [info.dev, info.ino, info.size, info.mtimeNs, info.ctimeNs].join(":");
 }
 
 export function planSources(snapshot: SourceSnapshot, processed: ReadonlySet<string>): readonly SourceBatch[] {
@@ -649,7 +717,11 @@ async function readBoundedUtf8(path: string, budget: AggregateBudget): Promise<s
       const { bytesRead } = await file.read(buffer, total, buffer.length - total, null);
       if (bytesRead === 0) break;
       total += bytesRead;
-      if (total > remaining) throw new Error("Session ancestry exceeds the aggregate byte limit.");
+      if (total > remaining) {
+        // Failed reads still consume a shared assessment budget.
+        budget.bytes = MAX_ANCESTRY_JSON_BYTES;
+        throw new Error("Session ancestry exceeds the aggregate byte limit.");
+      }
     }
   } finally {
     await file.close();
@@ -927,19 +999,25 @@ async function loadSessionGraph(
   ancestors: Set<string>,
   depth: number,
   budget: AggregateBudget,
+  fileVersions?: Map<string, string>,
 ): Promise<SessionGraph & { readonly parentSessionPending: boolean }> {
   if (depth > MAX_ANCESTRY_DEPTH) throw new Error("Session parentSession ancestry exceeds the supported depth.");
   const resolvedPath = resolve(path);
   if (ancestors.has(resolvedPath)) throw new Error("Session parentSession ancestry contains a file cycle.");
   const nextAncestors = new Set(ancestors);
   nextAncestors.add(resolvedPath);
+  const before = fileVersions ? await sessionFileVersion(resolvedPath) : undefined;
   const parsed = parseSessionText(await readBoundedUtf8(resolvedPath, budget), budget);
+  if (fileVersions && before !== undefined) {
+    if (await sessionFileVersion(resolvedPath) !== before) throw new Error("Session changed while reading.");
+    fileVersions.set(resolvedPath, before);
+  }
   const local = entryMaps(parsed.entries, parsed.header.id);
   if (!parsed.header.parentSession) {
     return { header: parsed.header, entries: parsed.entries, entriesById: local.entriesById, signatures: local.signatures, origins: local.origins, pending: parsed.pending, parentSessionPending: false };
   }
   const parentPath = resolve(dirname(resolvedPath), parsed.header.parentSession);
-  const parent = await loadSessionGraph(parentPath, nextAncestors, depth + 1, budget);
+  const parent = await loadSessionGraph(parentPath, nextAncestors, depth + 1, budget, fileVersions);
   if (parent.header.id === parsed.header.id) throw new Error("Forked sessions must have distinct session ids.");
   const origins = new Map<string, SourceOrigin>();
   const signatures = new Map<string, string>();
