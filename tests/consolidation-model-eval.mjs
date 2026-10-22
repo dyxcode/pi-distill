@@ -2,15 +2,14 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { assessCurrentMemories, assessRecall, sanitizeEvaluationTrace } from "./consolidation-model-eval-support.mjs";
+import { assessCurrentMemories, assessRecall, evaluationFailureStatus, sanitizeEvaluationTrace, trackStreamCompletion, waitForConsolidation } from "./consolidation-model-eval-support.mjs";
+import { assessTaskMemories, assessTaskRecall } from "./task-cancellation-eval-support.mjs";
 
 const repoRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const extensionPath = join(repoRoot, "src", "index.ts");
 const modelId = "gpt-6-luna";
 const requestLimit = 20;
 const deadlineMs = 150_000;
-const closeWaitMs = 45_000;
-const pollMs = 200;
 const cases = {
   lifecycle: {
     project: "Cedar-72", initialDays: 14, correctedDays: 7, exceptionDays: 30,
@@ -26,13 +25,28 @@ const cases = {
     initialQuestion: "What is Maple's normal retention duration and its investigation exception? Answer briefly in English.",
     finalQuestion: "For Maple, how long do we now keep ordinary logs, and what changes when investigating an incident? Answer briefly in English.",
   },
+  cancellation: {
+    kind: "task", project: "River", trigger: "close",
+    initial: "For our fictional River project, we need to submit the migration proposal. The weekly log review is also required. These are our current commitments. Briefly acknowledge.",
+    correction: "River's migration has been cancelled, so there is no need to submit the proposal. The weekly log review must continue. Briefly acknowledge.",
+    initialQuestion: "What work is currently required for River? Answer briefly in English.",
+    finalQuestion: "What work is still required for River now? Answer briefly in English.",
+  },
+  "cancellation-compact": {
+    kind: "task", project: "Brook", trigger: "compact",
+    initial: "For our fictional Brook project, submitting the migration proposal is required. We also need to carry out the weekly log review. Both are agreed commitments. Briefly acknowledge.",
+    correction: "Brook 的迁移已经取消，因此迁移提案不需要提交了。每周日志检查照常进行。简单确认即可。",
+    initialQuestion: "What work is currently required for Brook? Answer briefly in English.",
+    finalQuestion: "What work is still required for Brook now? Answer briefly in English.",
+  },
 };
+const usage = `Usage: node tests/consolidation-model-eval.mjs [--case ${Object.keys(cases).join("|")}]`;
 
 function parseArgs(argv) {
   if (argv.includes("--help") || argv.includes("-h")) return { help: true };
   if (argv.length === 0) return { caseId: "lifecycle" };
   if (argv.length === 2 && argv[0] === "--case" && Object.hasOwn(cases, argv[1])) return { caseId: argv[1] };
-  throw new Error("Usage: node tests/consolidation-model-eval.mjs [--case lifecycle|compact]");
+  throw new Error(usage);
 }
 
 function failureCode(error, requestLimitHit) {
@@ -133,7 +147,6 @@ async function runLifecycle(pi, SQLiteMemoryStore, modelRuntime, model, isolated
   let completedRequests = 0;
   let lastRequestCompletion = Date.now();
   let requestLimitHit = false;
-  const activeForegroundRequests = [];
   const seenMessageCount = new WeakMap();
   let activeStage = "setup";
 
@@ -220,8 +233,6 @@ async function runLifecycle(pi, SQLiteMemoryStore, modelRuntime, model, isolated
           content: assistantContent,
         }));
         if (event.message.stopReason === "stop") foregroundResults.set(activeStage, responseText(event.message));
-        const request = activeForegroundRequests.shift();
-        if (request) finishRequest(request);
       }
       if (event.type === "tool_execution_start" && ["memory_search", "memory_read"].includes(event.toolName)) {
         trace.push(sanitizeEvaluationTrace({
@@ -247,24 +258,13 @@ async function runLifecycle(pi, SQLiteMemoryStore, modelRuntime, model, isolated
     const originalStream = session.agent.streamFunction;
     session.agent.streamFunction = (requestedModel, context, options = {}) => {
       const request = beginRequest("foreground");
-      activeForegroundRequests.push(request);
-      try {
-        return Promise.resolve(originalStream(requestedModel, context, {
-          ...options,
-          signal: signalFor(deadlineSignal, options.signal),
-        })).catch((error) => {
-          const index = activeForegroundRequests.indexOf(request);
-          if (index >= 0) activeForegroundRequests.splice(index, 1);
-          finishRequest(request);
-          trace.push({ stage: activeStage, surface: "foreground", type: "request_failure", failure: failureCode(error, requestLimitHit) });
-          throw error;
-        });
-      } catch (error) {
-        const index = activeForegroundRequests.indexOf(request);
-        if (index >= 0) activeForegroundRequests.splice(index, 1);
-        finishRequest(request);
+      return trackStreamCompletion(() => originalStream(requestedModel, context, {
+        ...options,
+        signal: signalFor(deadlineSignal, options.signal),
+      }), () => finishRequest(request)).catch((error) => {
+        trace.push({ stage: activeStage, surface: "foreground", type: "request_failure", failure: failureCode(error, requestLimitHit) });
         throw error;
-      }
+      });
     };
   };
 
@@ -310,37 +310,43 @@ async function runLifecycle(pi, SQLiteMemoryStore, modelRuntime, model, isolated
   const readState = () => {
     const store = new SQLiteMemoryStore(databasePath);
     try {
-      const memories = store.searchBatch({ terms: [fixture.project], match: "any" })
-        .map((row) => ({ id: row.memory.id, revision: row.memory.revision, content: row.memory.content }));
-      return { memories, pendingJobs: store.listConsolidationJobs().length };
+      const memories = [];
+      let after;
+      // Inspect the complete isolated store, including records that omit the
+      // project name; a literal search miss cannot establish task deletion.
+      for (let page = 0; page < 4; page++) {
+        const rows = store.searchBatch({ terms: [fixture.project], match: "any", limit: 128, ...(after === undefined ? {} : { after }) });
+        memories.push(...rows.map(({ memory }) => ({ id: memory.id, revision: memory.revision, content: memory.content })));
+        if (rows.length < 128) return {
+          memories, pendingJobs: store.listConsolidationJobs().length,
+          pendingObservations: store.observedSessions().length,
+        };
+        const next = rows.at(-1).memory.id;
+        if (next === after) throw new Error("evaluation_store_cursor_not_advancing");
+        after = next;
+      }
+      throw new Error("evaluation_store_scan_limit");
     } finally {
       store.close();
     }
   };
 
-  const waitForClose = async (beforeCompleted) => {
-    const stopAt = Date.now() + closeWaitMs;
-    let last = { memories: [], pendingJobs: 0 };
-    while (Date.now() < stopAt && !deadlineSignal.aborted) {
-      try { last = readState(); } catch { /* The extension may still be opening or committing the store. */ }
-      if (last.pendingJobs === 0) return last;
-      const terminalRequestSettled = completedRequests > beforeCompleted && inFlightRequests === 0 &&
-        Date.now() - lastRequestCompletion >= 1_500;
-      if (terminalRequestSettled || requestLimitHit) return last;
-      await new Promise((resolve) => setTimeout(resolve, pollMs));
-    }
-    return last;
-  };
-
-  const closeAndAssess = async (stage, expectedDefaultDays, expectedRevision, previous, compact = false) => {
-    activeStage = stage;
+  const advanceBoundary = async (compact) => {
     const completedBefore = completedRequests;
     if (compact) await bounded(runtime.session.compact(), deadlineSignal);
     else {
       const replacement = await bounded(runtime.newSession(), deadlineSignal);
       if (replacement.cancelled) throw new Error("session_replacement_cancelled");
     }
-    const state = await waitForClose(completedBefore);
+    return waitForConsolidation({
+      readState, signal: deadlineSignal, completedBefore,
+      activity: () => ({ inFlightRequests, completedRequests, lastRequestCompletion, requestLimitHit }),
+    });
+  };
+
+  const closeAndAssess = async (stage, expectedDefaultDays, expectedRevision, previous, compact = false) => {
+    activeStage = stage;
+    const { state, settled } = await advanceBoundary(compact);
     const assessment = assessCurrentMemories(state.memories, {
       defaultDays: expectedDefaultDays,
       project: fixture.project,
@@ -352,10 +358,12 @@ async function runLifecycle(pi, SQLiteMemoryStore, modelRuntime, model, isolated
       assessment.accepted = false;
       assessment.issues.push("initial_memory_missing");
     }
-    const accepted = state.pendingJobs === 0 && assessment.accepted;
+    const accepted = settled && assessment.accepted;
     const result = {
       name: stage,
-      status: accepted ? "passed" : state.pendingJobs > 0 ? "incomplete" : "needs_review",
+      status: accepted ? "passed" : !settled ? "incomplete" : "needs_review",
+      settled,
+      pendingObservations: state.pendingObservations,
       pendingJobs: state.pendingJobs,
       memories: state.memories,
       assessment,
@@ -364,12 +372,17 @@ async function runLifecycle(pi, SQLiteMemoryStore, modelRuntime, model, isolated
     return result;
   };
 
-  const promptAndAssess = async (stage, prompt, expectedDefaultDays, memory) => {
+  const promptAndTrace = async (stage, prompt) => {
     activeStage = stage;
     await bounded(runtime.session.prompt(prompt, { expandPromptTemplates: false }), deadlineSignal);
     const response = foregroundResults.get(stage) ?? "";
     const foregroundCalls = trace.filter((item) => item?.stage === stage && item.surface === "foreground" && item.type === "tool_call");
     const foregroundToolResults = trace.filter((item) => item?.stage === stage && item.surface === "foreground" && item.type === "tool_result");
+    return { response, foregroundCalls, foregroundToolResults };
+  };
+
+  const promptAndAssess = async (stage, prompt, expectedDefaultDays, memory) => {
+    const { response, foregroundCalls, foregroundToolResults } = await promptAndTrace(stage, prompt);
     const assessment = assessRecall(response, foregroundToolResults, { memory, project: fixture.project, defaultDays: expectedDefaultDays, exceptionDays: fixture.exceptionDays });
     const result = {
       name: stage,
@@ -385,12 +398,63 @@ async function runLifecycle(pi, SQLiteMemoryStore, modelRuntime, model, isolated
     return result;
   };
 
+  const taskBoundary = async (stage, { cancelled, previous, unchanged = false, compact = false }) => {
+    activeStage = stage;
+    const { state, settled } = await advanceBoundary(compact);
+    const assessment = assessTaskMemories(state.memories, {
+      project: fixture.project, cancelled, previous, unchanged, pendingJobs: state.pendingJobs,
+    });
+    const result = {
+      name: stage, status: !settled ? "incomplete" : assessment.accepted ? "passed" : "needs_review",
+      ...state, settled, assessment,
+    };
+    stages.push(result);
+    return result;
+  };
+
+  const taskRecall = async (stage, prompt, records, cancelled) => {
+    const { response, foregroundCalls, foregroundToolResults } = await promptAndTrace(stage, prompt);
+    const assessment = assessTaskRecall(response, foregroundToolResults, { records, project: fixture.project, cancelled });
+    const result = {
+      name: stage, status: assessment.accepted ? "passed" : "needs_review", prompt, response,
+      toolCalls: foregroundCalls, toolResults: foregroundToolResults, assessment,
+    };
+    stages.push(result);
+    return result;
+  };
+
   try {
     activeStage = "initial_conversation";
     await bounded(runtime.session.prompt(
       fixture.initial,
       { expandPromptTemplates: false },
     ), deadlineSignal);
+
+    if (fixture.kind === "task") {
+      const initial = await taskBoundary("initial_close", { cancelled: false });
+      if (initial.status === "incomplete") return { ...runtimeRef.report, status: initial.status };
+      // Preserve all completed stages for offline rubric review without another model run.
+      await taskRecall("initial_fresh_session_recall", fixture.initialQuestion, initial.memories, false);
+
+      activeStage = "cancellation_conversation";
+      await bounded(runtime.session.prompt(fixture.correction, { expandPromptTemplates: false }), deadlineSignal);
+      const compact = fixture.trigger === "compact";
+      const cancelled = await taskBoundary(compact ? "cancellation_compact" : "cancellation_close", {
+        cancelled: true, previous: initial.memories, compact,
+      });
+      if (cancelled.status === "incomplete") return { ...runtimeRef.report, status: cancelled.status };
+      if (compact) {
+        const repeated = await taskBoundary("post_compact_close", {
+          cancelled: true, previous: cancelled.memories, unchanged: true,
+        });
+        if (repeated.status === "incomplete") return { ...runtimeRef.report, status: repeated.status };
+      }
+      await taskRecall("cancelled_fresh_session_recall", fixture.finalQuestion, cancelled.memories, true);
+      const expectedStages = compact ? 5 : 4;
+      runtimeRef.report.status = stages.length === expectedStages && stages.every((stage) => stage.status === "passed") && !requestLimitHit
+        ? "completed" : deadlineSignal.aborted ? "incomplete" : "needs_review";
+      return runtimeRef.report;
+    }
 
     const initial = await closeAndAssess("initial_close", fixture.initialDays, 1);
     if (initial.status !== "passed") return { ...runtimeRef.report, status: initial.status };
@@ -436,7 +500,7 @@ async function runLifecycle(pi, SQLiteMemoryStore, modelRuntime, model, isolated
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   if (args.help) {
-    process.stdout.write("Usage: node tests/consolidation-model-eval.mjs [--case lifecycle|compact]\n");
+    process.stdout.write(`${usage}\n`);
     return;
   }
 
@@ -464,18 +528,9 @@ async function main() {
   } catch (error) {
     const reason = failureCode(error, runtimeRef.requestLimitHit === true);
     const partialReport = runtimeRef.report ?? {};
-    const incomplete = reason === "timeout_or_cancelled" || reason === "request_budget_exhausted";
-    const unavailable = [
-      "openai_oauth_unavailable",
-      "provider_model_unavailable",
-      "provider_temporarily_unavailable",
-      "provider_quota_exhausted",
-      "provider_auth_rejected",
-      "network_unavailable",
-    ].includes(reason);
     report = {
       ...partialReport,
-      status: incomplete ? "incomplete" : unavailable ? "not_run" : "harness_failure",
+      status: evaluationFailureStatus(reason, partialReport),
       case: args.caseId,
       model: { provider: "openai", id: modelId },
       reason,

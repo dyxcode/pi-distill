@@ -1,6 +1,63 @@
 const forbiddenKey = /(?:usage|tokens?|credential|authorization|headers?|api.?key|thinking|cost)/iu;
 const localPath = /(?:\/Users\/[^/\s"']+\/[^\s"']*|\/home\/[^/\s"']+\/[^\s"']*|\/(?:private\/)?(?:tmp|var\/folders)\/[^\s"']*)/gu;
 
+/** Compaction consumes stream.result() without a foreground message_end event. */
+export async function trackStreamCompletion(start, finish) {
+  try {
+    const stream = await start();
+    stream.result().then(finish, finish);
+    return stream;
+  } catch (error) {
+    finish();
+    throw error;
+  }
+}
+
+export function evaluationFailureStatus(reason, report = {}) {
+  if (reason === "timeout_or_cancelled" || reason === "request_budget_exhausted") return "incomplete";
+  const unavailable = [
+    "openai_oauth_unavailable", "requested_model_unavailable", "provider_model_unavailable",
+    "provider_temporarily_unavailable", "provider_quota_exhausted", "provider_auth_rejected", "network_unavailable",
+  ].includes(reason);
+  if (!unavailable) return "harness_failure";
+  return (report.providerRequests ?? 0) > 0 || (report.stages?.length ?? 0) > 0 ? "incomplete" : "not_run";
+}
+
+/** Wait for durable completion, including capture recovery and active requests. */
+export async function waitForConsolidation({
+  readState, activity, signal, timeoutMs = 45_000, completedBefore = activity().completedRequests,
+  now = Date.now, sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+}) {
+  const stopAt = now() + timeoutMs;
+  let last;
+  let fingerprint;
+  let stableSince;
+  while (now() < stopAt && !signal.aborted) {
+    let readable = false;
+    try { last = readState(); readable = true; } catch { /* Opening or a bounded lock can be retried. */ }
+    const current = activity();
+    const idle = readable && last.pendingJobs === 0 && last.pendingObservations === 0 && current.inFlightRequests === 0;
+    if (idle) {
+      const next = JSON.stringify(last);
+      if (next !== fingerprint || stableSince === undefined) {
+        fingerprint = next;
+        stableSince = now();
+      }
+      if (now() - stableSince >= 1_000) return { state: last, settled: true };
+    } else {
+      fingerprint = undefined;
+      stableSince = undefined;
+    }
+    const failedRequestSettled = current.completedRequests > completedBefore && current.inFlightRequests === 0 &&
+      now() - current.lastRequestCompletion >= 1_500;
+    if (current.requestLimitHit || (!idle && readable && failedRequestSettled)) break;
+    await sleep(200);
+  }
+  if (signal.aborted) throw signal.reason ?? new Error("Evaluation cancelled.");
+  if (!last) throw new Error("evaluation_store_unavailable");
+  return { state: last, settled: false };
+}
+
 function clauses(value) {
   return value.split(/[.!?;。！？；\n]+/u).map((clause) => clause.trim()).filter(Boolean);
 }
