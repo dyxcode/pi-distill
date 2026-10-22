@@ -380,7 +380,7 @@ test("schema v2 migration preserves memories, jobs, progress, origins and observ
 
   const verify = database(f.path);
   try {
-    assert.equal(verify.prepare("PRAGMA user_version").get()["user_version"], 4);
+    assert.equal(verify.prepare("PRAGMA user_version").get()["user_version"], 5);
     assert.deepEqual(verify.prepare("SELECT name FROM sqlite_schema WHERE name = 'session_usages'").all()
       .map(row => row["name"]), ["session_usages"]);
   } finally {
@@ -447,6 +447,8 @@ test("v2 migration rejects an unexpected schema object without changing existing
 // Reconstruct the historical fixture rather than relabeling current schema as v2.
 function restoreV2Schema(db) {
   db.exec(`
+    DROP TABLE source_access;
+    DROP TABLE session_deletions;
     DROP TABLE session_usages;
     DROP TABLE clean_tasks;
     DROP TABLE distill_trigger_jobs;

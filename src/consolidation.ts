@@ -1,3 +1,4 @@
+import { withSourceAccess } from "./source-access.ts";
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
@@ -84,6 +85,7 @@ export class ConsolidationCoordinator {
   #lastObservation: string | undefined;
   #triggerCursor = 0;
   #observationCursor = 0;
+  #unobservedCursor = 0;
   #pendingTriggerCursor = 0;
   #lastJob: string | undefined;
 
@@ -249,7 +251,7 @@ export class ConsolidationCoordinator {
   }
 
   #load(path: string, leaf?: string | null): Promise<SourceSnapshot> {
-    return (this.#options.loadSnapshot ?? loadSnapshot)(path, leaf);
+    return withSourceAccess(this.#options.openStore, () => (this.#options.loadSnapshot ?? loadSnapshot)(path, leaf), this.#controller?.signal);
   }
 
   #kick(): void {
@@ -464,12 +466,8 @@ export class ConsolidationCoordinator {
       if (signal.aborted) return;
       if (trigger.status !== "candidate") continue;
       try {
-        const compactionRecordId = await (this.#options.loadCompactionRecord ?? findCompactionRecord)(
-          trigger.sessionFile,
-          trigger.sessionId,
-          trigger.cwd,
-          trigger.leafId,
-        );
+        const compactionRecordId = await withSourceAccess(this.#options.openStore, () =>
+          (this.#options.loadCompactionRecord ?? findCompactionRecord)(trigger.sessionFile, trigger.sessionId, trigger.cwd, trigger.leafId), signal);
         if (signal.aborted) return;
         if (compactionRecordId) store.confirmCompactionTrigger({ id: trigger.id, compactionRecordId });
         else unresolved = true;
@@ -477,6 +475,29 @@ export class ConsolidationCoordinator {
     }
     this.#triggerCursor = triggerPage.nextCursor ?? 0;
     if (this.#triggerCursor !== 0) unresolved = true;
+
+    const unobserved = store.listUnobservedSessionUsages({
+      limit: MAX_OBSERVATIONS_PER_PASS,
+      ...(this.#unobservedCursor === 0 ? {} : { cursor: this.#unobservedCursor }),
+    });
+    for (const owner of unobserved.items) {
+      if (signal.aborted) return;
+      if (alive(owner.ownerPid) || !existsSync(owner.sessionFile)) continue;
+      try {
+        await withSourceAccess(this.#options.openStore, async () => {
+          const source = await (this.#options.loadSnapshot ?? loadSnapshot)(owner.sessionFile);
+          if (signal.aborted) return;
+          if (!isValidSourceSnapshot(source) || source.sessionId !== owner.sessionId || source.cwd !== owner.cwd) {
+            throw new Error("Unobserved crash source is unavailable.");
+          }
+          // Publish the recovered boundary before releasing its source protection.
+          store.observeSession({ sessionId: owner.sessionId, sessionFile: owner.sessionFile,
+            cwd: owner.cwd, leafId: source.leafId, ownerPid: owner.ownerPid });
+        }, signal);
+      } catch { unresolved = true; }
+    }
+    this.#unobservedCursor = unobserved.nextCursor ?? 0;
+    if (this.#unobservedCursor !== 0) unresolved = true;
 
     const observationPage = store.listObservedSessions({
       limit: MAX_OBSERVATIONS_PER_PASS,
@@ -495,6 +516,16 @@ export class ConsolidationCoordinator {
           leafId: observation.leafId,
         };
         store.enqueueDistillTrigger(this.#triggerInput(source, "close", closeTriggerId(source)));
+        const latest = await this.#load(observation.sessionFile);
+        if (signal.aborted) return;
+        if (!isValidSourceSnapshot(latest) || latest.sessionId !== source.sessionId || latest.cwd !== source.cwd) {
+          throw new Error("Crash recovery source identity or coverage is unavailable.");
+        }
+        // Preserve the recorded boundary and any subsequently persisted tail.
+        if (latest.leafId !== source.leafId) {
+          const tail = { ...source, leafId: latest.leafId };
+          store.enqueueDistillTrigger(this.#triggerInput(tail, "close", closeTriggerId(tail)));
+        }
         store.acknowledgeObservation(observation.sessionId, observation.leafId);
       } catch { unresolved = true; }
     }

@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -8,9 +8,14 @@ import { assessTaskMemories, assessTaskRecall } from "./task-cancellation-eval-s
 const repoRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const extensionPath = join(repoRoot, "src", "index.ts");
 const modelId = "gpt-6-luna";
-const requestLimit = 20;
+const defaultRequestLimit = 20;
 const deadlineMs = 150_000;
 const cases = {
+  cleanup: {
+    project: "Birch", initialDays: 14, exceptionDays: 30,
+    initial: "For our fictional Birch service, the agreed default log retention is 14 days, extended to 30 days during an incident investigation. Briefly acknowledge.",
+    initialQuestion: "For Birch, what retention periods apply normally and during an incident investigation? Answer briefly.",
+  },
   lifecycle: {
     project: "Cedar-72", initialDays: 14, correctedDays: 7, exceptionDays: 30,
     initial: "For the fictional Cedar-72 service, normal log retention is 14 days by default. While an incident investigation is active, retain the relevant logs for 30 days. The incident period is an exception; the general default remains 14 days.",
@@ -119,6 +124,7 @@ async function selectModel(pi) {
 
 async function runLifecycle(pi, SQLiteMemoryStore, modelRuntime, model, isolatedRoot, deadlineSignal, runtimeRef, caseId) {
   const fixture = cases[caseId];
+  const requestLimit = caseId === "cleanup" ? 8 : defaultRequestLimit;
   let providerRequests = 0;
   const trace = [];
   const stages = [];
@@ -459,9 +465,26 @@ async function runLifecycle(pi, SQLiteMemoryStore, modelRuntime, model, isolated
       return runtimeRef.report;
     }
 
+    const sourceFile = runtime.session.sessionManager.getSessionFile();
     const initial = await closeAndAssess("initial_close", fixture.initialDays, 1);
     if (initial.status !== "passed") return { ...runtimeRef.report, status: initial.status };
     const initialMemory = initial.assessment.target;
+    if (caseId === "cleanup") {
+      activeStage = "automatic_cleanup";
+      let removed = false;
+      const cleanDeadline = Date.now() + 8_000;
+      while (!removed && Date.now() < cleanDeadline && !deadlineSignal.aborted) {
+        try { await stat(sourceFile); }
+        catch (error) { if (error?.code !== "ENOENT") throw error; removed = true; }
+        if (!removed) await new Promise(resolve => setTimeout(resolve, 25));
+      }
+      stages.push({name:"automatic_cleanup",status:removed ? "passed" : "incomplete"});
+      if (!removed) return {...runtimeRef.report,status:"incomplete"};
+      await promptAndAssess("recall_after_cleanup", fixture.initialQuestion, fixture.initialDays, initialMemory);
+      runtimeRef.report.status = stages.every(stage => stage.status === "passed") && !requestLimitHit ? "completed" : "needs_review";
+      return runtimeRef.report;
+    }
+
     await promptAndAssess(
       "initial_fresh_session_recall",
       fixture.initialQuestion,

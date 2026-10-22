@@ -31,7 +31,7 @@ test("the model runner reports missing credentials as an unsuccessful run withou
   assert.equal(result.status, 1, "A skipped real-model evaluation must not look successful to the caller");
 });
 
-for (const caseId of ["lifecycle", "cancellation", "cancellation-compact"]) {
+for (const caseId of ["lifecycle", "cancellation", "cancellation-compact", "cleanup"]) {
   test(`the ${caseId} runner fails without OAuth and preserves an inspectable report without model calls`, async t => {
     const agentDir = await mkdtemp(join(tmpdir(), "pi-distill-lifecycle-preflight-"));
     t.after(() => rm(agentDir, { recursive: true, force: true }));

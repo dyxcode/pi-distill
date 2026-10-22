@@ -87,7 +87,11 @@ export async function waitForConsolidation({
 }
 
 function clauses(value) {
-  return value.split(/[.!?;。！？；\n]+/u).map((clause) => clause.trim()).filter(Boolean);
+  // Formatting is not semantic distance. Coordinated clauses may each put the
+  // duration before its condition ("14 days normally and 30 days during ...").
+  const plain = value.replace(/(\*\*|__)([^\n]+?)\1/gu, "$2");
+  return plain.split(/[.!?;。！？；\n]+|\s+(?:and|whereas|while|but)\s+/iu)
+    .map((clause) => clause.trim()).filter(Boolean);
 }
 
 function escaped(value) {

@@ -143,7 +143,23 @@ const cleanTasksSchema =
   "CHECK ((lease_owner IS NULL AND lease_until IS NULL) OR " +
   "(lease_owner IS NOT NULL AND lease_until IS NOT NULL))" +
   ") STRICT";
-const latestSchemaVersion = 4;
+const sourceAccessSchema = "CREATE TABLE source_access (singleton INTEGER PRIMARY KEY NOT NULL CHECK (singleton = 1), token TEXT NOT NULL, owner_pid INTEGER NOT NULL CHECK (owner_pid > 0)) STRICT";
+const deletionsSchema = "CREATE TABLE session_deletions (session_file TEXT PRIMARY KEY NOT NULL, session_id TEXT NOT NULL, intent_id TEXT NOT NULL, file_version TEXT NOT NULL, state TEXT NOT NULL CHECK (state IN ('deleting', 'complete'))) STRICT";
+const latestSchemaVersion = 5;
+
+export interface SessionDeletion {
+  readonly sessionFile: string;
+  readonly sessionId: string;
+  readonly intentId: string;
+  readonly fileVersion: string;
+  readonly state: "deleting" | "complete";
+}
+
+/** ESRCH establishes exit; permission failures and PID reuse remain protected. */
+export function processHasExited(pid: number): boolean {
+  try { process.kill(pid, 0); return false; }
+  catch (error) { return error instanceof Error && "code" in error && error.code === "ESRCH"; }
+}
 const maxTaskPageSize = 128;
 
 // Node 22 truncates TEXT results at NUL. Return bytes only at the result boundary;
@@ -1446,7 +1462,7 @@ export class SQLiteMemoryStore {
     this.#ensureOpen();
     const page = parseTaskPageOptions(options, true);
     const cursor = page.cursor ?? 0;
-    const clauses = ["rowid > ?"];
+    const clauses = ["rowid > ?", "NOT EXISTS (SELECT 1 FROM session_deletions d WHERE d.session_file = json_extract(clean_tasks.task_json, '$.sessionFile') AND d.state = 'complete')"];
     const params: (number | string)[] = [cursor];
     if (page.now !== undefined) {
       clauses.push("(retry_at IS NULL OR retry_at <= ?)");
@@ -1487,6 +1503,7 @@ export class SQLiteMemoryStore {
       if (row === undefined) return false;
       const current = parsePersistedCleanTask(this.#decodeRow(row));
       if (current.status !== "pending" && current.status !== "waiting") return false;
+      if (this.getDeletion(current.task.sessionFile)?.state === "complete") return false;
       if (!force && current.retryAt !== null && current.retryAt > now) return false;
       if (current.leaseOwner !== null && current.leaseUntil !== null && current.leaseUntil > now) return false;
       this.#database.prepare(
@@ -1914,6 +1931,26 @@ export class SQLiteMemoryStore {
     return { items, ...(nextCursor === undefined ? {} : { nextCursor }) };
   }
 
+  /** Startup recovery also covers a crash between the first file write and message_end. */
+  listUnobservedSessionUsages(options: TaskPageOptions): TaskPage<SessionUsage> {
+    const page = parseTaskPageOptions(options, false);
+    const rows = this.#database.prepare(
+      `SELECT rowid AS cursorRow, ${sessionUsageColumns} FROM session_usages ` +
+      "WHERE rowid > ? AND NOT EXISTS (SELECT 1 FROM session_observations o WHERE o.session_id = session_usages.session_id) " +
+      "AND NOT EXISTS (SELECT 1 FROM session_deletions d WHERE d.session_file = session_usages.session_file AND d.state = 'complete') " +
+      "ORDER BY rowid LIMIT ?",
+    ).all(page.cursor ?? 0, page.limit + 1);
+    const visible = rows.slice(0, page.limit);
+    const items = visible.map(raw => {
+      const {cursorRow, ...owner} = this.#decodeRow(raw);
+      validateNow(cursorRow, "Session usage cursor");
+      return parseStoredSessionUsage(owner);
+    });
+    const nextCursor = rows.length > page.limit ? visible.at(-1)?.["cursorRow"] : undefined;
+    if (nextCursor !== undefined) validateNow(nextCursor, "Next session usage cursor");
+    return {items, ...(nextCursor === undefined ? {} : {nextCursor})};
+  }
+
   listSessionUsages(): readonly SessionUsage[] {
     this.#ensureOpen();
     return this.#database.prepare(
@@ -1974,7 +2011,7 @@ export class SQLiteMemoryStore {
         "UNION SELECT json_extract(task_json, '$.sessionFile') AS path FROM clean_tasks " +
         "UNION SELECT session_file AS path FROM session_observations " +
         "UNION SELECT session_file AS path FROM session_usages" +
-        ") WHERE path IS NOT NULL AND (? IS NULL OR path COLLATE BINARY > ?) " +
+        ") WHERE path IS NOT NULL AND NOT EXISTS (SELECT 1 FROM session_deletions d WHERE d.session_file = path AND d.state = 'complete') AND (? IS NULL OR path COLLATE BINARY > ?) " +
         "ORDER BY path COLLATE BINARY LIMIT ?",
       ).all(afterPath ?? null, afterPath ?? null, limit);
       return paths.map((row) => {
@@ -1983,6 +2020,110 @@ export class SQLiteMemoryStore {
         return path;
       });
     }, "DEFERRED");
+  }
+
+  /** Distinguishes a path reserved by a fresh empty session from a captured source. */
+  hasSessionSourceWork(path: string): boolean {
+    validateAbsolutePath(path, "Source work path");
+    return this.#database.prepare(
+      "SELECT 1 FROM session_observations WHERE session_file = ? " +
+      "UNION ALL SELECT 1 FROM consolidation_jobs WHERE json_extract(job_json, '$.sessionFile') = ? " +
+      "UNION ALL SELECT 1 FROM distill_triggers WHERE json_extract(trigger_json, '$.sessionFile') = ? " +
+      "UNION ALL SELECT 1 FROM clean_tasks WHERE json_extract(task_json, '$.sessionFile') = ? LIMIT 1",
+    ).get(path, path, path, path) !== undefined;
+  }
+
+  /** Serializes bounded internal source reads and cleanup. Never held during LLM work. */
+  acquireSourceAccess(): string | undefined {
+    return this.#transaction(() => {
+      const access = this.#sourceAccess();
+      if (access && !processHasExited(access.pid)) return undefined;
+      const token = randomUUID();
+      this.#database.prepare("DELETE FROM source_access").run();
+      this.#database.prepare("INSERT INTO source_access VALUES (1, ?, ?)").run(token, process.pid);
+      return token;
+    });
+  }
+
+  releaseSourceAccess(token: string): boolean {
+    validateText(token, "Source access token");
+    return this.#transaction(() => this.#database.prepare("DELETE FROM source_access WHERE token = ?").run(token).changes === 1);
+  }
+
+  #sourceAccess(): { token: string; pid: number } | undefined {
+    const raw = this.#database.prepare(`SELECT ${textColumn("token")}, owner_pid FROM source_access`).get();
+    if (!raw) return undefined;
+    const row = this.#decodeRow(raw);
+    validateText(row["token"], "Stored source token");
+    const pid = row["owner_pid"];
+    if (typeof pid !== "number" || !Number.isSafeInteger(pid) || pid <= 0) throw new TypeError("Invalid source owner PID.");
+    return { token: row["token"], pid };
+  }
+
+  /** Compare on this connection only; includes other connections and local mutations. */
+  retentionVersion(): string {
+    this.#ensureOpen();
+    return `${this.#database.prepare("PRAGMA data_version").get()?.["data_version"]}:${this.#database.prepare("SELECT total_changes() AS n").get()?.["n"]}`;
+  }
+
+  reconcileExitedSessionOwners(): void {
+    this.#transaction(() => {
+      const rows = this.#database.prepare(`SELECT ${sessionUsageColumns} FROM session_usages WHERE state != 'released'`).all();
+      for (const raw of rows) {
+        const owner = parseStoredSessionUsage(this.#decodeRow(raw));
+        if (processHasExited(owner.ownerPid)) this.#database.prepare("UPDATE session_usages SET state = 'released' WHERE owner_id = ?").run(owner.ownerId);
+      }
+    });
+  }
+
+  getDeletion(path: string): SessionDeletion | undefined {
+    validateAbsolutePath(path, "Deletion path");
+    const raw = this.#database.prepare(`SELECT ${["session_file", "session_id", "intent_id", "file_version", "state"].map(c => textColumn(c)).join(", ")} FROM session_deletions WHERE session_file = ?`).get(path);
+    if (!raw) return undefined;
+    const row = this.#decodeRow(raw);
+    validateAbsolutePath(row["session_file"], "Stored deletion path");
+    validateText(row["session_id"], "Stored deletion session ID");
+    validateText(row["intent_id"], "Stored deletion intent ID");
+    validateText(row["file_version"], "Stored deletion file version");
+    if (!/^\d+:\d+:\d+:\d+:\d+$/.test(row["file_version"])) throw new TypeError("Invalid deletion file version.");
+    if (row["state"] !== "deleting" && row["state"] !== "complete") throw new TypeError("Invalid deletion state.");
+    return {sessionFile:row["session_file"], sessionId:row["session_id"], intentId:row["intent_id"], fileVersion:row["file_version"], state:row["state"]};
+  }
+
+  #deletionTask(id: string, owner: string, access: string, version: string): CleanTaskInput | undefined {
+    if (this.retentionVersion() !== version || this.#sourceAccess()?.token !== access) return undefined;
+    const raw = this.#database.prepare(`SELECT ${cleanTaskColumns} FROM clean_tasks WHERE id = ?`).get(id);
+    if (!raw) return undefined;
+    const record = parsePersistedCleanTask(this.#decodeRow(raw));
+    if (record.leaseOwner !== owner || record.leaseUntil === null || record.leaseUntil <= Date.now()) return undefined;
+    return record.task;
+  }
+
+  prepareDeletion(id: string, owner: string, access: string, version: string, fileVersion: string): boolean {
+    if (typeof fileVersion !== "string" || !/^\d+:\d+:\d+:\d+:\d+$/.test(fileVersion)) throw new TypeError("Invalid deletion file version.");
+    return this.#transaction(() => {
+      const task = this.#deletionTask(id, owner, access, version);
+      if (!task) return false;
+      const previous = this.getDeletion(task.sessionFile);
+      if (previous && (previous.state === "complete" || previous.sessionId !== task.sessionId || previous.fileVersion.split(":").slice(0, 2).join(":") !== fileVersion.split(":").slice(0, 2).join(":"))) return false;
+      this.#database.prepare("INSERT INTO session_deletions VALUES (?, ?, ?, ?, 'deleting') ON CONFLICT(session_file) DO UPDATE SET intent_id = excluded.intent_id, file_version = excluded.file_version")
+        .run(task.sessionFile, task.sessionId, task.intentId, fileVersion);
+      return true;
+    });
+  }
+
+  /** Callback performs only bounded synchronous identity checks/unlink, under the writer reservation. */
+  finishDeletion(id: string, owner: string, access: string, version: string, mutate: () => boolean): boolean {
+    return this.#transaction(() => {
+      const task = this.#deletionTask(id, owner, access, version);
+      if (!task) return false;
+      const receipt = this.getDeletion(task.sessionFile);
+      if (!receipt || receipt.state !== "deleting" || receipt.sessionId !== task.sessionId || receipt.intentId !== task.intentId) return false;
+      if (mutate() !== true) return false;
+      this.#database.prepare("UPDATE session_deletions SET state = 'complete' WHERE session_file = ?").run(task.sessionFile);
+      this.#database.prepare("UPDATE clean_tasks SET lease_owner = NULL, lease_until = NULL WHERE id = ?").run(id);
+      return true;
+    });
   }
 
   close(): void {
@@ -2291,7 +2432,7 @@ export class SQLiteMemoryStore {
 
   #initializeSchema(): void {
     const version = this.#database.prepare("PRAGMA user_version").get()?.["user_version"];
-    if (version !== 0 && version !== 1 && version !== 2 && version !== 3 && version !== latestSchemaVersion) {
+    if (version !== 0 && version !== 1 && version !== 2 && version !== 3 && version !== 4 && version !== latestSchemaVersion) {
       throw new Error("Unsupported memory database schema version: " + String(version) + ".");
     }
     const objects = this.#database.prepare(
@@ -2359,9 +2500,22 @@ export class SQLiteMemoryStore {
       this.#validateSchema(true, true);
       this.#validateAllRows(true, true);
     }
-    if (version !== latestSchemaVersion) this.#migrateV3ToV4();
+    if (version !== 4 && version !== latestSchemaVersion) this.#migrateV3ToV4();
+    if (version !== latestSchemaVersion) {
+      this.#validateSchema(true);
+      this.#validateAllRows();
+      this.#database.exec(sourceAccessSchema);
+      this.#database.exec(deletionsSchema);
+      this.#database.exec("PRAGMA user_version = 5");
+    }
     this.#validateLatestSchema();
     this.#validateAllRows();
+    this.#sourceAccess();
+    for (const row of this.#database.prepare(`SELECT ${textColumn("session_file")} FROM session_deletions`).iterate()) {
+      const path = this.#decodeRow(row)["session_file"];
+      validateAbsolutePath(path, "Stored deletion path");
+      this.getDeletion(path);
+    }
   }
 
   #migrateV3ToV4(): void {
@@ -2523,6 +2677,20 @@ export class SQLiteMemoryStore {
           { name: "lease_until", type: "INTEGER", notNull: 0, primaryKey: 0 },
         ],
       });
+    }
+    if (this.#database.prepare("PRAGMA user_version").get()?.["user_version"] === 5) {
+      schemas.set("source_access", { sql: sourceAccessSchema, columns: [
+        { name: "singleton", type: "INTEGER", notNull: 1, primaryKey: 1 },
+        { name: "token", type: "TEXT", notNull: 1, primaryKey: 0 },
+        { name: "owner_pid", type: "INTEGER", notNull: 1, primaryKey: 0 },
+      ] });
+      schemas.set("session_deletions", { sql: deletionsSchema, columns: [
+        { name: "session_file", type: "TEXT", notNull: 1, primaryKey: 1 },
+        { name: "session_id", type: "TEXT", notNull: 1, primaryKey: 0 },
+        { name: "intent_id", type: "TEXT", notNull: 1, primaryKey: 0 },
+        { name: "file_version", type: "TEXT", notNull: 1, primaryKey: 0 },
+        { name: "state", type: "TEXT", notNull: 1, primaryKey: 0 },
+      ] });
     }
     if (objects.length !== schemas.size) throw new Error("Unsupported memory database schema.");
     for (const object of objects) {

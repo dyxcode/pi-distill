@@ -521,7 +521,7 @@ test("schema v0 and v1 migrations preserve every current memory field and create
     }
     const check = database(f.path);
     try {
-      assert.equal(check.prepare("PRAGMA user_version").get()["user_version"], 4);
+      assert.equal(check.prepare("PRAGMA user_version").get()["user_version"], 5);
       const names = check.prepare("SELECT name FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*' ORDER BY name")
         .all().map((row) => row["name"]);
       assert.deepEqual(names, [
@@ -533,8 +533,10 @@ test("schema v0 and v1 migrations preserve every current memory field and create
         "distill_triggers",
         "memories",
         "memory_origins",
+        "session_deletions",
         "session_observations",
         "session_usages",
+        "source_access",
       ]);
       assert.deepEqual(check.prepare("PRAGMA table_info(memory_origins)").all().map((row) => row["name"]), [
         "memory_id",
@@ -561,14 +563,14 @@ test("schema v0 and v1 migrations preserve every current memory field and create
 test("future and unknown schemas fail without being reset", async (t) => {
   const f = await fixture(t);
   const raw = database(f.path);
-  raw.exec("CREATE TABLE future_data (value TEXT NOT NULL) STRICT; PRAGMA user_version = 5");
+  raw.exec("CREATE TABLE future_data (value TEXT NOT NULL) STRICT; PRAGMA user_version = 99");
   raw.prepare("INSERT INTO future_data VALUES (?)").run("preserve");
   raw.close();
 
   assert.throws(() => new SQLiteMemoryStore(f.path), /unsupported.*schema version/i);
   const verify = database(f.path);
   try {
-    assert.equal(verify.prepare("PRAGMA user_version").get()["user_version"], 5);
+    assert.equal(verify.prepare("PRAGMA user_version").get()["user_version"], 99);
     assert.equal(verify.prepare("SELECT value FROM future_data").get()["value"], "preserve");
   } finally {
     verify.close();

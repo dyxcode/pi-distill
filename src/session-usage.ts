@@ -1,3 +1,4 @@
+import { withSourceAccess } from "./source-access.ts";
 import { randomUUID } from "node:crypto";
 import { resolve } from "node:path";
 import type { ExtensionContext, SessionShutdownEvent, SessionStartEvent } from "@earendil-works/pi-coding-agent";
@@ -179,7 +180,9 @@ export class SessionUsageCoordinator {
     try {
       store = this.options.openStore();
       const files = store.listKnownSessionFiles();
-      const report = await (this.options.assess ?? assessSessionRetention)(files, store, { processToken: this.state.token });
+      const reader = store;
+      const report = await withSourceAccess(this.options.openStore, () =>
+        (this.options.assess ?? assessSessionRetention)(files, reader, { processToken: this.state.token }));
       return { ...report, discoveryScope: "known-session-files", candidateLimitReached: files.length === 1024 };
     } catch { return undefined; }
     finally { store?.close(); }

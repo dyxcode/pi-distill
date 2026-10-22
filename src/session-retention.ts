@@ -27,6 +27,8 @@ export interface SessionRetentionReport {
   /** Only describes dependency resolution for the supplied files, never global discovery. */
   readonly dependenciesComplete: boolean;
   readonly sessions: readonly SessionRetentionAssessment[];
+  /** Exact read versions for the final cleanup check; contains no conversation text. */
+  readonly fileVersions: ReadonlyMap<string, string>;
 }
 
 type ProgressReader = Pick<SQLiteMemoryStore, "readConsolidationStatus">;
@@ -140,5 +142,6 @@ export async function assessSessionRetention(
       requiredBy,
     });
   }
-  return { scope: "provided-session-files", dependenciesComplete, sessions };
+  return { scope: "provided-session-files", dependenciesComplete, sessions,
+    fileVersions: new Map([...coverage.values()].flatMap(source => [...source.fileVersions])) };
 }

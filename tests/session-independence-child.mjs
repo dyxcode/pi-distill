@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { existsSync } from 'node:fs';
-import { mkdir, unlink } from 'node:fs/promises';
+import { mkdir } from 'node:fs/promises';
 import { join, sep } from 'node:path';
 import { stripVTControlCharacters } from 'node:util';
 
@@ -11,7 +11,8 @@ const pi = await import('@earendil-works/pi-coding-agent');
 const ai = await import('@earendil-works/pi-ai');
 const { SQLiteMemoryStore } = await import('../src/memory-store.ts');
 const databasePath = join(agentDir, 'distill', 'memories.sqlite');
-const originalSessionPhrase = 'For fictional Cedar, retain logs for 14 days by default and 30 days during incident investigations.';
+const originalSessionPhrase = 'For fictional Cedar, retain logs for 14 days by default and 30 days during incident investigations. Separately, my preferred afternoon drink is oolong tea.';
+const preferenceContent = 'The user prefers oolong tea in the afternoon.';
 const originalContent = 'For fictional Cedar, retain logs for 14 days by default and 30 days during incident investigations.';
 const correctedContent = 'For fictional Cedar, retain logs for 7 days by default and 30 days during incident investigations.';
 let memoryId;
@@ -54,6 +55,7 @@ function scriptedResponse(context) {
       assert.ok(evidence, 'the original synthetic policy must reach consolidation');
       return ai.fauxAssistantMessage(JSON.stringify({ operations: [
         { action: 'create', content: originalContent, sourceKeys: [evidence.key] },
+        { action: 'create', content: preferenceContent, sourceKeys: [evidence.key] },
       ] }));
     }
 
@@ -147,7 +149,10 @@ function readState() {
   try {
     return {
       memory: store.searchBatch({ terms: ['Cedar'], match: 'any' }).find(row => row.matchedTerms.length)?.memory,
+      preference: store.searchBatch({ terms: ['oolong'], match: 'any' }).find(row => row.matchedTerms.length)?.memory,
       pendingJobs: store.listConsolidationJobs(),
+      clean: store.listCleanTasks({limit:100}),
+      usages: store.listSessionUsages(),
       pendingObservations: store.observedSessions(),
     };
   } finally {
@@ -186,20 +191,20 @@ try {
   const originalSessionId = runtime.session.sessionManager.getSessionId();
   assert.ok(originalSessionFile);
   assert.ok(originalSessionFile.startsWith(`${root}${sep}`), 'the original source must be inside the disposable fixture');
-  await runtime.dispose();
-  runtime = await createRuntime(modelRuntime, settings);
+  await runtime.newSession();
 
   const originalState = await waitForSettledMemory(memory => memory.content === originalContent);
   assert.equal(originalState.memory?.content, originalContent);
   assert.equal(originalState.memory?.revision, 1);
   assert.deepEqual(originalState.pendingJobs, [], 'initial consolidation must have no pending work');
   assert.deepEqual(originalState.pendingObservations, [], 'initial capture must have no pending observations');
+  assert.equal(originalState.preference?.content, preferenceContent);
   memoryId = originalState.memory.id;
   memoryRevision = originalState.memory.revision;
 
-  assert.equal(existsSync(originalSessionFile), true);
-  await unlink(originalSessionFile);
-  assert.equal(existsSync(originalSessionFile), false);
+  const cleanupDeadline = Date.now() + 5_000;
+  while (existsSync(originalSessionFile) && Date.now() < cleanupDeadline) await new Promise(resolve => setTimeout(resolve, 20));
+  assert.equal(existsSync(originalSessionFile), false, "extension cleanup must remove the processed inactive source: " + JSON.stringify(readState()));
 
   setScript();
   const freshSessionId = runtime.session.sessionManager.getSessionId();
@@ -234,13 +239,13 @@ try {
   assert.equal(existsSync(originalSessionFile), false, 'fresh-session retrieval must not recreate its deleted source');
 
   await runtime.session.prompt('Correction: For fictional Cedar, retain logs for 7 days by default and 30 days during incident investigations.');
-  await runtime.dispose();
-  runtime = await createRuntime(modelRuntime, settings);
+  await runtime.newSession();
 
   const correctedState = await waitForSettledMemory(memory => memory.content === correctedContent);
   assert.equal(correctedState.memory?.id, memoryId, 'the correction must update the same durable record');
   assert.equal(correctedState.memory?.content, correctedContent);
   assert.equal(correctedState.memory?.revision, 2);
+  assert.deepEqual(correctedState.preference, originalState.preference, 'an unrelated preference from the same old chat must survive correction');
   assert.deepEqual(correctedState.pendingJobs, [], 'correction consolidation must have no pending work');
   assert.deepEqual(correctedState.pendingObservations, [], 'correction capture must have no pending observations');
   assert.equal(existsSync(originalSessionFile), false, 'the original source file must remain absent after correction');

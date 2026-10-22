@@ -128,3 +128,20 @@ test("evaluation trace sanitizer removes credentials, paths, thinking, and usage
   assert.equal(JSON.stringify(sanitized).includes("totalTokens"), false);
   assert.equal(sanitized.response.text.includes("7 days"), true);
 });
+
+test('coordinated durations retain their conditions with or without Markdown emphasis', () => {
+  const policy = {project:'Birch',defaultDays:14,exceptionDays:30};
+  for (const answer of [
+    'Birch logs are retained for **14 days normally** and **30 days during an incident investigation**.',
+    'Birch logs are retained for 14 days normally and 30 days during an incident investigation.',
+    'Birch retains logs for __30 days during an incident investigation__ and __14 days normally__.',
+  ]) assert.deepEqual(policySignals(answer,policy),{namesProject:true,matchesDefault:true,preservesIncidentException:true});
+  for (const answer of [
+    'Birch logs are retained for **30 days normally** and **14 days during an incident investigation**.',
+    'Birch logs are not retained for **14 days normally** and **30 days during an incident investigation**.',
+    'Birch logs are retained for **14 days normally** and **21 days during an incident investigation**.',
+  ]) {
+    const signals=policySignals(answer,policy);
+    assert.equal(signals.matchesDefault&&signals.preservesIncidentException,false,answer);
+  }
+});

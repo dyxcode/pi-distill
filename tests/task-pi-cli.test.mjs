@@ -70,7 +70,7 @@ async function waitForEvents(path, predicate, child, timeoutMs = 8_000) {
   throw new Error(`Timed out waiting for synthetic provider events in ${path}.`);
 }
 
-function startInteractivePi(root, logPath, { sessionFile, delayMs }) {
+function startInteractivePi(root, logPath, { initialPrompt = true, delayMs }) {
   const env = {
     ...process.env,
     PI_CODING_AGENT_DIR: join(root, 'agent'),
@@ -88,7 +88,7 @@ function startInteractivePi(root, logPath, { sessionFile, delayMs }) {
     '--model', 'task-test/synthetic',
     '--session-dir', join(root, 'sessions'),
     '--no-mcp', '--no-skills', '--no-prompt-templates', '--no-themes', '--no-context-files', '--no-approve',
-    ...(sessionFile ? ['--session', sessionFile] : ['For synthetic Cedar, keep the test rule local.']),
+    ...(initialPrompt ? ['For synthetic Cedar, keep the test rule local.'] : []),
   ];
   const child = spawn(process.env.PI_TEST_PYTHON ?? 'python3', ['-u', '-c', ptyRelay, ...args], { cwd: repository, env, stdio: ['pipe', 'pipe', 'pipe'] });
   child.output = '';
@@ -126,7 +126,7 @@ async function stopPi(child) {
   if (!terminated) child.kill('SIGKILL');
 }
 
-test('Pi CLI Ctrl+D queues the source without a shutdown model call, then startup resumes it from the same session', async (t) => {
+test('Pi CLI Ctrl+D queues the source without a shutdown model call, then a fresh startup distills and cleans it', async (t) => {
   const root = await mkdtemp(join(tmpdir(), 'pi-distill-cli-queue-'));
   const logPath = join(root, 'provider-events.jsonl');
   await writeFile(logPath, '');
@@ -161,7 +161,7 @@ test('Pi CLI Ctrl+D queues the source without a shutdown model call, then startu
   assert.deepEqual(queued[0].jobIds, []);
   queuedStore.close();
 
-  second = startInteractivePi(root, logPath, { sessionFile: queued[0].sessionFile, delayMs: 0 });
+  second = startInteractivePi(root, logPath, { initialPrompt: false, delayMs: 0 });
   await waitForEvents(logPath,
     (events) => events.some((event) => event.event === 'finish' && event.distill), second);
 
@@ -177,10 +177,17 @@ test('Pi CLI Ctrl+D queues the source without a shutdown model call, then startu
   recoveredStore = new SQLiteMemoryStore(memoryPath);
   try {
     memory = recoveredStore.searchBatch({ terms: ['Cedar'], match: 'any' }).find((row) => row.matchedTerms.length)?.memory;
-    assert.ok(memory, 'the restarted CLI should distill the queued source while reopening the same session');
+    assert.ok(memory, 'the restarted CLI should distill the queued source in a fresh session');
     assert.equal(recoveredStore.listConsolidationJobs().length, 0);
   } finally {
     recoveredStore.close();
   }
+  const cleanupDeadline = Date.now() + 8_000;
+  let removed = false;
+  while (!removed && Date.now() < cleanupDeadline) {
+    try { await readFile(queued[0].sessionFile); } catch (error) { if (error.code !== "ENOENT") throw error; removed = true; }
+    if (!removed) await pause(25);
+  }
+  assert.equal(removed, true, "the fresh CLI must clean the fully processed source after its owner exited");
   await quitWithCtrlD(second);
 });
