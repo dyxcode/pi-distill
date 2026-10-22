@@ -116,14 +116,17 @@ export async function assessSessionRetention(
       const checkpoints = (state: typeof progress): string => JSON.stringify({
         observations: state.observations.filter(observation => observation.sessionId === source.sessionId || resolve(observation.sessionFile) === path),
         usages: state.usages.filter(owner => owner.sessionId === source.sessionId || resolve(owner.sessionFile) === path),
+        triggers: state.pendingTriggers.filter(trigger => trigger.sessionId === source.sessionId || resolve(trigger.sessionFile) === path),
       });
       if (checkpoints(initial) !== checkpoints(progress)) reason = "checkpoint-changed";
     }
     if (reason === "source-unavailable" || reason === "source-changed" || reason === "duplicate-session-id") dependenciesComplete = false;
     const unprocessedSources = reason || !source ? null : source.sourceKeys.filter(key => !processed.has(key)).length;
-    const pendingJobs = reason || !source || !progress ? null : progress.pendingJobs.filter(job =>
-      job.sessionId === source.sessionId || (job.sessionFile !== null && resolve(job.sessionFile) === path),
-    ).length;
+    const pendingJobs = reason || !source || !progress ? null :
+      progress.pendingJobs.filter(job => job.sessionId === source.sessionId ||
+        (job.sessionFile !== null && resolve(job.sessionFile) === path)).length +
+      progress.pendingTriggers.filter(trigger => trigger.sessionId === source.sessionId ||
+        resolve(trigger.sessionFile) === path).length;
     sessions.push({
       sessionFile: path,
       sessionId: source?.sessionId ?? null,

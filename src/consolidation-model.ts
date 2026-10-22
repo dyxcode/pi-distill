@@ -84,6 +84,11 @@ class ConsolidationError extends Error {
   }
 }
 
+export interface ConsolidationModelOptions {
+  /** Waits until the owning live Pi runtime can issue a background model request. */
+  readonly waitUntilIdle?: (signal: AbortSignal) => Promise<void>;
+}
+
 function isRecord(value: unknown): value is RecordValue {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -448,6 +453,7 @@ export async function consolidateWithModel(
   context: Pick<ExtensionContext, "model" | "modelRegistry">,
   store: SQLiteMemoryStore,
   signal: AbortSignal,
+  options: ConsolidationModelOptions = {},
 ): Promise<ConsolidationChanges> {
   const model = context.model;
   if (model === undefined) throw new ConsolidationError("No Pi chat model is selected for consolidation.");
@@ -479,7 +485,6 @@ export async function consolidateWithModel(
   const messages: Message[] = [{ role: "user", content: sourceMessage, timestamp: Date.now() }];
   const modelRequest: ModelRequestContext = { systemPrompt, messages, tools };
   const contextByteLimit = Math.min(MAX_INPUT_BYTES, model.contextWindow - CONTEXT_OUTPUT_RESERVE);
-  const jobSignal = AbortSignal.any([signal, AbortSignal.timeout(MAX_JOB_MS)]);
   const memoryTools = new MemoryTools(() => store);
   const fullyRead = new Map<string, number>();
   let retrievalFailed = false;
@@ -487,9 +492,11 @@ export async function consolidateWithModel(
   let cumulativeOutputBytes = 0;
   let cumulativeOutputTokens = 0;
   let toolCallCount = 0;
+  let cumulativeModelWorkMs = 0;
 
   for (let modelCall = 0; modelCall < MAX_MODEL_CALLS; modelCall += 1) {
-    if (jobSignal.aborted) throw jobSignal.reason ?? new ConsolidationError("Consolidation was cancelled.");
+    await options.waitUntilIdle?.(signal);
+    if (signal.aborted) throw signal.reason ?? new ConsolidationError("Consolidation was cancelled.");
     let serializedRequest: string;
     try {
       serializedRequest = JSON.stringify({ systemPrompt, messages, tools });
@@ -504,11 +511,20 @@ export async function consolidateWithModel(
 
     const remainingOutputTokens = MAX_OUTPUT_TOKENS - cumulativeOutputTokens;
     if (remainingOutputTokens < 1) throw new ConsolidationError("The model output token budget was exhausted.");
+    const remainingModelWorkMs = MAX_JOB_MS - cumulativeModelWorkMs;
+    if (remainingModelWorkMs <= 0) throw new ConsolidationError("The consolidation model-work budget was exhausted.");
+    const requestSignal = AbortSignal.any([signal, AbortSignal.timeout(remainingModelWorkMs)]);
+    const requestStartedAt = Date.now();
     const request = context.modelRegistry.complete(model, modelRequest, {
       maxTokens: Math.min(remainingOutputTokens, model.maxTokens),
-      signal: jobSignal,
+      signal: requestSignal,
     });
-    const response: unknown = await raceAbort(request, jobSignal);
+    let response: unknown;
+    try {
+      response = await raceAbort(request, requestSignal);
+    } finally {
+      cumulativeModelWorkMs += Date.now() - requestStartedAt;
+    }
     const assistant = validateAssistantMessage(response);
     cumulativeOutputTokens += assistant.usage.output;
     cumulativeOutputBytes += Buffer.byteLength(JSON.stringify(assistant.content), "utf8");
@@ -542,7 +558,7 @@ export async function consolidateWithModel(
       const argumentsValue = call.arguments;
       let result: MemoryToolResult;
       if (call.name === "memory_search") {
-        result = await memoryTools.search(argumentsValue, jobSignal);
+        result = await memoryTools.search(argumentsValue, signal);
         const body = resultBody(result);
         if (body.status !== "ok" || result.isError === true) retrievalFailed = true;
       } else {
@@ -551,7 +567,7 @@ export async function consolidateWithModel(
         if (typeof id !== "string" || !positiveRevision(expectedRevision)) {
           throw new ConsolidationError("The model supplied invalid memory-read arguments.");
         }
-        result = await memoryTools.read(argumentsValue, jobSignal);
+        result = await memoryTools.read(argumentsValue, signal);
         const body = resultBody(result);
         if (body.status !== "ok" || result.isError === true) retrievalFailed = true;
         if (body.status === "ok" && body.id === id && body.revision === expectedRevision) {

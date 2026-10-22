@@ -1,291 +1,708 @@
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
+import { resolve } from "node:path";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { SQLiteMemoryStore } from "./memory-store.js";
-import type { ConsolidationJob, SourceBatch } from "./consolidation-types.js";
-import { loadSnapshot, planSources, snapshotSession, type SourceSnapshot } from "./consolidation-source.ts";
+import type { ConsolidationJob, SessionObservation, SourceBatch, SourcePart } from "./consolidation-types.js";
+import type { DistillTrigger, DistillTriggerInput, RetryCategory } from "./task-types.js";
+import {
+  findCompactionRecord,
+  isValidSourceSnapshot,
+  loadSnapshot,
+  planSources,
+  type SourceSnapshot,
+} from "./consolidation-source.ts";
 import { consolidateWithModel } from "./consolidation-model.ts";
 
-type Context = Pick<ExtensionContext, "model" | "modelRegistry" | "sessionManager">;
+type Context = Pick<ExtensionContext, "model" | "modelRegistry" | "sessionManager"> &
+  Partial<Pick<ExtensionContext, "isIdle" | "hasPendingMessages">>;
 type ShutdownReason = "quit" | "reload" | "new" | "resume" | "fork";
+type RunModel = typeof consolidateWithModel;
+
 interface Options {
-  openStore: () => SQLiteMemoryStore;
-  hasStore?: () => boolean;
-  loadSnapshot?: typeof loadSnapshot;
-  runModel?: typeof consolidateWithModel;
-  retryDelayMs?: number;
-  closeGraceMs?: number;
+  readonly openStore: () => SQLiteMemoryStore;
+  readonly hasStore?: () => boolean;
+  readonly loadSnapshot?: typeof loadSnapshot;
+  readonly loadCompactionRecord?: typeof findCompactionRecord;
+  readonly runModel?: RunModel;
+  readonly retryDelayMs?: number;
+  readonly claimLeaseMs?: number;
+  readonly onProgress?: () => void;
 }
 
-/** Owns background work; lifecycle events only register source boundaries. */
+interface SourceReference {
+  readonly sessionId: string;
+  readonly sessionFile: string;
+  readonly leafId: string | null;
+  readonly cwd: string;
+}
+
+interface PendingCompact {
+  readonly id: string;
+  readonly source: SourceReference;
+}
+
+interface ActiveClaim {
+  readonly token: string;
+  readonly store: SQLiteMemoryStore;
+}
+
+class PendingSourceOverlapError extends Error {}
+
+const MAX_RECOVERY_ITEMS_PER_PASS = 4;
+const MAX_OBSERVATIONS_PER_PASS = 4;
+const MAX_PENDING_SCAN_PAGES = 4;
+const PENDING_SCAN_PAGE_SIZE = 32;
+const MAX_MODEL_BATCHES_PER_PASS = 2;
+const SOURCE_EVIDENCE_BYTES = 24 * 1024;
+const CONTEXT_BYTES = 8 * 1024;
+const MODEL_INPUT_RESERVE_BYTES = 16 * 1024;
+const DEFAULT_CLAIM_LEASE_MS = 60_000;
+const INITIAL_IDLE_RETRY_MS = 100;
+const MAX_IDLE_RETRY_MS = 5_000;
+
+/** Coordinates durable source references and model work for one live Pi runtime. */
 export class ConsolidationCoordinator {
   readonly #options: Options;
-  readonly #snapshots = new Map<string, SourceSnapshot>();
+  readonly #workerId = randomUUID();
+  readonly #idleWaiters = new Set<() => void>();
   #store: SQLiteMemoryStore | undefined;
   #context: Context | undefined;
-  #before: SourceSnapshot | undefined;
+  #before: PendingCompact | undefined;
   #working: Promise<void> | undefined;
   #controller: AbortController | undefined;
-  #claim: { id: string; owner: string } | undefined;
+  #activeClaim: ActiveClaim | undefined;
+  #heartbeat: ReturnType<typeof setInterval> | undefined;
   #timer: ReturnType<typeof setTimeout> | undefined;
+  #deferredKick: Promise<void> | undefined;
+  #resolveDeferredKick: (() => void) | undefined;
+  #idleRetryMs = INITIAL_IDLE_RETRY_MS;
   #closed = false;
-  #lastJob: string | undefined;
+  #foregroundBusy = false;
+  #compactionBusy = false;
   #recoveryNeeded = false;
-  readonly #recovered = new Set<string>();
   #lastObservation: string | undefined;
+  #triggerCursor = 0;
+  #observationCursor = 0;
+  #pendingTriggerCursor = 0;
+  #lastJob: string | undefined;
 
   constructor(options: Options) { this.#options = options; }
 
   async start(ctx: Context): Promise<void> {
-    this.#context = ctx;
     if (this.#closed) return;
+    this.#context = ctx;
     try {
-      if (this.#options.hasStore && !this.#options.hasStore()) { this.observe(ctx); return; }
+      if (this.#options.hasStore && !this.#options.hasStore() && !this.#store) {
+        return;
+      }
       this.#recoveryNeeded = true;
-      this.observe(ctx);
       this.#kick();
-    } catch { this.#recoveryNeeded = true; this.#retry(); }
-  }
-
-  async #recover(ctx: Context): Promise<void> {
-    this.#recoveryNeeded = false;
-    const pending = this.#database().observedSessions();
-    const last = pending.findIndex(observation => observation.sessionId === this.#lastObservation);
-    const observations = [...pending.slice(last + 1), ...pending.slice(0, last + 1)];
-    let attempted = 0;
-    for (const observation of observations) {
-      if (this.#closed) return;
-      const key = JSON.stringify(observation);
-      if (this.#recovered.has(key) || observation.sessionId === ctx.sessionManager.getSessionId() || alive(observation.ownerPid)) continue;
-      if (attempted >= 4) { this.#recoveryNeeded = true; break; }
-      attempted++;
-      this.#lastObservation = observation.sessionId;
-      try {
-        const snapshot = await this.#load(observation.sessionFile, observation.leafId);
-        if (this.#closed) return;
-        if (snapshot.sessionId !== observation.sessionId || snapshot.pending) {
-          this.#recoveryNeeded = true;
-          continue;
-        }
-        this.#enqueue(snapshot);
-        this.#recovered.add(key);
-      } catch { this.#recoveryNeeded = true; }
+    } catch {
+      this.#recoveryNeeded = true;
+      this.#retry();
     }
   }
 
+  /** Save bounded identity/checkpoint metadata only; never inspect session entries. */
   observe(ctx: Context): void {
     if (this.#closed) return;
     this.#context = ctx;
     try {
-      const manager = ctx.sessionManager;
-      const sessionFile = manager.getSessionFile();
-      const leafId = manager.getLeafId();
-      if (!sessionFile || leafId === null || !existsSync(sessionFile)) return;
-      this.#database().observeSession({
-        sessionId: manager.getSessionId(), sessionFile,
-        cwd: manager.getCwd(), leafId, ownerPid: process.pid,
-      });
-      // Observation does not create a consolidation job. Previously queued work
-      // can resume after a model is selected later in the session.
-      this.#kick();
-    } catch { /* A later event can retry observation without interrupting Pi. */ }
-  }
-
-  beforeCompact(ctx: Context): void {
-    if (this.#closed) return;
-    this.#context = ctx;
-    try { this.#before = snapshotSession(ctx.sessionManager); this.observe(ctx); }
-    catch { this.#before = undefined; }
-  }
-
-  afterCompact(ctx: Context): void {
-    if (this.#closed) return;
-    this.#context = ctx;
-    const before = this.#before;
-    this.#before = undefined;
-    if (before) {
-      try { this.#enqueue(before); } catch { this.#retry(); }
+      if (this.#options.hasStore && !this.#options.hasStore() && !this.#store) return;
+      const source = this.#sourceReference(ctx);
+      if (!source) return;
+      this.#database().observeSession({ ...source, ownerPid: process.pid });
+    } catch {
+      // Observation is best effort. A later host event can record a newer boundary.
     }
     this.#kick();
   }
 
-  compactFailed(): void { this.#before = undefined; }
+  /** Persist a candidate source boundary. Confirmation waits for the saved entry ID. */
+  beforeCompact(ctx: Context): void {
+    if (this.#closed) return;
+    this.#context = ctx;
+    this.#compactionBusy = true;
+    this.#notifyIdleWaiters();
+    try {
+      const source = this.#sourceReference(ctx);
+      if (!source) { this.#before = undefined; return; }
+      const id = randomUUID();
+      this.#before = { id, source };
+      this.#database().enqueueDistillTrigger(this.#triggerInput(source, "compact", id));
+    } catch {
+      // afterCompact retries the bounded candidate write before confirming it.
+    }
+  }
 
-  async whenIdle(): Promise<void> { await this.#working; }
+  /**
+   * Confirm only when Pi reports the persisted compaction record. The source leaf
+   * remains the pre-compaction boundary, so the summary is never extraction input.
+   */
+  afterCompact(ctx: Context, compactionRecordId: string): void {
+    if (this.#closed) return;
+    this.#context = ctx;
+    const candidate = this.#before;
+    this.#before = undefined;
+    this.#compactionBusy = false;
+    if (candidate && typeof compactionRecordId === "string" && compactionRecordId.length > 0) {
+      try {
+        const store = this.#database();
+        store.enqueueDistillTrigger(this.#triggerInput(candidate.source, "compact", candidate.id));
+        if (store.confirmCompactionTrigger({ id: candidate.id, compactionRecordId })) this.#notifyProgress();
+      } catch {
+        this.#recoveryNeeded = true;
+      }
+    }
+    this.#notifyIdleWaiters();
+    this.#deferKick();
+  }
 
+  /** A failed compaction removes only its unconfirmed candidate. */
+  compactFailed(): void {
+    const candidate = this.#before;
+    this.#before = undefined;
+    this.#compactionBusy = false;
+    if (candidate) {
+      try { this.#store?.cancelCompactionTrigger(candidate.id); }
+      catch { this.#recoveryNeeded = true; }
+    }
+    this.#notifyIdleWaiters();
+    this.#kick();
+  }
+
+  /** Pi adapter signal: do not start or advance model requests while foreground work runs. */
+  setForegroundBusy(busy: boolean): void {
+    this.#foregroundBusy = busy;
+    if (!busy) this.#idleRetryMs = INITIAL_IDLE_RETRY_MS;
+    this.#notifyIdleWaiters();
+    if (!busy && !this.#deferredKick) this.#kick();
+  }
+
+  async whenIdle(): Promise<void> {
+    const deferred = this.#deferredKick;
+    if (deferred) await deferred;
+    await this.#working;
+  }
+
+  /**
+   * Close captures one frozen source reference, then fences and aborts without
+   * waiting on the provider. Reload deliberately creates no semantic trigger.
+   */
   async shutdown(ctx: Context, reason: ShutdownReason): Promise<void> {
     if (this.#closed) return;
     this.#context = ctx;
     if (this.#timer) clearTimeout(this.#timer);
     this.#timer = undefined;
+    this.#resolveDeferredKick?.();
+    this.#resolveDeferredKick = undefined;
+    this.#deferredKick = undefined;
+
     if (reason !== "reload") {
-      try { this.#enqueue(snapshotSession(ctx.sessionManager)); } catch { /* Observe/recovery retains the source. */ }
-      this.#kick();
-    }
-    // Bound shutdown even for providers which ignore cancellation. A fenced claim
-    // and the signal check before commit also prevent a late provider response writing.
-    const grace = reason === "reload" ? 0 : this.#options.closeGraceMs ?? 1_500;
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    try {
-      if (this.#working && grace > 0) await Promise.race([
-        this.#working,
-        new Promise<void>(resolve => { timer = setTimeout(resolve, grace); }),
-      ]);
-    } finally {
-      if (timer) clearTimeout(timer);
-      this.#closed = true;
-      this.#controller?.abort();
-      if (this.#timer) clearTimeout(this.#timer);
-      if (this.#claim) {
-        try { this.#store?.releaseConsolidation(this.#claim.id, this.#claim.owner); } catch { /* Lease expires on recovery. */ }
+      try {
+        const source = this.#sourceReference(ctx);
+        if (source) {
+          const store = this.#database();
+          const id = closeTriggerId(source);
+          store.enqueueDistillTrigger(this.#triggerInput(source, "close", id));
+          store.acknowledgeObservation(source.sessionId, source.leafId);
+        }
+      } catch {
+        // Persisted observations can recover a missed close after this process exits.
       }
-      this.#store?.close();
-      this.#store = undefined;
-      this.#snapshots.clear();
     }
+
+    this.#closed = true;
+    this.#controller?.abort(new Error("Pi runtime is shutting down."));
+    for (const waiter of [...this.#idleWaiters]) waiter();
+    if (this.#heartbeat) clearInterval(this.#heartbeat);
+    this.#heartbeat = undefined;
+    if (this.#activeClaim) {
+      try {
+        this.#activeClaim.store.releaseDistillClaim({
+          claimToken: this.#activeClaim.token,
+          now: Date.now(),
+          retry: { category: "transient", retryAt: Date.now() },
+        });
+      } catch { /* The database lease remains the crash-recovery fence. */ }
+      this.#activeClaim = undefined;
+    }
+    this.#store?.close();
+    this.#store = undefined;
   }
 
   #database(): SQLiteMemoryStore { return this.#store ??= this.#options.openStore(); }
+
+  #sourceReference(ctx: Context): SourceReference | undefined {
+    const manager = ctx.sessionManager;
+    const sessionFile = manager.getSessionFile();
+    const sessionId = manager.getSessionId();
+    const cwd = manager.getCwd();
+    const leafId = manager.getLeafId();
+    if (typeof sessionFile !== "string" || sessionFile.length === 0 || !existsSync(sessionFile)) return undefined;
+    return { sessionId, sessionFile, cwd, leafId };
+  }
+
+  #triggerInput(source: SourceReference, reason: "close" | "compact", id: string): DistillTriggerInput {
+    return { ...source, id, reason };
+  }
+
   #load(path: string, leaf?: string | null): Promise<SourceSnapshot> {
     return (this.#options.loadSnapshot ?? loadSnapshot)(path, leaf);
   }
 
-  #enqueue(snapshot: SourceSnapshot): void {
-    const all = planSources(snapshot, new Set());
-    if (!all.length) {
-      if (!snapshot.pending) this.#store?.acknowledgeObservation(snapshot.sessionId, snapshot.leafId);
+  #kick(): void {
+    const context = this.#context;
+    if (this.#closed || this.#working || !context?.model) return;
+    if (this.#options.hasStore && !this.#options.hasStore() && !this.#store) return;
+    if (!this.#canRun(context)) {
+      if (this.#recoveryNeeded || this.#hasQueuedWork()) this.#retryWhenIdle();
       return;
     }
-    const store = this.#database();
-    const keys = all.flatMap(batch => [...batch.sourceKeys]);
-    const processed = new Set(store.processedSources(keys));
-    // Capturing a newer boundary must not create another job for ranges which
-    // already have durable pending work.
-    for (const queued of store.listConsolidationJobs()) {
-      for (const key of queued.sourceKeys) processed.add(key);
-    }
-    const inputCap = Math.min(64 * 1024, (this.#context?.model?.contextWindow ?? 128_000) - 4_096);
-    const evidenceCap = Math.max(2 * 1024, Math.min(24 * 1024, inputCap - 16 * 1024));
-    for (const planned of planSources(snapshot, processed)) {
-      const batches: SourceBatch[] = [];
-      let evidence: SourceBatch["evidence"][number][] = [];
-      const append = (): void => {
-        if (!evidence.length) return;
-        const sourceKeys = evidence.map(part => part.key);
-        const id = createHash("sha256").update(JSON.stringify([planned.id, sourceKeys])).digest("hex");
-        batches.push({ ...planned, id, sourceKeys, evidence });
-        evidence = [];
-      };
-      for (const part of planned.evidence) {
-        if (Buffer.byteLength(JSON.stringify([...evidence, part])) > evidenceCap) append();
-        evidence.push(part);
-      }
-      append();
-      for (const batch of batches) {
-        const job: ConsolidationJob = {
-          id: batch.id, sessionId: batch.sessionId, sessionFile: batch.sessionFile,
-          leafId: batch.leafId, cwd: batch.cwd, sourceKeys: batch.sourceKeys,
-          lineageSessionIds: [...new Set([
-            snapshot.sessionId,
-            ...Array.from(snapshot.ancestry?.origins.values() ?? [], origin => origin.sessionId),
-          ])],
-          ...sourceBoundary(snapshot, batch.evidence),
-        };
-        store.enqueueConsolidation(job);
-        // Sessionless SDK sessions have no file to recover from. Their live snapshot
-        // can still be processed during the current runtime.
-        if (!snapshot.sessionFile) this.#snapshots.set(job.id, snapshot);
-      }
-    }
-    store.acknowledgeObservation(snapshot.sessionId, snapshot.leafId);
-  }
-
-  #kick(): void {
-    if (this.#closed || this.#working || !this.#context?.model) return;
+    this.#idleRetryMs = INITIAL_IDLE_RETRY_MS;
     if (this.#timer) clearTimeout(this.#timer);
     this.#timer = undefined;
+    const resolveDeferred = this.#resolveDeferredKick;
+    this.#resolveDeferredKick = undefined;
+    this.#deferredKick = undefined;
+    const controller = new AbortController();
+    this.#controller = controller;
+    const signal = controller.signal;
+    this.#working = this.#runPass(context, signal)
+      .catch(() => { this.#recoveryNeeded = true; })
+      .finally(() => {
+        this.#working = undefined;
+        this.#controller = undefined;
+        if (!this.#closed) this.#retryIfNeeded();
+      });
+    resolveDeferred?.();
+  }
+
+  #canRun(context: Context | undefined): boolean {
+    if (this.#closed || this.#foregroundBusy || this.#compactionBusy || !context) return false;
+    try {
+      if (context.isIdle && !context.isIdle()) return false;
+      if (context.hasPendingMessages && context.hasPendingMessages()) return false;
+    } catch { return false; }
+    return true;
+  }
+
+  #notifyIdleWaiters(): void {
+    for (const waiter of [...this.#idleWaiters]) waiter();
+  }
+
+  #waitUntilIdle(signal: AbortSignal): Promise<void> {
     const context = this.#context;
-    this.#controller = new AbortController();
-    const signal = this.#controller.signal;
-    this.#working = (async () => {
-      if (this.#recoveryNeeded) await this.#recover(context);
-      if (!signal.aborted) await this.#pass(context, signal);
-    })().catch(() => { this.#recoveryNeeded = true; }).finally(() => {
-      this.#working = undefined;
-      if (!this.#closed) this.#retry();
+    if (signal.aborted) return Promise.reject(signal.reason ?? new Error("Consolidation was cancelled."));
+    if (this.#canRun(context)) return Promise.resolve();
+    return new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const cleanup = (): void => {
+        this.#idleWaiters.delete(wake);
+        signal.removeEventListener("abort", abort);
+      };
+      const abort = (): void => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        reject(signal.reason ?? new Error("Consolidation was cancelled."));
+      };
+      const wake = (): void => {
+        if (settled) return;
+        if (signal.aborted) { abort(); return; }
+        if (!this.#canRun(this.#context)) return;
+        settled = true;
+        cleanup();
+        resolve();
+      };
+      this.#idleWaiters.add(wake);
+      signal.addEventListener("abort", abort, { once: true });
+      wake();
     });
+  }
+
+  #startClaim(store: SQLiteMemoryStore, token: string): void {
+    this.#activeClaim = { store, token };
+    const interval = Math.max(1_000, Math.floor((this.#options.claimLeaseMs ?? DEFAULT_CLAIM_LEASE_MS) / 3));
+    this.#heartbeat = setInterval(() => {
+      try {
+        const renewed = store.renewDistillClaim({
+          claimToken: token,
+          now: Date.now(),
+          leaseMs: this.#options.claimLeaseMs ?? DEFAULT_CLAIM_LEASE_MS,
+        });
+        if (!renewed) this.#controller?.abort(new Error("The durable consolidation claim was fenced."));
+      } catch {
+        this.#controller?.abort(new Error("The durable consolidation claim could not be renewed."));
+      }
+    }, interval);
+    this.#heartbeat.unref();
+  }
+
+  #finishClaim(): void {
+    if (this.#heartbeat) clearInterval(this.#heartbeat);
+    this.#heartbeat = undefined;
+    this.#activeClaim = undefined;
+  }
+
+  #retryIfNeeded(): void {
+    if (this.#closed) return;
+    const pending = this.#recoveryNeeded || this.#hasQueuedWork();
+    if (!pending) return;
+    if (!this.#canRun(this.#context)) {
+      this.#retryWhenIdle();
+      return;
+    }
+    this.#retry();
+  }
+
+  #hasQueuedWork(): boolean {
+    try {
+      if (this.#options.hasStore && !this.#options.hasStore() && !this.#store) return false;
+      const store = this.#database();
+      return store.listConsolidationJobs().length > 0 || this.#hasPendingTriggers(store);
+    } catch { return true; }
+  }
+
+  #hasPendingTriggers(store: SQLiteMemoryStore): boolean {
+    let cursor: number | undefined = this.#pendingTriggerCursor || undefined;
+    for (let pageCount = 0; pageCount < MAX_PENDING_SCAN_PAGES; pageCount += 1) {
+      const page = store.listDistillTriggers({ limit: PENDING_SCAN_PAGE_SIZE, ...(cursor === undefined ? {} : { cursor }) });
+      if (page.items.some(item => item.status === "pending" || item.status === "candidate")) {
+        this.#pendingTriggerCursor = 0;
+        return true;
+      }
+      if (page.nextCursor === undefined) {
+        this.#pendingTriggerCursor = 0;
+        return false;
+      }
+      cursor = page.nextCursor;
+    }
+    // A bounded scan must not report an empty queue when later rows remain unseen.
+    this.#pendingTriggerCursor = cursor ?? 0;
+    return this.#pendingTriggerCursor !== 0;
   }
 
   #retry(): void {
     if (this.#closed || this.#timer || !this.#context?.model) return;
-    this.#timer = setTimeout(() => { this.#timer = undefined; this.#kick(); }, this.#options.retryDelayMs ?? 30_000);
+    this.#timer = setTimeout(() => {
+      this.#timer = undefined;
+      this.#kick();
+    }, this.#options.retryDelayMs ?? 30_000);
     this.#timer.unref();
   }
 
-  async #pass(context: Context, signal: AbortSignal): Promise<void> {
+  #retryWhenIdle(): void {
+    if (this.#closed || this.#timer || !this.#context?.model) return;
+    const delay = this.#idleRetryMs;
+    this.#idleRetryMs = Math.min(MAX_IDLE_RETRY_MS, this.#idleRetryMs * 2);
+    this.#timer = setTimeout(() => {
+      this.#timer = undefined;
+      this.#kick();
+    }, delay);
+    this.#timer.unref();
+  }
+
+  #deferKick(): void {
+    if (this.#closed || this.#deferredKick) return;
+    if (this.#timer) clearTimeout(this.#timer);
+    let resolveKick: (() => void) | undefined;
+    const deferred = new Promise<void>(resolve => { resolveKick = resolve; });
+    this.#deferredKick = deferred;
+    this.#resolveDeferredKick = resolveKick;
+    this.#timer = setTimeout(() => {
+      this.#timer = undefined;
+      if (this.#deferredKick === deferred) this.#deferredKick = undefined;
+      if (this.#resolveDeferredKick === resolveKick) this.#resolveDeferredKick = undefined;
+      this.#kick();
+      resolveKick?.();
+    }, 0);
+  }
+
+  async #runPass(context: Context, signal: AbortSignal): Promise<void> {
+    if (this.#recoveryNeeded) {
+      await this.#recover(signal);
+      if (!this.#recoveryNeeded && !signal.aborted) this.observe(context);
+    }
+    if (signal.aborted || !this.#canRun(context)) return;
+
+    // Preparation is bounded separately from the two model batches below. The
+    // global SQLite claim prevents another Pi process from preparing or distilling
+    // at the same time.
+    await this.#prepareOneTrigger(signal);
+    if (signal.aborted || !this.#canRun(context)) return;
+
     const store = this.#database();
-    const pending = store.listConsolidationJobs();
-    const last = pending.findIndex(job => job.id === this.#lastJob);
-    const jobs = [...pending.slice(last + 1), ...pending.slice(0, last + 1)];
-    let attempted = 0;
+    const jobs = rotateJobs(store.listConsolidationJobs(), this.#lastJob);
+    let batches = 0;
     for (const job of jobs) {
-      if (signal.aborted || attempted >= 2) break;
-      const owner = randomUUID();
-      if (!store.claimConsolidation(job.id, owner, Date.now(), 60_000)) continue;
+      if (signal.aborted || batches >= MAX_MODEL_BATCHES_PER_PASS || !this.#canRun(context)) break;
+      const claim = store.claimDistillJob({
+        id: job.id,
+        workerId: this.#workerId,
+        now: Date.now(),
+        leaseMs: this.#options.claimLeaseMs ?? DEFAULT_CLAIM_LEASE_MS,
+      });
+      if (!claim) continue;
+      batches++;
       this.#lastJob = job.id;
-      this.#claim = { id: job.id, owner };
-      try {
-        const processed = new Set(store.processedSources(job.sourceKeys));
-        const sourceKeys = job.sourceKeys.filter(key => !processed.has(key));
-        if (!sourceKeys.length) {
-          store.commitConsolidation({jobId:job.id,owner,now:Date.now(),sourceKeys,creates:[],updates:[],deletes:[]});
-          continue;
-        }
-        attempted++;
-        const snapshot = this.#snapshots.get(job.id) ?? (job.sessionFile ? await this.#load(job.sessionFile, job.leafId) : undefined);
-        if (!snapshot || snapshot.sessionId !== job.sessionId || snapshot.cwd !== job.cwd) {
-          throw new Error("Source unavailable or its identity changed.");
-        }
-        const all = planSources(snapshot, new Set());
-        const parts = new Map(all.flatMap(batch => batch.evidence).map(part => [part.key, part]));
-        const evidence = sourceKeys.map(key => {
-          const part = parts.get(key);
-          if (!part) throw new Error("Source changed after capture.");
-          return part;
-        });
-        const currentParts = [...parts.values()];
-        const firstIndex = currentParts.findIndex(part => part.key === sourceKeys[0]);
-        const inputCap = Math.min(64 * 1024, (context.model?.contextWindow ?? 128_000) - 4_096);
-        const contextCap = Math.max(0, Math.min(8 * 1024, inputCap - Buffer.byteLength(JSON.stringify(evidence)) - 8 * 1024));
-        const interpretation: SourceBatch["context"][number][] = [];
-        for (const part of currentParts.slice(0, Math.max(0, firstIndex)).reverse()) {
-          if (Buffer.byteLength(JSON.stringify([part, ...interpretation])) <= contextCap) interpretation.unshift(part);
-        }
-        const batch: SourceBatch = {
-          ...job, sourceKeys, evidence, context: interpretation,
-          lineageKeys: [...parts.keys()],
-          lineageAnchors: snapshot.entries.flatMap(entry => typeof entry === "object" && entry !== null &&
-            "id" in entry && typeof entry.id === "string" ? [anchor(snapshot, entry.id)] : []),
-          lineageSessionIds: [...new Set([
-            snapshot.sessionId,
-            ...Array.from(snapshot.ancestry?.origins.values() ?? [], origin => origin.sessionId),
-          ])],
-        };
-        signal.throwIfAborted();
-        const timeout = AbortSignal.timeout(30_000);
-        const combined = AbortSignal.any([signal, timeout]);
-        const run = this.#options.runModel ?? consolidateWithModel;
-        const changes = await abortable(run(batch, context, store, combined), combined);
-        combined.throwIfAborted();
-        store.commitConsolidation({ ...changes, jobId: job.id, owner, now: Date.now(), sourceKeys });
-        this.#snapshots.delete(job.id);
-      } catch { /* Invalid results and transient failures retain their original source range. */ }
-      finally {
-        if (!this.#closed) { try { store.releaseConsolidation(job.id, owner); } catch { /* Durable lease handles recovery. */ } }
-        this.#claim = undefined;
-      }
+      this.#startClaim(store, claim.claimToken);
+      await this.#processJob(claim.job, claim.claimToken, context, signal, store);
+      this.#finishClaim();
     }
   }
+
+  async #recover(signal: AbortSignal): Promise<void> {
+    const store = this.#database();
+    let unresolved = false;
+    const triggerPage = store.listDistillTriggers({
+      limit: MAX_RECOVERY_ITEMS_PER_PASS,
+      ...(this.#triggerCursor === 0 ? {} : { cursor: this.#triggerCursor }),
+    });
+    for (const trigger of triggerPage.items) {
+      if (signal.aborted) return;
+      if (trigger.status !== "candidate") continue;
+      try {
+        const compactionRecordId = await (this.#options.loadCompactionRecord ?? findCompactionRecord)(
+          trigger.sessionFile,
+          trigger.sessionId,
+          trigger.cwd,
+          trigger.leafId,
+        );
+        if (signal.aborted) return;
+        if (compactionRecordId) store.confirmCompactionTrigger({ id: trigger.id, compactionRecordId });
+        else unresolved = true;
+      } catch { unresolved = true; }
+    }
+    this.#triggerCursor = triggerPage.nextCursor ?? 0;
+    if (this.#triggerCursor !== 0) unresolved = true;
+
+    const observationPage = store.listObservedSessions({
+      limit: MAX_OBSERVATIONS_PER_PASS,
+      ...(this.#observationCursor === 0 ? {} : { cursor: this.#observationCursor }),
+    });
+    const observations = rotateObservations(observationPage.items, this.#lastObservation);
+    for (const observation of observations) {
+      if (signal.aborted) return;
+      this.#lastObservation = observation.sessionId;
+      if (alive(observation.ownerPid) || !observation.sessionFile) continue;
+      try {
+        const source: SourceReference = {
+          sessionId: observation.sessionId,
+          sessionFile: observation.sessionFile,
+          cwd: observation.cwd,
+          leafId: observation.leafId,
+        };
+        store.enqueueDistillTrigger(this.#triggerInput(source, "close", closeTriggerId(source)));
+        store.acknowledgeObservation(observation.sessionId, observation.leafId);
+      } catch { unresolved = true; }
+    }
+
+    this.#observationCursor = observationPage.nextCursor ?? 0;
+    if (this.#observationCursor !== 0) unresolved = true;
+    this.#recoveryNeeded = unresolved || this.#triggerCursor !== 0 || this.#observationCursor !== 0;
+  }
+
+  async #prepareOneTrigger(signal: AbortSignal): Promise<boolean> {
+    if (signal.aborted || !this.#canRun(this.#context)) return false;
+    const store = this.#database();
+    const claim = store.claimDistillTrigger({
+      workerId: this.#workerId,
+      now: Date.now(),
+      leaseMs: this.#options.claimLeaseMs ?? DEFAULT_CLAIM_LEASE_MS,
+    });
+    if (!claim) return false;
+    this.#startClaim(store, claim.claimToken);
+    try {
+      const trigger = claim.trigger;
+      const snapshot = await this.#load(trigger.sessionFile, trigger.leafId);
+      assertSnapshotMatches(snapshot, trigger);
+      if (!isValidSourceSnapshot(snapshot)) throw new Error("The frozen source boundary failed validation or exceeds its bounded preparation budget.");
+      const jobs = this.#prepareJobs(snapshot, trigger, store);
+      store.prepareDistillTrigger({
+        id: trigger.id,
+        claimToken: claim.claimToken,
+        now: Date.now(),
+        jobs,
+      });
+      if (jobs.length === 0) this.#notifyProgress();
+      return true;
+    } catch (error) {
+      const retryAt = error instanceof PendingSourceOverlapError
+        ? Date.now()
+        : Date.now() + (this.#options.retryDelayMs ?? 30_000);
+      this.#releaseClaim(store, claim.claimToken, "transient", retryAt);
+      this.#recoveryNeeded = true;
+      return true;
+    } finally {
+      this.#finishClaim();
+    }
+  }
+
+  #prepareJobs(snapshot: SourceSnapshot, trigger: DistillTrigger, store: SQLiteMemoryStore): ConsolidationJob[] {
+    if (snapshot.pending || snapshot.ancestry?.unresolved) {
+      throw new Error(snapshot.pendingReason ?? "The source branch is not fully available.");
+    }
+    const all = planSources(snapshot, new Set());
+    const allKeys = all.flatMap(batch => [...batch.sourceKeys]);
+    const processed = new Set(store.processedSources(allKeys));
+    const sourceKeySet = new Set(allKeys);
+    const queued: ConsolidationJob[] = [];
+    for (const job of store.listConsolidationJobs()) {
+      if (!job.sourceKeys.some(key => sourceKeySet.has(key))) continue;
+      if (job.sessionId !== trigger.sessionId || job.sessionFile !== trigger.sessionFile || job.cwd !== trigger.cwd ||
+        job.leafId !== trigger.leafId || !job.sourceKeys.every(key => sourceKeySet.has(key))) {
+        throw new PendingSourceOverlapError("A queued batch overlaps this frozen range under a different source boundary.");
+      }
+      queued.push(job);
+    }
+    for (const job of queued) for (const key of job.sourceKeys) processed.add(key);
+
+    const inputCap = Math.min(64 * 1024, (this.#context?.model?.contextWindow ?? 128_000) - 4_096);
+    const evidenceCap = Math.max(2 * 1024, Math.min(SOURCE_EVIDENCE_BYTES, inputCap - MODEL_INPUT_RESERVE_BYTES));
+    const jobs: ConsolidationJob[] = [...queued];
+    for (const planned of planSources(snapshot, processed)) {
+      let evidence: SourcePart[] = [];
+      const append = (): void => {
+        if (evidence.length === 0) return;
+        const sourceKeys = evidence.map(part => part.key);
+        const id = createHash("sha256").update(JSON.stringify([planned.id, sourceKeys])).digest("hex");
+        const batch = { ...planned, id, sourceKeys, evidence };
+        jobs.push({
+          id: batch.id,
+          sessionId: trigger.sessionId,
+          sessionFile: trigger.sessionFile,
+          leafId: trigger.leafId,
+          cwd: trigger.cwd,
+          sourceKeys,
+          lineageSessionIds: triggerLineageSessionIds(snapshot),
+          ...sourceBoundary(snapshot, evidence),
+        });
+        evidence = [];
+      };
+      for (const part of planned.evidence) {
+        if (evidence.length > 0 && Buffer.byteLength(JSON.stringify([...evidence, part])) > evidenceCap) append();
+        evidence.push(part);
+      }
+      append();
+    }
+    return jobs;
+  }
+
+  async #processJob(
+    job: ConsolidationJob,
+    claimToken: string,
+    context: Context,
+    signal: AbortSignal,
+    store: SQLiteMemoryStore,
+  ): Promise<void> {
+    try {
+      const processed = new Set(store.processedSources(job.sourceKeys));
+      const sourceKeys = job.sourceKeys.filter(key => !processed.has(key));
+      if (sourceKeys.length === 0) {
+        store.commitConsolidation({ jobId: job.id, owner: claimToken, now: Date.now(), sourceKeys, creates: [], updates: [], deletes: [] });
+        this.#notifyProgress();
+        return;
+      }
+      const sourceFile = job.sessionFile;
+      if (typeof sourceFile !== "string" || sourceFile.length === 0) throw new Error("A durable source file is unavailable.");
+      const snapshot = await this.#load(sourceFile, job.leafId);
+      assertSnapshotMatches(snapshot, job);
+      if (!isValidSourceSnapshot(snapshot)) throw new Error("The frozen source boundary failed validation or exceeds its bounded preparation budget.");
+      const all = planSources(snapshot, new Set());
+      const parts = new Map(all.flatMap(batch => batch.evidence).map(part => [part.key, part]));
+      const evidence = sourceKeys.map(key => {
+        const part = parts.get(key);
+        if (!part) throw new Error("A frozen source reference changed after preparation.");
+        return part;
+      });
+      const currentParts = [...parts.values()];
+      const firstIndex = currentParts.findIndex(part => part.key === sourceKeys[0]);
+      const inputCap = Math.min(64 * 1024, (context.model?.contextWindow ?? 128_000) - 4_096);
+      const contextCap = Math.max(0, Math.min(CONTEXT_BYTES,
+        inputCap - Buffer.byteLength(JSON.stringify(evidence)) - 8 * 1024));
+      const interpretation: SourcePart[] = [];
+      for (const part of currentParts.slice(0, Math.max(0, firstIndex)).reverse()) {
+        if (Buffer.byteLength(JSON.stringify([part, ...interpretation])) <= contextCap) interpretation.unshift(part);
+      }
+      const batch: SourceBatch = {
+        ...job,
+        sourceKeys,
+        evidence,
+        context: interpretation,
+        lineageKeys: [...parts.keys()],
+        lineageAnchors: snapshot.entries.flatMap(entry =>
+          typeof entry === "object" && entry !== null && "id" in entry && typeof entry.id === "string"
+            ? [anchor(snapshot, entry.id)] : []),
+        lineageSessionIds: triggerLineageSessionIds(snapshot),
+      };
+      await this.#waitUntilIdle(signal);
+      signal.throwIfAborted();
+      const run = this.#options.runModel ?? consolidateWithModel;
+      const changes = await abortable(
+        run(batch, context, store, signal, { waitUntilIdle: requestSignal => this.#waitUntilIdle(requestSignal) }),
+        signal,
+      );
+      signal.throwIfAborted();
+      store.commitConsolidation({ ...changes, jobId: job.id, owner: claimToken, now: Date.now(), sourceKeys });
+      this.#notifyProgress();
+    } catch {
+      if (!this.#closed) this.#releaseClaim(store, claimToken, "transient");
+    }
+  }
+
+  #releaseClaim(store: SQLiteMemoryStore, claimToken: string, category: RetryCategory, retryAt?: number): void {
+    try {
+      store.releaseDistillClaim({
+        claimToken,
+        now: Date.now(),
+        retry: { category, retryAt: retryAt ?? Date.now() + (this.#options.retryDelayMs ?? 30_000) },
+      });
+    } catch { /* Expiring the lease is the final recovery path. */ }
+  }
+
+  #notifyProgress(): void {
+    try { this.#options.onProgress?.(); } catch { /* Cleanup wake failures must not block consolidation. */ }
+  }
+}
+
+function rotateJobs(jobs: readonly ConsolidationJob[], last: string | undefined): ConsolidationJob[] {
+  if (!last) return [...jobs];
+  const index = jobs.findIndex(job => job.id === last);
+  return index < 0 ? [...jobs] : [...jobs.slice(index + 1), ...jobs.slice(0, index + 1)];
+}
+
+function rotateObservations(observations: readonly SessionObservation[], last: string | undefined): SessionObservation[] {
+  if (!last) return [...observations];
+  const index = observations.findIndex(observation => observation.sessionId === last);
+  return index < 0 ? [...observations] : [...observations.slice(index + 1), ...observations.slice(0, index + 1)];
+}
+
+function closeTriggerId(source: SourceReference): string {
+  return createHash("sha256").update(JSON.stringify([
+    "pi-distill-close-trigger-v1", source.sessionId, source.sessionFile, source.leafId,
+  ])).digest("hex");
+}
+
+function assertSnapshotMatches(snapshot: SourceSnapshot, reference: Pick<DistillTrigger, "sessionId" | "sessionFile" | "leafId" | "cwd"> | ConsolidationJob): void {
+  if (snapshot.pending || snapshot.ancestry?.unresolved) {
+    throw new Error(snapshot.pendingReason ?? "The source branch is not fully available.");
+  }
+  if (snapshot.sessionId !== reference.sessionId || snapshot.cwd !== reference.cwd || snapshot.leafId !== reference.leafId) {
+    throw new Error("The original source boundary is unavailable or changed.");
+  }
+  if (typeof reference.sessionFile !== "string" || snapshot.sessionFile === null ||
+    resolve(snapshot.sessionFile) !== resolve(reference.sessionFile)) {
+    throw new Error("The persisted source file identity changed.");
+  }
+}
+
+function triggerLineageSessionIds(snapshot: SourceSnapshot): string[] {
+  return [...new Set([
+    snapshot.sessionId,
+    ...Array.from(snapshot.ancestry?.origins.values() ?? [], origin => origin.sessionId),
+  ])];
 }
 
 function alive(pid: number): boolean {
@@ -295,7 +712,7 @@ function alive(pid: number): boolean {
   }
 }
 
-function sourceBoundary(snapshot: SourceSnapshot, evidence: SourceBatch["evidence"]): {
+function sourceBoundary(snapshot: SourceSnapshot, evidence: readonly SourcePart[]): {
   sourceTime?: string;
   branchAnchor?: string;
 } {
@@ -308,8 +725,6 @@ function sourceBoundary(snapshot: SourceSnapshot, evidence: SourceBatch["evidenc
     const changedEvidence = "type" in entry && entry.type === "context_edit" && "targetId" in entry &&
       typeof entry.targetId === "string" && ids.has(snapshot.ancestry?.origins.get(entry.targetId)?.entryId ?? entry.targetId);
     if (!ids.has(sourceId) && !changedEvidence) continue;
-    // Corrected text retains its original message ID. Its supporting branch
-    // also needs the edit event, which an unedited sibling does not contain.
     boundary = entry.id;
     if (!("timestamp" in entry) || typeof entry.timestamp !== "string") continue;
     const date = new Date(entry.timestamp);
@@ -329,11 +744,16 @@ function anchor(snapshot: SourceSnapshot, entryId: string): string {
     "pi-distill-entry-anchor-v1", origin?.sessionId ?? snapshot.sessionId, origin?.entryId ?? entryId,
   ])).digest("hex");
 }
+
 function abortable<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) return Promise.reject(signal.reason ?? new Error("Consolidation cancelled."));
   return new Promise<T>((resolve, reject) => {
-    const abort = (): void => reject(new Error("Consolidation cancelled."));
-    if (signal.aborted) abort();
-    else signal.addEventListener("abort", abort, {once:true});
-    promise.then(resolve, reject).finally(() => signal.removeEventListener("abort", abort));
+    const cleanup = (): void => signal.removeEventListener("abort", abort);
+    const abort = (): void => { cleanup(); reject(signal.reason ?? new Error("Consolidation cancelled.")); };
+    signal.addEventListener("abort", abort, { once: true });
+    promise.then(
+      value => { cleanup(); resolve(value); },
+      error => { cleanup(); reject(error); },
+    );
   });
 }

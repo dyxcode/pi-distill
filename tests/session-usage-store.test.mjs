@@ -206,6 +206,7 @@ test("consolidation status reads usages and observations from one read snapshot"
     assert.deepEqual(reader.readConsolidationStatus([]), {
       processedSources: [],
       pendingJobs: [],
+      pendingTriggers: [],
       observations: [observation],
       usages: [active],
     });
@@ -354,7 +355,7 @@ test("schema v2 migration preserves memories, jobs, progress, origins and observ
   store.close();
 
   const downgrade = database(f.path);
-  downgrade.exec("DROP TABLE IF EXISTS session_usages; PRAGMA user_version = 2");
+  restoreV2Schema(downgrade);
   downgrade.close();
 
   const upgraded = f.open();
@@ -379,7 +380,7 @@ test("schema v2 migration preserves memories, jobs, progress, origins and observ
 
   const verify = database(f.path);
   try {
-    assert.equal(verify.prepare("PRAGMA user_version").get()["user_version"], 3);
+    assert.equal(verify.prepare("PRAGMA user_version").get()["user_version"], 4);
     assert.deepEqual(verify.prepare("SELECT name FROM sqlite_schema WHERE name = 'session_usages'").all()
       .map(row => row["name"]), ["session_usages"]);
   } finally {
@@ -402,7 +403,7 @@ test("invalid v2 state aborts migration without changing the database version or
   store.close();
 
   const downgrade = database(f.path);
-  downgrade.exec("DROP TABLE IF EXISTS session_usages; PRAGMA user_version = 2");
+  restoreV2Schema(downgrade);
   downgrade.prepare("UPDATE session_observations SET session_file = 'relative/session.jsonl'").run();
   downgrade.close();
 
@@ -425,7 +426,7 @@ test("v2 migration rejects an unexpected schema object without changing existing
   store.close();
 
   const raw = database(f.path);
-  raw.exec("DROP TABLE IF EXISTS session_usages; PRAGMA user_version = 2");
+  restoreV2Schema(raw);
   raw.exec("CREATE TABLE unexpected (value TEXT NOT NULL) STRICT");
   raw.prepare("INSERT INTO unexpected VALUES (?)").run("preserve");
   raw.close();
@@ -442,3 +443,19 @@ test("v2 migration rejects an unexpected schema object without changing existing
     verify.close();
   }
 });
+
+// Reconstruct the historical fixture rather than relabeling current schema as v2.
+function restoreV2Schema(db) {
+  db.exec(`
+    DROP TABLE session_usages;
+    DROP TABLE clean_tasks;
+    DROP TABLE distill_trigger_jobs;
+    DROP TABLE distill_triggers;
+    DROP TABLE distill_lease;
+    ALTER TABLE consolidation_jobs RENAME TO jobs_current;
+    CREATE TABLE consolidation_jobs (id TEXT PRIMARY KEY NOT NULL, job_json TEXT NOT NULL, status TEXT NOT NULL CHECK (status IN ('pending', 'complete')), lease_owner TEXT, lease_until INTEGER, CHECK ((lease_owner IS NULL AND lease_until IS NULL) OR (lease_owner IS NOT NULL AND lease_until IS NOT NULL))) STRICT;
+    INSERT INTO consolidation_jobs SELECT id, job_json, status, lease_owner, lease_until FROM jobs_current;
+    DROP TABLE jobs_current;
+    PRAGMA user_version = 2;
+  `);
+}

@@ -95,7 +95,7 @@ test("pending job order follows enqueue order rather than job ID order", async (
   assert.deepEqual(store.listConsolidationJobs(), [earlier, later]);
 });
 
-test("a session's pending jobs are claimed in order while other sessions proceed", async (t) => {
+test("global distill claims serialize across sessions while preserving per-session job order", async (t) => {
   const f = await fixture(t);
   const store = f.open();
   const secondStore = f.open();
@@ -108,11 +108,13 @@ test("a session's pending jobs are claimed in order while other sessions proceed
 
   assert.equal(secondStore.claimConsolidation(later.id, "worker-later", 100, 50), false);
   assert.equal(secondStore.claimConsolidation(unrelated.id, "worker-other", 100, 50), true);
-  assert.equal(store.claimConsolidation(earlier.id, "worker-earlier", 100, 50), true);
-  assert.equal(secondStore.claimConsolidation(later.id, "worker-later", 101, 50), false);
+  assert.equal(store.claimConsolidation(earlier.id, "worker-earlier", 100, 50), false);
 
-  assert.equal(store.commitConsolidation(commit(earlier.id, "worker-earlier")), true);
-  assert.equal(secondStore.claimConsolidation(later.id, "worker-later", 102, 50), true);
+  assert.equal(secondStore.commitConsolidation(commit(unrelated.id, "worker-other")), true);
+  assert.equal(store.claimConsolidation(earlier.id, "worker-earlier", 101, 50), true);
+  assert.equal(secondStore.claimConsolidation(later.id, "worker-later", 102, 50), false);
+  assert.equal(store.commitConsolidation(commit(earlier.id, "worker-earlier", { now: 103 })), true);
+  assert.equal(secondStore.claimConsolidation(later.id, "worker-later", 104, 50), true);
 });
 
 test("claims serialize across connections, expire at the boundary, and release only for their owner", async (t) => {
@@ -342,6 +344,7 @@ test("processing assessments read committed progress while another connection ho
     assert.deepEqual(store.readConsolidationStatus([...first.sourceKeys, ...second.sourceKeys]), {
       processedSources: first.sourceKeys,
       pendingJobs: [second],
+      pendingTriggers: [],
       observations: [],
       usages: [],
     });
@@ -518,12 +521,16 @@ test("schema v0 and v1 migrations preserve every current memory field and create
     }
     const check = database(f.path);
     try {
-      assert.equal(check.prepare("PRAGMA user_version").get()["user_version"], 3);
+      assert.equal(check.prepare("PRAGMA user_version").get()["user_version"], 4);
       const names = check.prepare("SELECT name FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*' ORDER BY name")
         .all().map((row) => row["name"]);
       assert.deepEqual(names, [
+        "clean_tasks",
         "consolidation_jobs",
         "consolidation_progress",
+        "distill_lease",
+        "distill_trigger_jobs",
+        "distill_triggers",
         "memories",
         "memory_origins",
         "session_observations",
@@ -554,14 +561,14 @@ test("schema v0 and v1 migrations preserve every current memory field and create
 test("future and unknown schemas fail without being reset", async (t) => {
   const f = await fixture(t);
   const raw = database(f.path);
-  raw.exec("CREATE TABLE future_data (value TEXT NOT NULL) STRICT; PRAGMA user_version = 4");
+  raw.exec("CREATE TABLE future_data (value TEXT NOT NULL) STRICT; PRAGMA user_version = 5");
   raw.prepare("INSERT INTO future_data VALUES (?)").run("preserve");
   raw.close();
 
   assert.throws(() => new SQLiteMemoryStore(f.path), /unsupported.*schema version/i);
   const verify = database(f.path);
   try {
-    assert.equal(verify.prepare("PRAGMA user_version").get()["user_version"], 4);
+    assert.equal(verify.prepare("PRAGMA user_version").get()["user_version"], 5);
     assert.equal(verify.prepare("SELECT value FROM future_data").get()["value"], "preserve");
   } finally {
     verify.close();

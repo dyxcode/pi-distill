@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
-import { evaluationFailureStatus, trackStreamCompletion, waitForConsolidation } from "./consolidation-model-eval-support.mjs";
+import { countOutstandingDistillTriggers, evaluationFailureStatus, trackStreamCompletion, waitForConsolidation } from "./consolidation-model-eval-support.mjs";
 
 test("SDK streams finish request accounting without a foreground message_end event", async () => {
   for (const type of ["done", "error"]) {
@@ -35,7 +35,7 @@ test("provider failure after partial evaluation remains incomplete with recorded
   assert.equal(evaluationFailureStatus("harness_failure", { providerRequests: 1 }), "harness_failure");
 });
 
-const empty = { memories: [], pendingJobs: 0, pendingObservations: 0 };
+const empty = { memories: [], pendingJobs: 0, pendingTriggers: 0, pendingObservations: 0 };
 const idle = { inFlightRequests: 0, completedRequests: 0, lastRequestCompletion: 0, requestLimitHit: false };
 
 async function runWait(readState, activity = () => idle, timeoutMs = 3_000) {
@@ -57,9 +57,39 @@ test("an apparently idle snapshot waits for delayed boundary work and its durabl
   assert.ok(result.elapsed >= 1_600);
 });
 
-test("uncaptured observations or in-flight requests prevent an unchanged-state pass", async () => {
+test("a live session observation is diagnostic and does not block completed work", async () => {
   const observed = await runWait(() => ({ ...empty, pendingObservations: 1 }));
-  assert.equal(observed.settled, false);
+  assert.equal(observed.settled, true);
+  assert.equal(observed.state.pendingObservations, 1);
+});
+
+test("an unprepared trigger blocks settlement until durable distillation finishes", async () => {
+  const result = await runWait((now) => now < 600
+    ? { ...empty, pendingTriggers: 1 }
+    : { ...empty, memories: [{ id: "task", revision: 1, content: "cancelled" }] });
+  assert.equal(result.settled, true);
+  assert.equal(result.state.pendingTriggers, 0);
+  assert.ok(result.elapsed >= 1_600);
+});
+
+test("outstanding trigger count paginates and includes candidates, pending, and prepared work", () => {
+  const pages = new Map([
+    [undefined, { items: [{ status: "candidate" }, { status: "complete" }], nextCursor: 2 }],
+    [2, { items: [{ status: "pending" }, { status: "prepared" }], nextCursor: 4 }],
+    [4, { items: [{ status: "complete" }] }],
+  ]);
+  const cursors = [];
+  const count = countOutstandingDistillTriggers(({ cursor }) => {
+    cursors.push(cursor);
+    const page = pages.get(cursor);
+    assert.ok(page, `unexpected cursor ${cursor}`);
+    return page;
+  });
+  assert.equal(count, 3);
+  assert.deepEqual(cursors, [undefined, 2, 4]);
+});
+
+test("an in-flight model request prevents an unchanged-state pass", async () => {
   const running = await runWait(() => empty, () => ({ ...idle, inFlightRequests: 1 }));
   assert.equal(running.settled, false);
 });

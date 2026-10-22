@@ -1,4 +1,5 @@
 import { isAbsolute } from "node:path";
+import { createHash, randomUUID } from "node:crypto";
 import { DatabaseSync, type StatementSync } from "node:sqlite";
 import type {
   ConsolidationCommit,
@@ -6,6 +7,23 @@ import type {
   SessionObservation,
 } from "./consolidation-types.js";
 import type { SessionUsage } from "./session-usage-types.js";
+import type {
+  CleanTask,
+  CleanTaskInput,
+  CleanTaskPageOptions,
+  DistillClaimInput,
+  DistillJobClaim,
+  DistillTrigger,
+  DistillTriggerInput,
+  DistillTriggerClaim,
+  PrepareDistillTriggerInput,
+  ReleaseDistillClaimInput,
+  RetryCategory,
+  RetryRequest,
+  TaskPage,
+  TaskPageOptions,
+  WaitReason,
+} from "./task-types.js";
 
 const initialColumns = `
   id TEXT PRIMARY KEY NOT NULL,
@@ -21,7 +39,7 @@ const maxKnownSessionFiles = 1_024;
 // Assessment reads validate at most this many persisted metadata records per snapshot.
 const maxSessionMetadataRows = 16_384;
 
-const consolidationJobsSchema =
+const consolidationJobsV3Schema =
   "CREATE TABLE consolidation_jobs (" +
   "id TEXT PRIMARY KEY NOT NULL, " +
   "job_json TEXT NOT NULL, " +
@@ -30,6 +48,20 @@ const consolidationJobsSchema =
   "lease_until INTEGER, " +
   "CHECK ((lease_owner IS NULL AND lease_until IS NULL) OR " +
   "(lease_owner IS NOT NULL AND lease_until IS NOT NULL))" +
+  ") STRICT";
+const consolidationJobsSchema =
+  "CREATE TABLE consolidation_jobs (" +
+  "id TEXT PRIMARY KEY NOT NULL, " +
+  "job_json TEXT NOT NULL, " +
+  "status TEXT NOT NULL CHECK (status IN ('pending', 'complete')), " +
+  "lease_owner TEXT, " +
+  "lease_until INTEGER, " +
+  "retry_category TEXT CHECK (retry_category IS NULL OR retry_category IN ('transient', 'unavailable', 'invalid')), " +
+  "retry_at INTEGER, " +
+  "CHECK ((lease_owner IS NULL AND lease_until IS NULL) OR " +
+  "(lease_owner IS NOT NULL AND lease_until IS NOT NULL)), " +
+  "CHECK ((retry_category IS NULL AND retry_at IS NULL) OR " +
+  "(retry_category IS NOT NULL AND retry_at IS NOT NULL))" +
   ") STRICT";
 const consolidationProgressSchema =
   "CREATE TABLE consolidation_progress (" +
@@ -63,7 +95,56 @@ const sessionUsagesSchema =
   "owner_pid INTEGER NOT NULL CHECK (owner_pid > 0), " +
   "state TEXT NOT NULL CHECK (state IN ('active', 'closing', 'released'))" +
   ") STRICT";
-const latestSchemaVersion = 3;
+const distillTriggersSchema =
+  "CREATE TABLE distill_triggers (" +
+  "id TEXT PRIMARY KEY NOT NULL, " +
+  "trigger_json TEXT NOT NULL, " +
+  "status TEXT NOT NULL CHECK (status IN ('candidate', 'pending', 'prepared', 'complete')), " +
+  "compaction_record_id TEXT, " +
+  "retry_category TEXT CHECK (retry_category IS NULL OR retry_category IN ('transient', 'unavailable', 'invalid')), " +
+  "retry_at INTEGER, " +
+  "CHECK ((retry_category IS NULL AND retry_at IS NULL) OR " +
+  "(retry_category IS NOT NULL AND retry_at IS NOT NULL))" +
+  ") STRICT";
+const triggerJobsSchema =
+  "CREATE TABLE distill_trigger_jobs (" +
+  "id TEXT PRIMARY KEY NOT NULL, " +
+  "trigger_id TEXT NOT NULL, " +
+  "job_id TEXT NOT NULL, " +
+  "ordinal INTEGER NOT NULL CHECK (ordinal >= 0)" +
+  ") STRICT";
+const distillLeaseSchema =
+  "CREATE TABLE distill_lease (" +
+  "singleton INTEGER PRIMARY KEY NOT NULL CHECK (singleton = 1), " +
+  "claim_token TEXT, " +
+  "worker_id TEXT, " +
+  "task_kind TEXT CHECK (task_kind IS NULL OR task_kind IN ('trigger', 'job')), " +
+  "task_id TEXT, " +
+  "lease_until INTEGER, " +
+  "CHECK ((claim_token IS NULL AND worker_id IS NULL AND task_kind IS NULL AND " +
+  "task_id IS NULL AND lease_until IS NULL) OR " +
+  "(claim_token IS NOT NULL AND worker_id IS NOT NULL AND task_kind IS NOT NULL AND " +
+  "task_id IS NOT NULL AND lease_until IS NOT NULL))" +
+  ") STRICT";
+const cleanTasksSchema =
+  "CREATE TABLE clean_tasks (" +
+  "id TEXT PRIMARY KEY NOT NULL, " +
+  "task_json TEXT NOT NULL, " +
+  "status TEXT NOT NULL CHECK (status IN ('pending', 'waiting')), " +
+  "wait_reason TEXT CHECK (wait_reason IS NULL OR wait_reason IN " +
+  "('host_coordination', 'unprocessed', 'usage', 'dependencies', 'unavailable')), " +
+  "retry_category TEXT CHECK (retry_category IS NULL OR retry_category IN ('transient', 'unavailable', 'invalid')), " +
+  "retry_at INTEGER, " +
+  "lease_owner TEXT, " +
+  "lease_until INTEGER, " +
+  "CHECK ((status = 'pending' AND wait_reason IS NULL) OR status = 'waiting'), " +
+  "CHECK ((retry_category IS NULL AND retry_at IS NULL) OR " +
+  "(retry_category IS NOT NULL AND retry_at IS NOT NULL)), " +
+  "CHECK ((lease_owner IS NULL AND lease_until IS NULL) OR " +
+  "(lease_owner IS NOT NULL AND lease_until IS NOT NULL))" +
+  ") STRICT";
+const latestSchemaVersion = 4;
+const maxTaskPageSize = 128;
 
 // Node 22 truncates TEXT results at NUL. Return bytes only at the result boundary;
 // predicates and ordering must continue to use the original TEXT columns.
@@ -78,7 +159,21 @@ const memoryColumns = [
 ].join(", ");
 const jobColumns = [
   textColumn("id"), textColumn("job_json"), textColumn("status"),
-  textColumn("lease_owner"), "lease_until",
+  textColumn("lease_owner"), "lease_until", textColumn("retry_category", "retryCategory"), "retry_at AS retryAt",
+].join(", ");
+const legacyJobColumns = [
+  textColumn("id"), textColumn("job_json"), textColumn("status"),
+  textColumn("lease_owner"), "lease_until", "NULL AS retryCategory", "NULL AS retryAt",
+].join(", ");
+const triggerColumns = [
+  textColumn("id"), textColumn("trigger_json", "triggerJson"), textColumn("status"),
+  textColumn("compaction_record_id", "compactionRecordId"),
+  textColumn("retry_category", "retryCategory"), "retry_at AS retryAt",
+].join(", ");
+const cleanTaskColumns = [
+  textColumn("id"), textColumn("task_json", "taskJson"), textColumn("status"),
+  textColumn("wait_reason", "waitReason"), textColumn("retry_category", "retryCategory"),
+  "retry_at AS retryAt", textColumn("lease_owner", "leaseOwner"), "lease_until AS leaseUntil",
 ].join(", ");
 const progressColumns = [textColumn("source_key"), textColumn("job_id"), "processed_at"].join(", ");
 const originColumns = [textColumn("memory_id", "memoryId"), textColumn("job_id", "jobId"), "revision"].join(", ");
@@ -94,11 +189,40 @@ const sessionUsageColumns = [
 ].join(", ");
 const schemaColumns = [textColumn("name"), textColumn("type"), textColumn("sql")].join(", ");
 
+interface PersistedDistillTrigger {
+  readonly trigger: DistillTriggerInput;
+  readonly status: DistillTrigger["status"];
+  readonly compactionRecordId: string | null;
+  readonly retryCategory: RetryCategory | null;
+  readonly retryAt: number | null;
+  readonly jobIds: readonly string[];
+}
+
+interface PersistedCleanTask {
+  readonly task: CleanTaskInput;
+  readonly status: CleanTask["status"];
+  readonly waitReason: WaitReason | null;
+  readonly retryCategory: RetryCategory | null;
+  readonly retryAt: number | null;
+  readonly leaseOwner: string | null;
+  readonly leaseUntil: number | null;
+}
+
+interface PersistedDistillLease {
+  readonly claimToken: string | null;
+  readonly workerId: string | null;
+  readonly taskKind: "trigger" | "job" | null;
+  readonly taskId: string | null;
+  readonly leaseUntil: number | null;
+}
+
 interface PersistedConsolidationJob {
   readonly job: ConsolidationJob;
   readonly status: "pending" | "complete";
   readonly leaseOwner: string | null;
   readonly leaseUntil: number | null;
+  readonly retryCategory: RetryCategory | null;
+  readonly retryAt: number | null;
 }
 
 interface SchemaColumn {
@@ -471,8 +595,8 @@ function parseConsolidationCommit(value: unknown): ConsolidationCommit {
 }
 
 function parsePersistedJobRow(value: unknown): PersistedConsolidationJob {
-  const { id, job_json, status, lease_owner, lease_until } = fields(
-    value, ["id", "job_json", "status", "lease_owner", "lease_until"],
+  const { id, job_json, status, lease_owner, lease_until, retryCategory, retryAt } = fields(
+    value, ["id", "job_json", "status", "lease_owner", "lease_until", "retryCategory", "retryAt"],
   );
   if (typeof job_json !== "string") throw new TypeError("Stored consolidation job JSON must be text.");
   let decoded: unknown;
@@ -497,7 +621,244 @@ function parsePersistedJobRow(value: unknown): PersistedConsolidationJob {
   if ((leaseOwner === null) !== (leaseUntil === null) || (status === "complete" && leaseOwner !== null)) {
     throw new TypeError("Stored consolidation lease state is inconsistent.");
   }
-  return { job, status, leaseOwner, leaseUntil };
+  const parsedRetry = parseRetryFields(retryCategory, retryAt, "Stored consolidation retry");
+  if (status === "complete" && parsedRetry.retryCategory !== null) {
+    throw new TypeError("Stored completed consolidation job has retry metadata.");
+  }
+  return { job, status, leaseOwner, leaseUntil, ...parsedRetry };
+}
+
+function parseRetryCategory(value: unknown, field: string): RetryCategory | null {
+  if (value === null) return null;
+  if (value !== "transient" && value !== "unavailable" && value !== "invalid") {
+    throw new TypeError(field + " category is invalid.");
+  }
+  return value;
+}
+
+function parseRetryFields(
+  categoryValue: unknown,
+  atValue: unknown,
+  field: string,
+): { readonly retryCategory: RetryCategory | null; readonly retryAt: number | null } {
+  const retryCategory = parseRetryCategory(categoryValue, field);
+  let retryAt: number | null = null;
+  if (atValue !== null) {
+    validateNow(atValue, field + " time");
+    retryAt = atValue;
+  }
+  if ((retryCategory === null) !== (retryAt === null)) {
+    throw new TypeError(field + " metadata is inconsistent.");
+  }
+  return { retryCategory, retryAt };
+}
+
+function parseDistillTriggerInput(value: unknown): DistillTriggerInput {
+  const { id, sessionId, sessionFile, leafId, cwd, reason } = fields(
+    value, ["id", "sessionId", "sessionFile", "leafId", "cwd", "reason"],
+  );
+  validateText(id, "distill trigger ID");
+  validateText(sessionId, "distill trigger session ID");
+  validateAbsolutePath(sessionFile, "distill trigger session file");
+  validateAbsolutePath(cwd, "distill trigger working directory");
+  const parsedLeafId = parseNullableText(leafId, "distill trigger leaf ID");
+  if (reason !== "close" && reason !== "compact") {
+    throw new TypeError("Distill trigger reason must be close or compact.");
+  }
+  return { id, sessionId, sessionFile, leafId: parsedLeafId, cwd, reason };
+}
+
+function parsePersistedDistillTrigger(value: unknown, jobIds: readonly string[]): PersistedDistillTrigger {
+  const { id, triggerJson, status, compactionRecordId, retryCategory, retryAt } = fields(
+    value, ["id", "triggerJson", "status", "compactionRecordId", "retryCategory", "retryAt"],
+  );
+  if (typeof triggerJson !== "string") throw new TypeError("Stored distill trigger JSON must be text.");
+  let decoded: unknown;
+  try { decoded = JSON.parse(triggerJson); }
+  catch { throw new TypeError("Stored distill trigger JSON is invalid."); }
+  const trigger = parseDistillTriggerInput(decoded);
+  if (JSON.stringify(trigger) !== triggerJson || id !== trigger.id) {
+    throw new TypeError("Stored distill trigger is not canonical or has a mismatched ID.");
+  }
+  if (status !== "candidate" && status !== "pending" && status !== "prepared" && status !== "complete") {
+    throw new TypeError("Stored distill trigger status is invalid.");
+  }
+  const parsedCompactionId = parseNullableText(compactionRecordId, "stored compaction record ID");
+  if (
+    (trigger.reason === "close" && (status === "candidate" || parsedCompactionId !== null)) ||
+    (trigger.reason === "compact" && ((status === "candidate") !== (parsedCompactionId === null)))
+  ) throw new TypeError("Stored compaction trigger confirmation state is inconsistent.");
+  if ((status === "candidate" || status === "pending") && jobIds.length !== 0) {
+    throw new TypeError("Unprepared distill trigger has associated batches.");
+  }
+  if (status === "prepared" && jobIds.length === 0) {
+    throw new TypeError("Prepared distill trigger has no associated batches.");
+  }
+  const parsedRetry = parseRetryFields(retryCategory, retryAt, "Stored distill trigger retry");
+  if (status === "complete" && parsedRetry.retryCategory !== null) {
+    throw new TypeError("Stored completed distill trigger has retry metadata.");
+  }
+  return { trigger, status, compactionRecordId: parsedCompactionId, ...parsedRetry, jobIds: [...jobIds] };
+}
+
+function parseCleanTaskInput(value: unknown): CleanTaskInput {
+  const { sessionId, sessionFile, leafId, cwd, reason, intentId } = fields(
+    value, ["sessionId", "sessionFile", "leafId", "cwd", "reason", "intentId"],
+  );
+  validateText(sessionId, "clean task session ID");
+  validateAbsolutePath(sessionFile, "clean task session file");
+  validateAbsolutePath(cwd, "clean task working directory");
+  const parsedLeafId = parseNullableText(leafId, "clean task leaf ID");
+  if (reason !== "close" && reason !== "compact" && reason !== "legacy") {
+    throw new TypeError("Clean task reason is invalid.");
+  }
+  validateText(intentId, "clean task intent ID");
+  return { sessionId, sessionFile, leafId: parsedLeafId, cwd, reason, intentId };
+}
+
+function cleanTaskId(sessionFile: string): string {
+  return "clean-" + createHash("sha256").update(sessionFile).digest("hex");
+}
+
+function parsePersistedCleanTask(value: unknown): PersistedCleanTask {
+  const { id, taskJson, status, waitReason, retryCategory, retryAt, leaseOwner, leaseUntil } = fields(
+    value,
+    ["id", "taskJson", "status", "waitReason", "retryCategory", "retryAt", "leaseOwner", "leaseUntil"],
+  );
+  if (typeof taskJson !== "string") throw new TypeError("Stored clean task JSON must be text.");
+  let decoded: unknown;
+  try { decoded = JSON.parse(taskJson); }
+  catch { throw new TypeError("Stored clean task JSON is invalid."); }
+  const task = parseCleanTaskInput(decoded);
+  if (JSON.stringify(task) !== taskJson || id !== cleanTaskId(task.sessionFile)) {
+    throw new TypeError("Stored clean task is not canonical or has a mismatched ID.");
+  }
+  if (status !== "pending" && status !== "waiting") throw new TypeError("Stored clean task status is invalid.");
+  let parsedWaitReason: WaitReason | null = null;
+  if (waitReason !== null) {
+    if (
+      waitReason !== "host_coordination" && waitReason !== "unprocessed" && waitReason !== "usage" &&
+      waitReason !== "dependencies" && waitReason !== "unavailable"
+    ) throw new TypeError("Stored clean task wait reason is invalid.");
+    parsedWaitReason = waitReason;
+  }
+  if ((status === "pending") !== (parsedWaitReason === null)) {
+    throw new TypeError("Stored clean task waiting state is inconsistent.");
+  }
+  const parsedRetry = parseRetryFields(retryCategory, retryAt, "Stored clean task retry");
+  const parsedLeaseOwner = parseNullableText(leaseOwner, "stored clean task lease owner");
+  let parsedLeaseUntil: number | null = null;
+  if (leaseUntil !== null) {
+    validateNow(leaseUntil, "Stored clean task lease expiration");
+    parsedLeaseUntil = leaseUntil;
+  }
+  if ((parsedLeaseOwner === null) !== (parsedLeaseUntil === null)) {
+    throw new TypeError("Stored clean task lease state is inconsistent.");
+  }
+  return {
+    task,
+    status,
+    waitReason: parsedWaitReason,
+    ...parsedRetry,
+    leaseOwner: parsedLeaseOwner,
+    leaseUntil: parsedLeaseUntil,
+  };
+}
+
+function parseTaskPageOptions(value: unknown, allowNow: boolean): {
+  readonly limit: number;
+  readonly cursor?: number;
+  readonly now?: number;
+} {
+  const allowed = allowNow ? ["limit", "cursor", "now"] : ["limit", "cursor"];
+  if (
+    !isRecord(value) || Reflect.ownKeys(value).some(key => typeof key !== "string" || !allowed.includes(key)) ||
+    !Object.hasOwn(value, "limit")
+  ) throw new TypeError("Task page requires a limit and only supported cursor/time fields.");
+  const limit = value["limit"];
+  if (typeof limit !== "number" || !Number.isSafeInteger(limit) || limit < 1 || limit > maxTaskPageSize) {
+    throw new TypeError("Task page limit must be an integer from 1 through " + maxTaskPageSize + ".");
+  }
+  const parsed: { limit: number; cursor?: number; now?: number } = { limit };
+  if (Object.hasOwn(value, "cursor")) {
+    const cursor = value["cursor"];
+    if (typeof cursor !== "number" || !Number.isSafeInteger(cursor) || cursor < 0) {
+      throw new TypeError("Task page cursor must be a nonnegative safe integer.");
+    }
+    parsed.cursor = cursor;
+  }
+  if (Object.hasOwn(value, "now")) {
+    validateNow(value["now"], "Task page time");
+    parsed.now = value["now"];
+  }
+  return parsed;
+}
+
+function parseDistillClaimInput(value: unknown): DistillClaimInput {
+  const { workerId, now, leaseMs } = fields(value, ["workerId", "now", "leaseMs"]);
+  validateText(workerId, "distill worker ID");
+  validateNow(now, "Distill claim time");
+  if (typeof leaseMs !== "number" || !Number.isSafeInteger(leaseMs) || leaseMs < 1) {
+    throw new TypeError("Distill lease duration must be a positive safe integer.");
+  }
+  if (!Number.isSafeInteger(now + leaseMs)) throw new TypeError("Distill lease expiration is outside the safe integer range.");
+  return { workerId, now, leaseMs };
+}
+
+function parseRetryRequest(value: unknown): RetryRequest {
+  const { category, retryAt } = fields(value, ["category", "retryAt"]);
+  const retryCategory = parseRetryCategory(category, "Retry");
+  if (retryCategory === null) throw new TypeError("Retry category is required.");
+  validateNow(retryAt, "Retry time");
+  return { category: retryCategory, retryAt };
+}
+
+function parseReleaseDistillClaimInput(value: unknown): ReleaseDistillClaimInput {
+  if (!isRecord(value)) throw new TypeError("Distill claim release must be an object.");
+  const allowed = ["claimToken", "now", "retry"];
+  if (Reflect.ownKeys(value).some(key => typeof key !== "string" || !allowed.includes(key))) {
+    throw new TypeError("Distill claim release has unsupported fields.");
+  }
+  const { claimToken, now } = value;
+  validateText(claimToken, "distill claim token");
+  validateNow(now, "Distill release time");
+  return {
+    claimToken,
+    now,
+    ...(Object.hasOwn(value, "retry") ? { retry: parseRetryRequest(value["retry"]) } : {}),
+  };
+}
+
+function parsePrepareDistillTriggerInput(value: unknown): PrepareDistillTriggerInput {
+  const { id, claimToken, now, jobs } = fields(value, ["id", "claimToken", "now", "jobs"]);
+  validateText(id, "distill trigger ID");
+  validateText(claimToken, "distill claim token");
+  validateNow(now, "Distill preparation time");
+  if (!Array.isArray(jobs)) throw new TypeError("Prepared consolidation batches must be an array.");
+  const parsedJobs: ConsolidationJob[] = [];
+  const seen = new Set<string>();
+  for (const rawJob of jobs) {
+    const parsed = parseConsolidationJob(rawJob);
+    if (seen.has(parsed.id)) throw new TypeError("Prepared batches must have unique job IDs.");
+    seen.add(parsed.id);
+    parsedJobs.push(parsed);
+  }
+  return { id, claimToken, now, jobs: parsedJobs };
+}
+
+function validateTaskCursor(value: unknown, field: string): number | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+    throw new TypeError(field + " must be a nonnegative safe integer.");
+  }
+  return value;
+}
+
+function validateLeaseDuration(value: unknown, now: number, field: string): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 1 || !Number.isSafeInteger(now + value)) {
+    throw new TypeError(field + " must be a positive safe integer that yields a safe expiration.");
+  }
+  return value;
 }
 
 function parseMemoryOriginRow(value: unknown): {
@@ -714,7 +1075,8 @@ export class SQLiteMemoryStore {
         textColumn("o.job_id", "originJobId"), "o.revision AS originRevision",
         textColumn("j.id", "jobRecordId"), textColumn("j.job_json", "jobJson"),
         textColumn("j.status", "jobStatus"), textColumn("j.lease_owner", "leaseOwner"),
-        "j.lease_until AS leaseUntil",
+        "j.lease_until AS leaseUntil", textColumn("j.retry_category", "retryCategory"),
+        "j.retry_at AS retryAt",
       ].join(", ") + " " +
       "FROM memories AS m " +
       "LEFT JOIN memory_origins AS o ON o.memory_id = m.id " +
@@ -736,6 +1098,8 @@ export class SQLiteMemoryStore {
       jobStatus,
       leaseOwner,
       leaseUntil,
+      retryCategory,
+      retryAt,
     } = fields(this.#decodeRow(row), [
       "currentId",
       "content",
@@ -750,6 +1114,8 @@ export class SQLiteMemoryStore {
       "jobStatus",
       "leaseOwner",
       "leaseUntil",
+      "retryCategory",
+      "retryAt",
     ]);
     const current = parseMemory({
       id: currentId,
@@ -761,7 +1127,8 @@ export class SQLiteMemoryStore {
     if (memoryId === null) {
       if (
         originJobId !== null || originRevision !== null || jobRecordId !== null || jobJson !== null ||
-        jobStatus !== null || leaseOwner !== null || leaseUntil !== null
+        jobStatus !== null || leaseOwner !== null || leaseUntil !== null ||
+        retryCategory !== null || retryAt !== null
       ) throw new TypeError("Stored memory origin row is inconsistent.");
       return undefined;
     }
@@ -774,6 +1141,8 @@ export class SQLiteMemoryStore {
       status: jobStatus,
       lease_owner: leaseOwner,
       lease_until: leaseUntil,
+      retryCategory,
+      retryAt,
     });
     if (job.status !== "complete") throw new TypeError("Stored memory origin references an incomplete job.");
     return {
@@ -839,25 +1208,379 @@ export class SQLiteMemoryStore {
     });
   }
 
-  enqueueConsolidation(job: ConsolidationJob): void {
+  enqueueDistillTrigger(trigger: DistillTriggerInput): void {
     this.#ensureOpen();
-    const record = parseConsolidationJob(job);
-    const serialized = JSON.stringify(record);
+    const record = parseDistillTriggerInput(trigger);
+    const triggerJson = JSON.stringify(record);
+    const status = record.reason === "compact" ? "candidate" : "pending";
     this.#transaction(() => {
-      const row = this.#database.prepare(
-        `SELECT ${jobColumns} FROM consolidation_jobs WHERE id = ?`,
-      ).get(record.id);
+      const row = this.#database.prepare(`SELECT ${triggerColumns} FROM distill_triggers WHERE id = ?`).get(record.id);
       if (row !== undefined) {
-        const existing = parsePersistedJobRow(this.#decodeRow(row));
-        if (JSON.stringify(existing.job) !== serialized) {
-          throw new ConsolidationConflictError(record.id, "already exists with a different payload");
+        const existing = this.#readDistillTrigger(row);
+        if (JSON.stringify(existing.trigger) !== triggerJson) {
+          throw new ConsolidationConflictError(record.id, "already exists with a different trigger boundary");
         }
         return;
       }
       this.#database.prepare(
-        "INSERT INTO consolidation_jobs (id, job_json, status, lease_owner, lease_until) VALUES (?, ?, 'pending', NULL, NULL)",
-      ).run(record.id, serialized);
+        "INSERT INTO distill_triggers " +
+        "(id, trigger_json, status, compaction_record_id, retry_category, retry_at) " +
+        "VALUES (?, ?, ?, NULL, NULL, NULL)",
+      ).run(record.id, triggerJson, status);
     });
+  }
+
+  confirmCompactionTrigger(input: { readonly id: string; readonly compactionRecordId: string }): boolean {
+    this.#ensureOpen();
+    const { id, compactionRecordId } = fields(input, ["id", "compactionRecordId"]);
+    validateText(id, "distill trigger ID");
+    validateText(compactionRecordId, "compaction record ID");
+    return this.#transaction(() => {
+      const row = this.#database.prepare(`SELECT ${triggerColumns} FROM distill_triggers WHERE id = ?`).get(id);
+      if (row === undefined) return false;
+      const current = this.#readDistillTrigger(row);
+      if (current.trigger.reason !== "compact") {
+        throw new ConsolidationConflictError(id, "is not a compaction candidate");
+      }
+      if (current.status !== "candidate") {
+        if (current.compactionRecordId === compactionRecordId) return true;
+        throw new ConsolidationConflictError(id, "has already been confirmed by a different compaction record");
+      }
+      this.#database.prepare(
+        "UPDATE distill_triggers SET status = 'pending', compaction_record_id = ? " +
+        "WHERE id = ? AND status = 'candidate'",
+      ).run(compactionRecordId, id);
+      return true;
+    });
+  }
+
+  cancelCompactionTrigger(id: string): boolean {
+    this.#ensureOpen();
+    validateText(id, "distill trigger ID");
+    return this.#transaction(() => {
+      const row = this.#database.prepare(`SELECT ${triggerColumns} FROM distill_triggers WHERE id = ?`).get(id);
+      if (row === undefined) return false;
+      const current = this.#readDistillTrigger(row);
+      if (current.trigger.reason !== "compact" || current.status !== "candidate") return false;
+      this.#database.prepare("DELETE FROM distill_triggers WHERE id = ? AND status = 'candidate'").run(id);
+      return true;
+    });
+  }
+
+  listDistillTriggers(options: TaskPageOptions): TaskPage<DistillTrigger> {
+    this.#ensureOpen();
+    const page = parseTaskPageOptions(options, false);
+    const cursor = page.cursor ?? 0;
+    const rows = this.#database.prepare(
+      `SELECT rowid AS cursorRow, ${triggerColumns} FROM distill_triggers ` +
+      "WHERE rowid > ? ORDER BY rowid LIMIT ?",
+    ).all(cursor, page.limit + 1);
+    const hasMore = rows.length > page.limit;
+    const visible = rows.slice(0, page.limit);
+    const items = visible.map(raw => {
+      const decoded = this.#decodeRow(raw);
+      const { cursorRow, ...triggerRow } = decoded;
+      validateNow(cursorRow, "Stored distill trigger cursor");
+      return this.#distillTriggerItem(this.#readDistillTrigger(triggerRow));
+    });
+    const last = visible.at(-1);
+    const nextCursor = hasMore && last !== undefined ? this.#decodeRow(last)["cursorRow"] : undefined;
+    if (nextCursor !== undefined) validateNow(nextCursor, "Next distill trigger cursor");
+    return { items, ...(nextCursor === undefined ? {} : { nextCursor }) };
+  }
+
+  claimDistillTrigger(input: DistillClaimInput): DistillTriggerClaim | undefined {
+    this.#ensureOpen();
+    const request = parseDistillClaimInput(input);
+    return this.#transaction(() => {
+      const rows = this.#database.prepare(
+        `SELECT ${triggerColumns} FROM distill_triggers ` +
+        "WHERE status = 'pending' AND (retry_at IS NULL OR retry_at <= ?) ORDER BY rowid LIMIT 32",
+      ).all(request.now);
+      for (const row of rows) {
+        const current = this.#readDistillTrigger(this.#decodeRow(row));
+        if (!this.#acquireDistillSlot({
+          claimToken: randomUUID(),
+          workerId: request.workerId,
+          taskKind: "trigger",
+          taskId: current.trigger.id,
+          now: request.now,
+          leaseMs: request.leaseMs,
+        })) return undefined;
+        const lease = this.#readDistillLease();
+        if (lease.claimToken === null || lease.leaseUntil === null) {
+          throw new Error("Distill claim was not persisted.");
+        }
+        this.#database.prepare(
+          "UPDATE distill_triggers SET retry_category = NULL, retry_at = NULL WHERE id = ? AND status = 'pending'",
+        ).run(current.trigger.id);
+        return {
+          trigger: this.#distillTriggerItem({ ...current, retryCategory: null, retryAt: null }),
+          claimToken: lease.claimToken,
+          leaseUntil: lease.leaseUntil,
+        };
+      }
+      return undefined;
+    });
+  }
+
+  prepareDistillTrigger(input: PrepareDistillTriggerInput): void {
+    this.#ensureOpen();
+    const request = parsePrepareDistillTriggerInput(input);
+    this.#transaction(() => {
+      const row = this.#database.prepare(`SELECT ${triggerColumns} FROM distill_triggers WHERE id = ?`).get(request.id);
+      if (row === undefined) throw new ConsolidationConflictError(request.id, "does not exist");
+      const current = this.#readDistillTrigger(this.#decodeRow(row));
+      if (current.status === "prepared" || current.status === "complete") {
+        const ids = this.#triggerJobIds(request.id);
+        if (ids.length !== request.jobs.length || ids.some((id, index) => id !== request.jobs[index]?.id)) {
+          throw new ConsolidationConflictError(request.id, "was prepared with a different batch set");
+        }
+        for (const prepared of request.jobs) this.#assertExistingJobPayload(prepared);
+        return;
+      }
+      this.#assertCurrentDistillLease("trigger", request.id, request.claimToken, request.now);
+      if (current.status !== "pending") {
+        throw new ConsolidationConflictError(request.id, "is not ready for preparation");
+      }
+      for (const prepared of request.jobs) {
+        if (prepared.sessionId !== current.trigger.sessionId || prepared.sessionFile !== current.trigger.sessionFile) {
+          throw new ConsolidationConflictError(prepared.id, "does not belong to the trigger session");
+        }
+        this.#enqueueConsolidationInTransaction(prepared);
+      }
+      for (let index = 0; index < request.jobs.length; index += 1) {
+        const prepared = request.jobs[index];
+        if (prepared === undefined) throw new Error("Prepared batch index exceeded its validated input.");
+        const linkId = createHash("sha256").update(JSON.stringify([request.id, prepared.id])).digest("hex");
+        const existing = this.#database.prepare(
+          "SELECT id, trigger_id AS triggerId, job_id AS jobId, ordinal FROM distill_trigger_jobs WHERE id = ?",
+        ).get(linkId);
+        if (existing === undefined) {
+          this.#database.prepare(
+            "INSERT INTO distill_trigger_jobs (id, trigger_id, job_id, ordinal) VALUES (?, ?, ?, ?)",
+          ).run(linkId, request.id, prepared.id, index);
+        } else {
+          const link = fields(this.#decodeRow(existing), ["id", "triggerId", "jobId", "ordinal"]);
+          if (link.triggerId !== request.id || link.jobId !== prepared.id || link.ordinal !== index) {
+            throw new ConsolidationConflictError(request.id, "has inconsistent batch associations");
+          }
+        }
+      }
+      this.#database.prepare(
+        "UPDATE distill_triggers SET status = ?, retry_category = NULL, retry_at = NULL WHERE id = ? AND status = 'pending'",
+      ).run(request.jobs.length === 0 ? "complete" : "prepared", request.id);
+      this.#clearDistillLease();
+      if (request.jobs.length === 0) {
+        this.#enqueueCleanTaskInTransaction({
+          sessionId: current.trigger.sessionId,
+          sessionFile: current.trigger.sessionFile,
+          leafId: current.trigger.leafId,
+          cwd: current.trigger.cwd,
+          reason: current.trigger.reason,
+          intentId: current.trigger.id,
+        });
+      } else {
+        this.#completeReadyTriggers([request.id]);
+      }
+    });
+  }
+
+  claimDistillJob(input: DistillClaimInput & { readonly id: string }): DistillJobClaim | undefined {
+    this.#ensureOpen();
+    const { id, workerId, now, leaseMs } = fields(input, ["id", "workerId", "now", "leaseMs"]);
+    validateText(id, "consolidation job ID");
+    const request = parseDistillClaimInput({ workerId, now, leaseMs });
+    return this.#transaction(() => this.#claimConsolidationJob(id, request, randomUUID()));
+  }
+
+  renewDistillClaim(input: { readonly claimToken: string; readonly now: number; readonly leaseMs: number }): boolean {
+    this.#ensureOpen();
+    const { claimToken, now, leaseMs } = fields(input, ["claimToken", "now", "leaseMs"]);
+    validateText(claimToken, "distill claim token");
+    const request = parseDistillClaimInput({ workerId: "lease-renewal", now, leaseMs });
+    return this.#transaction(() => {
+      const lease = this.#readDistillLease();
+      if (lease.claimToken !== claimToken || lease.leaseUntil === null || lease.leaseUntil <= request.now) return false;
+      const until = request.now + request.leaseMs;
+      this.#database.prepare("UPDATE distill_lease SET lease_until = ? WHERE singleton = 1").run(until);
+      if (lease.taskKind === "job" && lease.taskId !== null) {
+        const changed = this.#database.prepare(
+          "UPDATE consolidation_jobs SET lease_until = ? WHERE id = ? AND status = 'pending' AND lease_owner = ?",
+        ).run(until, lease.taskId, claimToken);
+        if (changed.changes !== 1) throw new ConsolidationConflictError(lease.taskId, "lost its durable claim");
+      }
+      return true;
+    });
+  }
+
+  releaseDistillClaim(input: ReleaseDistillClaimInput): boolean {
+    this.#ensureOpen();
+    const request = parseReleaseDistillClaimInput(input);
+    return this.#transaction(() => {
+      const lease = this.#readDistillLease();
+      if (lease.claimToken !== request.claimToken || lease.taskKind === null || lease.taskId === null) return false;
+      if (lease.taskKind === "job") {
+        this.#database.prepare(
+          "UPDATE consolidation_jobs SET lease_owner = NULL, lease_until = NULL, " +
+          "retry_category = ?, retry_at = ? WHERE id = ? AND status = 'pending' AND lease_owner = ?",
+        ).run(request.retry?.category ?? null, request.retry?.retryAt ?? null, lease.taskId, request.claimToken);
+      } else if (request.retry) {
+        this.#database.prepare(
+          "UPDATE distill_triggers SET retry_category = ?, retry_at = ? " +
+          "WHERE id = ? AND status = 'pending'",
+        ).run(request.retry.category, request.retry.retryAt, lease.taskId);
+      }
+      this.#clearDistillLease();
+      return true;
+    });
+  }
+
+  enqueueCleanTask(input: CleanTaskInput): CleanTask {
+    this.#ensureOpen();
+    const task = parseCleanTaskInput(input);
+    return this.#transaction(() => this.#enqueueCleanTaskInTransaction(task));
+  }
+
+  listCleanTasks(options: CleanTaskPageOptions): TaskPage<CleanTask> {
+    this.#ensureOpen();
+    const page = parseTaskPageOptions(options, true);
+    const cursor = page.cursor ?? 0;
+    const clauses = ["rowid > ?"];
+    const params: (number | string)[] = [cursor];
+    if (page.now !== undefined) {
+      clauses.push("(retry_at IS NULL OR retry_at <= ?)");
+      params.push(page.now);
+    }
+    params.push(page.limit + 1);
+    const rows = this.#database.prepare(
+      `SELECT rowid AS cursorRow, ${cleanTaskColumns} FROM clean_tasks ` +
+      `WHERE ${clauses.join(" AND ")} ORDER BY rowid LIMIT ?`,
+    ).all(...params);
+    const hasMore = rows.length > page.limit;
+    const visible = rows.slice(0, page.limit);
+    const items = visible.map(raw => {
+      const decoded = this.#decodeRow(raw);
+      const { cursorRow, ...taskRow } = decoded;
+      validateNow(cursorRow, "Stored clean task cursor");
+      return this.#cleanTaskItem(parsePersistedCleanTask(taskRow));
+    });
+    const last = visible.at(-1);
+    const nextCursor = hasMore && last !== undefined ? this.#decodeRow(last)["cursorRow"] : undefined;
+    if (nextCursor !== undefined) validateNow(nextCursor, "Next clean task cursor");
+    return { items, ...(nextCursor === undefined ? {} : { nextCursor }) };
+  }
+
+  /**
+   * `owner` is a fresh, single-attempt fencing token, not a reusable worker ID.
+   * The caller must use a new token after release, expiry, or intent replacement.
+   */
+  claimCleanTask(id: string, owner: string, now: number, leaseMs: number, force = false): boolean {
+    this.#ensureOpen();
+    validateText(id, "clean task ID");
+    validateText(owner, "clean task claim owner");
+    validateNow(now, "Clean task claim time");
+    validateLeaseDuration(leaseMs, now, "Clean task lease duration");
+    if (typeof force !== "boolean") throw new TypeError("Clean task force flag must be boolean.");
+    return this.#transaction(() => {
+      const row = this.#database.prepare(`SELECT ${cleanTaskColumns} FROM clean_tasks WHERE id = ?`).get(id);
+      if (row === undefined) return false;
+      const current = parsePersistedCleanTask(this.#decodeRow(row));
+      if (current.status !== "pending" && current.status !== "waiting") return false;
+      if (!force && current.retryAt !== null && current.retryAt > now) return false;
+      if (current.leaseOwner !== null && current.leaseUntil !== null && current.leaseUntil > now) return false;
+      this.#database.prepare(
+        "UPDATE clean_tasks SET lease_owner = ?, lease_until = ? WHERE id = ?",
+      ).run(owner, now + leaseMs, id);
+      return true;
+    });
+  }
+
+  releaseCleanTask(id: string, owner: string): boolean {
+    this.#ensureOpen();
+    validateText(id, "clean task ID");
+    validateText(owner, "clean task lease owner");
+    return this.#transaction(() => {
+      const changed = this.#database.prepare(
+        "UPDATE clean_tasks SET lease_owner = NULL, lease_until = NULL " +
+        "WHERE id = ? AND lease_owner = ?",
+      ).run(id, owner);
+      return changed.changes === 1;
+    });
+  }
+
+  recordCleanAssessment(id: string, owner: string, now: number, reason: WaitReason, retryAt: number): boolean {
+    this.#ensureOpen();
+    validateText(id, "clean task ID");
+    validateText(owner, "clean task lease owner");
+    validateNow(now, "Clean assessment time");
+    validateNow(retryAt, "Clean assessment retry time");
+    if (
+      reason !== "host_coordination" && reason !== "unprocessed" && reason !== "usage" &&
+      reason !== "dependencies" && reason !== "unavailable"
+    ) throw new TypeError("Clean assessment reason is invalid.");
+    return this.#transaction(() => {
+      const row = this.#database.prepare(`SELECT ${cleanTaskColumns} FROM clean_tasks WHERE id = ?`).get(id);
+      if (row === undefined) return false;
+      const current = parsePersistedCleanTask(this.#decodeRow(row));
+      if (
+        current.leaseOwner !== owner || current.leaseUntil === null || current.leaseUntil <= now
+      ) return false;
+      this.#database.prepare(
+        "UPDATE clean_tasks SET status = 'waiting', wait_reason = ?, retry_category = ?, retry_at = ?, " +
+        "lease_owner = NULL, lease_until = NULL WHERE id = ? AND lease_owner = ?",
+      ).run(reason, reason === "unavailable" ? "unavailable" : "transient", retryAt, id, owner);
+      return true;
+    });
+  }
+
+  reconcileLegacyCleanTasks(limit = 32, cursor?: number): { readonly created: number; readonly nextCursor?: number } {
+    this.#ensureOpen();
+    if (typeof limit !== "number" || !Number.isSafeInteger(limit) || limit < 1 || limit > maxTaskPageSize) {
+      throw new TypeError("Legacy cleanup reconciliation limit must be from 1 through " + maxTaskPageSize + ".");
+    }
+    const after = validateTaskCursor(cursor, "Legacy cleanup reconciliation cursor") ?? 0;
+    return this.#transaction(() => {
+      const rows = this.#database.prepare(
+        `SELECT rowid AS cursorRow, ${jobColumns} FROM consolidation_jobs ` +
+        "WHERE rowid > ? AND status = 'complete' ORDER BY rowid LIMIT ?",
+      ).all(after, limit + 1);
+      const hasMore = rows.length > limit;
+      const visible = rows.slice(0, limit);
+      let created = 0;
+      for (const raw of visible) {
+        const decoded = this.#decodeRow(raw);
+        const { cursorRow, ...jobRow } = decoded;
+        validateNow(cursorRow, "Legacy job cursor");
+        const record = parsePersistedJobRow(jobRow);
+        if (this.#jobTriggerIds(record.job.id).length > 0 || record.job.sessionFile === null) continue;
+        const cleanId = cleanTaskId(record.job.sessionFile);
+        const cleanRow = this.#database.prepare(`SELECT ${cleanTaskColumns} FROM clean_tasks WHERE id = ?`).get(cleanId);
+        if (cleanRow !== undefined) {
+          parsePersistedCleanTask(this.#decodeRow(cleanRow));
+          continue;
+        }
+        this.#enqueueCleanTaskInTransaction({
+          sessionId: record.job.sessionId,
+          sessionFile: record.job.sessionFile,
+          leafId: record.job.leafId,
+          cwd: record.job.cwd,
+          reason: "legacy",
+          intentId: "legacy-job:" + record.job.id,
+        });
+        created += 1;
+      }
+      const last = visible.at(-1);
+      const nextCursor = hasMore && last !== undefined ? this.#decodeRow(last)["cursorRow"] : undefined;
+      if (nextCursor !== undefined) validateNow(nextCursor, "Next legacy job cursor");
+      return { created, ...(nextCursor === undefined ? {} : { nextCursor }) };
+    });
+  }
+
+  enqueueConsolidation(job: ConsolidationJob): void {
+    this.#ensureOpen();
+    const record = parseConsolidationJob(job);
+    this.#transaction(() => this.#enqueueConsolidationInTransaction(record));
   }
 
   listConsolidationJobs(): readonly ConsolidationJob[] {
@@ -874,34 +1597,12 @@ export class SQLiteMemoryStore {
     validateText(id, "consolidation job ID");
     validateText(owner, "consolidation lease owner");
     validateNow(now, "Consolidation claim time");
-    if (typeof leaseMs !== "number" || !Number.isSafeInteger(leaseMs) || leaseMs < 1) {
-      throw new TypeError("Consolidation lease duration must be a positive safe integer.");
-    }
-    const leaseUntil = now + leaseMs;
-    if (!Number.isSafeInteger(leaseUntil)) {
-      throw new TypeError("Consolidation lease expiration must be a safe integer.");
-    }
-
-    return this.#transaction(() => {
-      const row = this.#database.prepare(
-        `SELECT ${jobColumns} FROM consolidation_jobs WHERE id = ?`,
-      ).get(id);
-      if (row === undefined) return false;
-      const current = parsePersistedJobRow(this.#decodeRow(row));
-      if (current.status !== "pending") return false;
-      if (current.leaseUntil !== null && current.leaseUntil > now) return false;
-      const earlierPending = this.#database.prepare(
-        "SELECT 1 FROM consolidation_jobs AS earlier " +
-        "JOIN consolidation_jobs AS current ON current.id = ? " +
-        "WHERE earlier.rowid < current.rowid AND earlier.status = 'pending' " +
-        "AND json_extract(earlier.job_json, '$.sessionId') = ? LIMIT 1",
-      ).get(id, current.job.sessionId);
-      if (earlierPending !== undefined) return false;
-      this.#database.prepare(
-        "UPDATE consolidation_jobs SET lease_owner = ?, lease_until = ? WHERE id = ? AND status = 'pending'",
-      ).run(owner, leaseUntil, id);
-      return true;
-    });
+    validateLeaseDuration(leaseMs, now, "Consolidation lease duration");
+    return this.#transaction(() => this.#claimConsolidationJob(
+      id,
+      { workerId: owner, now, leaseMs },
+      owner,
+    ) !== undefined);
   }
 
   releaseConsolidation(id: string, owner: string): void {
@@ -916,8 +1617,13 @@ export class SQLiteMemoryStore {
       const current = parsePersistedJobRow(this.#decodeRow(row));
       if (current.status === "pending" && current.leaseOwner === owner) {
         this.#database.prepare(
-          "UPDATE consolidation_jobs SET lease_owner = NULL, lease_until = NULL WHERE id = ? AND status = 'pending'",
+          "UPDATE consolidation_jobs SET lease_owner = NULL, lease_until = NULL, " +
+          "retry_category = NULL, retry_at = NULL WHERE id = ? AND status = 'pending'",
         ).run(id);
+        const lease = this.#readDistillLease();
+        if (lease.claimToken === owner && lease.taskKind === "job" && lease.taskId === id) {
+          this.#clearDistillLease();
+        }
       }
     });
   }
@@ -939,10 +1645,11 @@ export class SQLiteMemoryStore {
     return result;
   }
 
-  /** One snapshot; fails closed when pending jobs, observations, and usages exceed 16,384 rows. */
+  /** One snapshot; queued source triggers count as unresolved retention evidence. */
   readConsolidationStatus(keys: readonly string[]): {
     readonly processedSources: readonly string[];
     readonly pendingJobs: readonly ConsolidationJob[];
+    readonly pendingTriggers: readonly DistillTrigger[];
     readonly observations: readonly SessionObservation[];
     readonly usages: readonly SessionUsage[];
   } {
@@ -951,6 +1658,7 @@ export class SQLiteMemoryStore {
       const rowCount = this.#database.prepare(
         "SELECT COUNT(*) AS totalRows FROM (" +
         "SELECT 1 FROM consolidation_jobs WHERE status = 'pending' " +
+        "UNION ALL SELECT 1 FROM distill_triggers WHERE status <> 'complete' " +
         "UNION ALL SELECT 1 FROM session_observations " +
         "UNION ALL SELECT 1 FROM session_usages LIMIT ?)",
       ).get(maxSessionMetadataRows + 1)?.["totalRows"];
@@ -965,6 +1673,7 @@ export class SQLiteMemoryStore {
       return {
         processedSources: this.processedSources(keys),
         pendingJobs: this.listConsolidationJobs(),
+        pendingTriggers: this.#listPendingDistillTriggers(),
         observations: this.#database.prepare(
           `SELECT ${observationColumns} FROM session_observations ORDER BY session_id COLLATE BINARY`,
         ).all().map(row => parseStoredSessionObservation(this.#decodeRow(row)).observation),
@@ -994,6 +1703,7 @@ export class SQLiteMemoryStore {
       ) {
         throw new ConsolidationConflictError(request.jobId, "has no current lease for this owner");
       }
+      this.#assertCurrentDistillLease("job", request.jobId, request.owner, request.now);
 
       const selectProgress = this.#database.prepare(
         `SELECT ${progressColumns} FROM consolidation_progress WHERE source_key = ?`,
@@ -1013,12 +1723,14 @@ export class SQLiteMemoryStore {
       }
       if (remaining.length === 0) {
         const completion = this.#database.prepare(
-          "UPDATE consolidation_jobs SET status = 'complete', lease_owner = NULL, lease_until = NULL " +
+          "UPDATE consolidation_jobs SET status = 'complete', lease_owner = NULL, lease_until = NULL, " +
+          "retry_category = NULL, retry_at = NULL " +
           "WHERE id = ? AND status = 'pending'",
         ).run(request.jobId);
         if (completion.changes !== 1) {
           throw new ConsolidationConflictError(request.jobId, "changed before completion");
         }
+        this.#finishConsolidationJob(current.job, request.owner);
         return false;
       }
 
@@ -1082,12 +1794,14 @@ export class SQLiteMemoryStore {
       );
       for (const key of remaining) insertProgress.run(key, request.jobId, request.now);
       const completion = this.#database.prepare(
-        "UPDATE consolidation_jobs SET status = 'complete', lease_owner = NULL, lease_until = NULL " +
+        "UPDATE consolidation_jobs SET status = 'complete', lease_owner = NULL, lease_until = NULL, " +
+        "retry_category = NULL, retry_at = NULL " +
         "WHERE id = ? AND status = 'pending'",
       ).run(request.jobId);
       if (completion.changes !== 1) {
         throw new ConsolidationConflictError(request.jobId, "changed before completion");
       }
+      this.#finishConsolidationJob(current.job, request.owner);
       return true;
     });
   }
@@ -1177,6 +1891,29 @@ export class SQLiteMemoryStore {
     ).all().map((row) => parseStoredSessionObservation(this.#decodeRow(row)).observation);
   }
 
+  /** Returns a bounded stable rowid page of uncaptured session observations. */
+  listObservedSessions(options: TaskPageOptions): TaskPage<SessionObservation> {
+    this.#ensureOpen();
+    const page = parseTaskPageOptions(options, false);
+    const cursor = page.cursor ?? 0;
+    const rows = this.#database.prepare(
+      `SELECT rowid AS cursorRow, ${observationColumns} FROM session_observations ` +
+      "WHERE captured = 0 AND rowid > ? ORDER BY rowid LIMIT ?",
+    ).all(cursor, page.limit + 1);
+    const hasMore = rows.length > page.limit;
+    const visible = rows.slice(0, page.limit);
+    const items = visible.map(raw => {
+      const decoded = this.#decodeRow(raw);
+      const { cursorRow, ...observationRow } = decoded;
+      validateNow(cursorRow, "Stored session observation cursor");
+      return parseStoredSessionObservation(observationRow).observation;
+    });
+    const last = visible.at(-1);
+    const nextCursor = hasMore && last !== undefined ? this.#decodeRow(last)["cursorRow"] : undefined;
+    if (nextCursor !== undefined) validateNow(nextCursor, "Next session observation cursor");
+    return { items, ...(nextCursor === undefined ? {} : { nextCursor }) };
+  }
+
   listSessionUsages(): readonly SessionUsage[] {
     this.#ensureOpen();
     return this.#database.prepare(
@@ -1184,8 +1921,8 @@ export class SQLiteMemoryStore {
     ).all().map((row) => parseStoredSessionUsage(this.#decodeRow(row)));
   }
 
-  /** Returns at most 1,024 paths after validating no more than 16,384 metadata rows. */
-  listKnownSessionFiles(limit = maxKnownSessionFiles): readonly string[] {
+  /** Returns a fair lexical page of known paths after validating bounded task metadata. */
+  listKnownSessionFiles(limit = maxKnownSessionFiles, afterPath?: string): readonly string[] {
     this.#ensureOpen();
     if (
       typeof limit !== "number" || !Number.isSafeInteger(limit) ||
@@ -1195,10 +1932,13 @@ export class SQLiteMemoryStore {
         "Known session file limit must be an integer from 1 through " + maxKnownSessionFiles + ".",
       );
     }
+    if (afterPath !== undefined) validateAbsolutePath(afterPath, "known session file cursor");
     return this.#transaction(() => {
       const rowCount = this.#database.prepare(
         "SELECT COUNT(*) AS totalRows FROM (" +
         "SELECT 1 FROM consolidation_jobs " +
+        "UNION ALL SELECT 1 FROM distill_triggers " +
+        "UNION ALL SELECT 1 FROM clean_tasks " +
         "UNION ALL SELECT 1 FROM session_observations " +
         "UNION ALL SELECT 1 FROM session_usages LIMIT ?)",
       ).get(maxSessionMetadataRows + 1)?.["totalRows"];
@@ -1213,6 +1953,12 @@ export class SQLiteMemoryStore {
       for (const row of this.#database.prepare(`SELECT ${jobColumns} FROM consolidation_jobs`).iterate()) {
         parsePersistedJobRow(this.#decodeRow(row));
       }
+      for (const row of this.#database.prepare(`SELECT ${triggerColumns} FROM distill_triggers`).iterate()) {
+        this.#readDistillTrigger(this.#decodeRow(row));
+      }
+      for (const row of this.#database.prepare(`SELECT ${cleanTaskColumns} FROM clean_tasks`).iterate()) {
+        parsePersistedCleanTask(this.#decodeRow(row));
+      }
       for (const row of this.#database.prepare(
         `SELECT ${observationColumns} FROM session_observations`,
       ).iterate()) parseStoredSessionObservation(this.#decodeRow(row));
@@ -1224,10 +1970,13 @@ export class SQLiteMemoryStore {
       const paths = this.#database.prepare(
         "SELECT " + textColumn("path") + " FROM (" +
         "SELECT json_extract(job_json, '$.sessionFile') AS path FROM consolidation_jobs " +
+        "UNION SELECT json_extract(trigger_json, '$.sessionFile') AS path FROM distill_triggers " +
+        "UNION SELECT json_extract(task_json, '$.sessionFile') AS path FROM clean_tasks " +
         "UNION SELECT session_file AS path FROM session_observations " +
         "UNION SELECT session_file AS path FROM session_usages" +
-        ") WHERE path IS NOT NULL ORDER BY path COLLATE BINARY LIMIT ?",
-      ).all(limit);
+        ") WHERE path IS NOT NULL AND (? IS NULL OR path COLLATE BINARY > ?) " +
+        "ORDER BY path COLLATE BINARY LIMIT ?",
+      ).all(afterPath ?? null, afterPath ?? null, limit);
       return paths.map((row) => {
         const { path } = fields(this.#decodeRow(row), ["path"]);
         validateAbsolutePath(path, "known session file");
@@ -1247,9 +1996,302 @@ export class SQLiteMemoryStore {
     return row;
   }
 
+  #readDistillTrigger(value: unknown): PersistedDistillTrigger {
+    const row = this.#decodeRow(value as Record<string, unknown>);
+    const id = row["id"];
+    validateText(id, "stored distill trigger ID");
+    return parsePersistedDistillTrigger(row, this.#triggerJobIds(id));
+  }
+
+  #distillTriggerItem(record: PersistedDistillTrigger): DistillTrigger {
+    return {
+      ...record.trigger,
+      status: record.status,
+      compactionRecordId: record.compactionRecordId,
+      jobIds: record.jobIds,
+      retryCategory: record.retryCategory,
+      retryAt: record.retryAt,
+    };
+  }
+
+  #listPendingDistillTriggers(): readonly DistillTrigger[] {
+    return this.#database.prepare(
+      `SELECT ${triggerColumns} FROM distill_triggers WHERE status <> 'complete' ORDER BY rowid`,
+    ).all().map(row => this.#distillTriggerItem(this.#readDistillTrigger(row)));
+  }
+
+  #triggerJobIds(triggerId: string): readonly string[] {
+    const rows = this.#database.prepare(
+      "SELECT id, trigger_id AS triggerId, job_id AS jobId, ordinal " +
+      "FROM distill_trigger_jobs WHERE trigger_id = ? ORDER BY ordinal, rowid",
+    ).all(triggerId);
+    const result: string[] = [];
+    const seen = new Set<string>();
+    for (let index = 0; index < rows.length; index += 1) {
+      const link = fields(this.#decodeRow(rows[index] ?? {}), ["id", "triggerId", "jobId", "ordinal"]);
+      validateText(link["id"], "distill trigger batch link ID");
+      validateText(link["triggerId"], "distill trigger batch trigger ID");
+      validateText(link["jobId"], "distill trigger batch job ID");
+      if (link["triggerId"] !== triggerId || link["ordinal"] !== index || typeof link["ordinal"] !== "number") {
+        throw new TypeError("Stored distill trigger batch order is invalid.");
+      }
+      const expectedId = createHash("sha256").update(JSON.stringify([triggerId, link["jobId"]])).digest("hex");
+      if (link["id"] !== expectedId || seen.has(link["jobId"])) {
+        throw new TypeError("Stored distill trigger batch identity is invalid.");
+      }
+      seen.add(link["jobId"]);
+      result.push(link["jobId"]);
+    }
+    return result;
+  }
+
+  #jobTriggerIds(jobId: string): readonly string[] {
+    const rows = this.#database.prepare(
+      "SELECT id, trigger_id AS triggerId, job_id AS jobId " +
+      "FROM distill_trigger_jobs WHERE job_id = ? ORDER BY rowid",
+    ).all(jobId);
+    return rows.map(raw => {
+      const link = fields(this.#decodeRow(raw), ["id", "triggerId", "jobId"]);
+      validateText(link["id"], "distill trigger batch link ID");
+      validateText(link["triggerId"], "distill trigger batch trigger ID");
+      validateText(link["jobId"], "distill trigger batch job ID");
+      const expectedId = createHash("sha256").update(JSON.stringify([link["triggerId"], jobId])).digest("hex");
+      if (link["jobId"] !== jobId || link["id"] !== expectedId) {
+        throw new TypeError("Stored distill trigger batch identity is invalid.");
+      }
+      return link["triggerId"];
+    });
+  }
+
+  #readDistillLease(): PersistedDistillLease {
+    const row = this.#database.prepare(
+      "SELECT singleton, " + [
+        textColumn("claim_token", "claimToken"), textColumn("worker_id", "workerId"),
+        textColumn("task_kind", "taskKind"), textColumn("task_id", "taskId"), "lease_until AS leaseUntil",
+      ].join(", ") + " FROM distill_lease WHERE singleton = 1",
+    ).get();
+    if (row === undefined) throw new TypeError("Global distill lease record is missing.");
+    const { singleton, claimToken, workerId, taskKind, taskId, leaseUntil } = fields(
+      this.#decodeRow(row), ["singleton", "claimToken", "workerId", "taskKind", "taskId", "leaseUntil"],
+    );
+    if (singleton !== 1) throw new TypeError("Global distill lease identity is invalid.");
+    const parsedToken = parseNullableText(claimToken, "stored distill claim token");
+    const parsedWorker = parseNullableText(workerId, "stored distill worker ID");
+    const parsedTaskId = parseNullableText(taskId, "stored distill task ID");
+    let parsedKind: "trigger" | "job" | null = null;
+    if (taskKind !== null) {
+      if (taskKind !== "trigger" && taskKind !== "job") throw new TypeError("Stored distill task kind is invalid.");
+      parsedKind = taskKind;
+    }
+    let parsedUntil: number | null = null;
+    if (leaseUntil !== null) {
+      validateNow(leaseUntil, "Stored global distill lease expiration");
+      parsedUntil = leaseUntil;
+    }
+    const allNull = parsedToken === null && parsedWorker === null && parsedKind === null && parsedTaskId === null && parsedUntil === null;
+    const allPresent = parsedToken !== null && parsedWorker !== null && parsedKind !== null && parsedTaskId !== null && parsedUntil !== null;
+    if (!allNull && !allPresent) throw new TypeError("Stored global distill lease state is inconsistent.");
+    return { claimToken: parsedToken, workerId: parsedWorker, taskKind: parsedKind, taskId: parsedTaskId, leaseUntil: parsedUntil };
+  }
+
+  #acquireDistillSlot(input: {
+    readonly claimToken: string;
+    readonly workerId: string;
+    readonly taskKind: "trigger" | "job";
+    readonly taskId: string;
+    readonly now: number;
+    readonly leaseMs: number;
+  }): boolean {
+    const current = this.#readDistillLease();
+    if (current.claimToken !== null && current.leaseUntil !== null) {
+      if (current.leaseUntil > input.now || current.claimToken === input.claimToken) return false;
+      if (current.taskKind === "job" && current.taskId !== null) {
+        this.#database.prepare(
+          "UPDATE consolidation_jobs SET lease_owner = NULL, lease_until = NULL " +
+          "WHERE id = ? AND status = 'pending' AND lease_owner = ?",
+        ).run(current.taskId, current.claimToken);
+      }
+    }
+    // Schema v3 allowed independent per-job claims. Keep a migrated live claim
+    // from racing the new database-wide lease, even when it belongs to another job.
+    const legacyClaim = this.#database.prepare(
+      "SELECT 1 FROM consolidation_jobs WHERE status = 'pending' " +
+      "AND lease_owner IS NOT NULL AND lease_until > ? LIMIT 1",
+    ).get(input.now);
+    if (legacyClaim !== undefined) return false;
+    this.#database.prepare(
+      "UPDATE distill_lease SET claim_token = ?, worker_id = ?, task_kind = ?, task_id = ?, lease_until = ? " +
+      "WHERE singleton = 1",
+    ).run(input.claimToken, input.workerId, input.taskKind, input.taskId, input.now + input.leaseMs);
+    return true;
+  }
+
+  #assertCurrentDistillLease(
+    taskKind: "trigger" | "job",
+    taskId: string,
+    claimToken: string,
+    now: number,
+  ): void {
+    const lease = this.#readDistillLease();
+    if (
+      lease.claimToken !== claimToken || lease.taskKind !== taskKind || lease.taskId !== taskId ||
+      lease.leaseUntil === null || lease.leaseUntil <= now
+    ) throw new ConsolidationConflictError(taskId, "has no current global distill lease for this owner");
+  }
+
+  #clearDistillLease(): void {
+    this.#database.prepare(
+      "UPDATE distill_lease SET claim_token = NULL, worker_id = NULL, task_kind = NULL, task_id = NULL, lease_until = NULL " +
+      "WHERE singleton = 1",
+    ).run();
+  }
+
+  #claimConsolidationJob(
+    id: string,
+    request: DistillClaimInput,
+    claimToken: string,
+  ): DistillJobClaim | undefined {
+    const row = this.#database.prepare(`SELECT ${jobColumns} FROM consolidation_jobs WHERE id = ?`).get(id);
+    if (row === undefined) return undefined;
+    const current = parsePersistedJobRow(this.#decodeRow(row));
+    if (current.status !== "pending" || (current.retryAt !== null && current.retryAt > request.now)) return undefined;
+    if (current.leaseUntil !== null && current.leaseUntil > request.now) return undefined;
+    const earlierPending = this.#database.prepare(
+      "SELECT 1 FROM consolidation_jobs AS earlier " +
+      "JOIN consolidation_jobs AS current ON current.id = ? " +
+      "WHERE earlier.rowid < current.rowid AND earlier.status = 'pending' " +
+      "AND json_extract(earlier.job_json, '$.sessionId') = ? LIMIT 1",
+    ).get(id, current.job.sessionId);
+    if (earlierPending !== undefined) return undefined;
+    if (!this.#acquireDistillSlot({
+      claimToken,
+      workerId: request.workerId,
+      taskKind: "job",
+      taskId: id,
+      now: request.now,
+      leaseMs: request.leaseMs,
+    })) return undefined;
+    const leaseUntil = request.now + request.leaseMs;
+    this.#database.prepare(
+      "UPDATE consolidation_jobs SET lease_owner = ?, lease_until = ?, retry_category = NULL, retry_at = NULL " +
+      "WHERE id = ? AND status = 'pending'",
+    ).run(claimToken, leaseUntil, id);
+    return { job: current.job, claimToken, leaseUntil };
+  }
+
+  #enqueueConsolidationInTransaction(record: ConsolidationJob): void {
+    const serialized = JSON.stringify(record);
+    const row = this.#database.prepare(`SELECT ${jobColumns} FROM consolidation_jobs WHERE id = ?`).get(record.id);
+    if (row !== undefined) {
+      const existing = parsePersistedJobRow(this.#decodeRow(row));
+      if (JSON.stringify(existing.job) !== serialized) {
+        throw new ConsolidationConflictError(record.id, "already exists with a different payload");
+      }
+      return;
+    }
+    this.#database.prepare(
+      "INSERT INTO consolidation_jobs " +
+      "(id, job_json, status, lease_owner, lease_until, retry_category, retry_at) " +
+      "VALUES (?, ?, 'pending', NULL, NULL, NULL, NULL)",
+    ).run(record.id, serialized);
+  }
+
+  #assertExistingJobPayload(record: ConsolidationJob): void {
+    const row = this.#database.prepare(`SELECT ${jobColumns} FROM consolidation_jobs WHERE id = ?`).get(record.id);
+    if (row === undefined) throw new ConsolidationConflictError(record.id, "is missing from its prepared trigger");
+    const existing = parsePersistedJobRow(this.#decodeRow(row));
+    if (JSON.stringify(existing.job) !== JSON.stringify(record)) {
+      throw new ConsolidationConflictError(record.id, "already exists with a different payload");
+    }
+  }
+
+  #enqueueCleanTaskInTransaction(task: CleanTaskInput): CleanTask {
+    const record = parseCleanTaskInput(task);
+    const id = cleanTaskId(record.sessionFile);
+    const serialized = JSON.stringify(record);
+    const row = this.#database.prepare(`SELECT ${cleanTaskColumns} FROM clean_tasks WHERE id = ?`).get(id);
+    if (row === undefined) {
+      this.#database.prepare(
+        "INSERT INTO clean_tasks " +
+        "(id, task_json, status, wait_reason, retry_category, retry_at, lease_owner, lease_until) " +
+        "VALUES (?, ?, 'pending', NULL, NULL, NULL, NULL, NULL)",
+      ).run(id, serialized);
+      const inserted = this.#database.prepare(`SELECT ${cleanTaskColumns} FROM clean_tasks WHERE id = ?`).get(id);
+      if (inserted === undefined) throw new Error("Clean task insert was not persisted.");
+      return this.#cleanTaskItem(parsePersistedCleanTask(this.#decodeRow(inserted)));
+    }
+    const existing = parsePersistedCleanTask(this.#decodeRow(row));
+    if (JSON.stringify(existing.task) === serialized) return this.#cleanTaskItem(existing);
+    this.#database.prepare(
+      "UPDATE clean_tasks SET task_json = ?, status = 'pending', wait_reason = NULL, retry_category = NULL, " +
+      "retry_at = NULL, lease_owner = NULL, lease_until = NULL WHERE id = ?",
+    ).run(serialized, id);
+    const refreshed = this.#database.prepare(`SELECT ${cleanTaskColumns} FROM clean_tasks WHERE id = ?`).get(id);
+    if (refreshed === undefined) throw new Error("Clean task refresh was not persisted.");
+    return this.#cleanTaskItem(parsePersistedCleanTask(this.#decodeRow(refreshed)));
+  }
+
+  #cleanTaskItem(record: PersistedCleanTask): CleanTask {
+    return {
+      ...record.task,
+      id: cleanTaskId(record.task.sessionFile),
+      status: record.status,
+      ...(record.waitReason === null ? {} : { waitReason: record.waitReason }),
+      ...(record.retryCategory === null ? {} : { retryCategory: record.retryCategory }),
+      ...(record.retryAt === null ? {} : { retryAt: record.retryAt }),
+    };
+  }
+
+  #completeReadyTriggers(triggerIds: readonly string[]): void {
+    for (const triggerId of new Set(triggerIds)) {
+      const row = this.#database.prepare(`SELECT ${triggerColumns} FROM distill_triggers WHERE id = ?`).get(triggerId);
+      if (row === undefined) throw new ConsolidationConflictError(triggerId, "has a missing trigger record");
+      const current = this.#readDistillTrigger(this.#decodeRow(row));
+      if (current.status !== "prepared") continue;
+      const remaining = this.#database.prepare(
+        "SELECT 1 FROM distill_trigger_jobs AS links " +
+        "JOIN consolidation_jobs AS jobs ON jobs.id = links.job_id " +
+        "WHERE links.trigger_id = ? AND jobs.status = 'pending' LIMIT 1",
+      ).get(triggerId);
+      if (remaining !== undefined) continue;
+      this.#database.prepare(
+        "UPDATE distill_triggers SET status = 'complete', retry_category = NULL, retry_at = NULL " +
+        "WHERE id = ? AND status = 'prepared'",
+      ).run(triggerId);
+      this.#enqueueCleanTaskInTransaction({
+        sessionId: current.trigger.sessionId,
+        sessionFile: current.trigger.sessionFile,
+        leafId: current.trigger.leafId,
+        cwd: current.trigger.cwd,
+        reason: current.trigger.reason,
+        intentId: current.trigger.id,
+      });
+    }
+  }
+
+  #finishConsolidationJob(job: ConsolidationJob, claimToken: string): void {
+    const triggerIds = this.#jobTriggerIds(job.id);
+    if (triggerIds.length > 0) this.#completeReadyTriggers(triggerIds);
+    else if (job.sessionFile !== null) {
+      this.#enqueueCleanTaskInTransaction({
+        sessionId: job.sessionId,
+        sessionFile: job.sessionFile,
+        leafId: job.leafId,
+        cwd: job.cwd,
+        reason: "legacy",
+        intentId: "legacy-job:" + job.id,
+      });
+    }
+    const lease = this.#readDistillLease();
+    if (lease.claimToken !== claimToken || lease.taskKind !== "job" || lease.taskId !== job.id) {
+      throw new ConsolidationConflictError(job.id, "lost its global distill lease before completion");
+    }
+    this.#clearDistillLease();
+  }
+
   #initializeSchema(): void {
     const version = this.#database.prepare("PRAGMA user_version").get()?.["user_version"];
-    if (version !== 0 && version !== 1 && version !== 2 && version !== latestSchemaVersion) {
+    if (version !== 0 && version !== 1 && version !== 2 && version !== 3 && version !== latestSchemaVersion) {
       throw new Error("Unsupported memory database schema version: " + String(version) + ".");
     }
     const objects = this.#database.prepare(
@@ -1309,28 +2351,58 @@ export class SQLiteMemoryStore {
       this.#createAuxiliaryTables();
       this.#database.exec("PRAGMA user_version = 3");
     } else if (version === 2) {
-      this.#validateSchema(false);
-      this.#validateAllRows(false);
+      this.#validateSchema(false, true);
+      this.#validateAllRows(false, true);
       this.#database.exec(sessionUsagesSchema);
       this.#database.exec("PRAGMA user_version = 3");
+    } else if (version === 3) {
+      this.#validateSchema(true, true);
+      this.#validateAllRows(true, true);
     }
+    if (version !== latestSchemaVersion) this.#migrateV3ToV4();
     this.#validateLatestSchema();
     this.#validateAllRows();
   }
 
+  #migrateV3ToV4(): void {
+    const currentVersion = this.#database.prepare("PRAGMA user_version").get()?.["user_version"];
+    if (currentVersion !== 3) throw new Error("Memory schema migration expected version 3.");
+    this.#database.exec(
+      "ALTER TABLE consolidation_jobs RENAME TO consolidation_jobs_v3; " +
+      consolidationJobsSchema + "; " +
+      "INSERT INTO consolidation_jobs (rowid, id, job_json, status, lease_owner, lease_until, retry_category, retry_at) " +
+      "SELECT rowid, id, job_json, status, lease_owner, lease_until, NULL, NULL " +
+      "FROM consolidation_jobs_v3 ORDER BY rowid; " +
+      "DROP TABLE consolidation_jobs_v3",
+    );
+    this.#createTaskTables();
+    this.#database.exec("PRAGMA user_version = 4");
+  }
+
   #createAuxiliaryTables(): void {
-    this.#database.exec(consolidationJobsSchema);
+    this.#database.exec(consolidationJobsV3Schema);
     this.#database.exec(consolidationProgressSchema);
     this.#database.exec(memoryOriginsSchema);
     this.#database.exec(sessionObservationsSchema);
     this.#database.exec(sessionUsagesSchema);
   }
 
+  #createTaskTables(): void {
+    this.#database.exec(distillTriggersSchema);
+    this.#database.exec(triggerJobsSchema);
+    this.#database.exec(distillLeaseSchema);
+    this.#database.exec(cleanTasksSchema);
+    this.#database.prepare(
+      "INSERT INTO distill_lease (singleton, claim_token, worker_id, task_kind, task_id, lease_until) " +
+      "VALUES (1, NULL, NULL, NULL, NULL, NULL)",
+    ).run();
+  }
+
   #validateLatestSchema(): void {
     this.#validateSchema(true);
   }
 
-  #validateSchema(includeSessionUsages: boolean): void {
+  #validateSchema(includeSessionUsages: boolean, useLegacyJobSchema = false): void {
     const objects = this.#database.prepare(
       `SELECT ${schemaColumns} FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*'`,
     ).all().map((row) => this.#decodeRow(row));
@@ -1346,13 +2418,21 @@ export class SQLiteMemoryStore {
         ],
       }],
       ["consolidation_jobs", {
-        sql: consolidationJobsSchema,
-        columns: [
+        sql: useLegacyJobSchema ? consolidationJobsV3Schema : consolidationJobsSchema,
+        columns: useLegacyJobSchema ? [
           { name: "id", type: "TEXT", notNull: 1, primaryKey: 1 },
           { name: "job_json", type: "TEXT", notNull: 1, primaryKey: 0 },
           { name: "status", type: "TEXT", notNull: 1, primaryKey: 0 },
           { name: "lease_owner", type: "TEXT", notNull: 0, primaryKey: 0 },
           { name: "lease_until", type: "INTEGER", notNull: 0, primaryKey: 0 },
+        ] : [
+          { name: "id", type: "TEXT", notNull: 1, primaryKey: 1 },
+          { name: "job_json", type: "TEXT", notNull: 1, primaryKey: 0 },
+          { name: "status", type: "TEXT", notNull: 1, primaryKey: 0 },
+          { name: "lease_owner", type: "TEXT", notNull: 0, primaryKey: 0 },
+          { name: "lease_until", type: "INTEGER", notNull: 0, primaryKey: 0 },
+          { name: "retry_category", type: "TEXT", notNull: 0, primaryKey: 0 },
+          { name: "retry_at", type: "INTEGER", notNull: 0, primaryKey: 0 },
         ],
       }],
       ["consolidation_progress", {
@@ -1395,6 +2475,52 @@ export class SQLiteMemoryStore {
           { name: "leaf_id", type: "TEXT", notNull: 0, primaryKey: 0 },
           { name: "owner_pid", type: "INTEGER", notNull: 1, primaryKey: 0 },
           { name: "state", type: "TEXT", notNull: 1, primaryKey: 0 },
+        ],
+      });
+    }
+    if (!useLegacyJobSchema && includeSessionUsages) {
+      schemas.set("distill_triggers", {
+        sql: distillTriggersSchema,
+        columns: [
+          { name: "id", type: "TEXT", notNull: 1, primaryKey: 1 },
+          { name: "trigger_json", type: "TEXT", notNull: 1, primaryKey: 0 },
+          { name: "status", type: "TEXT", notNull: 1, primaryKey: 0 },
+          { name: "compaction_record_id", type: "TEXT", notNull: 0, primaryKey: 0 },
+          { name: "retry_category", type: "TEXT", notNull: 0, primaryKey: 0 },
+          { name: "retry_at", type: "INTEGER", notNull: 0, primaryKey: 0 },
+        ],
+      });
+      schemas.set("distill_trigger_jobs", {
+        sql: triggerJobsSchema,
+        columns: [
+          { name: "id", type: "TEXT", notNull: 1, primaryKey: 1 },
+          { name: "trigger_id", type: "TEXT", notNull: 1, primaryKey: 0 },
+          { name: "job_id", type: "TEXT", notNull: 1, primaryKey: 0 },
+          { name: "ordinal", type: "INTEGER", notNull: 1, primaryKey: 0 },
+        ],
+      });
+      schemas.set("distill_lease", {
+        sql: distillLeaseSchema,
+        columns: [
+          { name: "singleton", type: "INTEGER", notNull: 1, primaryKey: 1 },
+          { name: "claim_token", type: "TEXT", notNull: 0, primaryKey: 0 },
+          { name: "worker_id", type: "TEXT", notNull: 0, primaryKey: 0 },
+          { name: "task_kind", type: "TEXT", notNull: 0, primaryKey: 0 },
+          { name: "task_id", type: "TEXT", notNull: 0, primaryKey: 0 },
+          { name: "lease_until", type: "INTEGER", notNull: 0, primaryKey: 0 },
+        ],
+      });
+      schemas.set("clean_tasks", {
+        sql: cleanTasksSchema,
+        columns: [
+          { name: "id", type: "TEXT", notNull: 1, primaryKey: 1 },
+          { name: "task_json", type: "TEXT", notNull: 1, primaryKey: 0 },
+          { name: "status", type: "TEXT", notNull: 1, primaryKey: 0 },
+          { name: "wait_reason", type: "TEXT", notNull: 0, primaryKey: 0 },
+          { name: "retry_category", type: "TEXT", notNull: 0, primaryKey: 0 },
+          { name: "retry_at", type: "INTEGER", notNull: 0, primaryKey: 0 },
+          { name: "lease_owner", type: "TEXT", notNull: 0, primaryKey: 0 },
+          { name: "lease_until", type: "INTEGER", notNull: 0, primaryKey: 0 },
         ],
       });
     }
@@ -1446,10 +2572,10 @@ export class SQLiteMemoryStore {
     ).iterate()) parseMemory(this.#decodeRow(row));
   }
 
-  #validateAllRows(includeSessionUsages = true): void {
+  #validateAllRows(includeSessionUsages = true, useLegacyJobColumns = false): void {
     this.#validateMemoryRows();
     const jobs = this.#database.prepare(
-      `SELECT ${jobColumns} FROM consolidation_jobs`,
+      `SELECT ${useLegacyJobColumns ? legacyJobColumns : jobColumns} FROM consolidation_jobs`,
     ).all().map((row) => parsePersistedJobRow(this.#decodeRow(row)));
     const jobsById = new Map(jobs.map((record) => [record.job.id, record]));
     for (const row of this.#database.prepare(
@@ -1477,6 +2603,55 @@ export class SQLiteMemoryStore {
       for (const row of this.#database.prepare(
         `SELECT ${sessionUsageColumns} FROM session_usages`,
       ).iterate()) parseStoredSessionUsage(this.#decodeRow(row));
+      if (!useLegacyJobColumns) {
+        const triggers = new Map<string, PersistedDistillTrigger>();
+        for (const row of this.#database.prepare(`SELECT ${triggerColumns} FROM distill_triggers`).iterate()) {
+          const trigger = this.#readDistillTrigger(row);
+          triggers.set(trigger.trigger.id, trigger);
+          for (const jobId of trigger.jobIds) {
+            const linkedJob = jobsById.get(jobId);
+            if (
+              linkedJob === undefined ||
+              linkedJob.job.sessionId !== trigger.trigger.sessionId ||
+              linkedJob.job.sessionFile !== trigger.trigger.sessionFile
+            ) throw new TypeError("Stored distill trigger batch does not match its session source.");
+            if (trigger.status === "complete" && linkedJob.status !== "complete") {
+              throw new TypeError("Stored completed distill trigger has pending batches.");
+            }
+          }
+        }
+        for (const raw of this.#database.prepare(
+          "SELECT id, trigger_id AS triggerId, job_id AS jobId " +
+          "FROM distill_trigger_jobs ORDER BY rowid",
+        ).iterate()) {
+          const link = fields(this.#decodeRow(raw), ["id", "triggerId", "jobId"]);
+          validateText(link["id"], "stored trigger batch link ID");
+          validateText(link["triggerId"], "stored trigger batch trigger ID");
+          validateText(link["jobId"], "stored trigger batch job ID");
+          if (!triggers.has(link["triggerId"]) || !jobsById.has(link["jobId"])) {
+            throw new TypeError("Stored distill trigger batch link is orphaned.");
+          }
+        }
+        for (const row of this.#database.prepare(`SELECT ${cleanTaskColumns} FROM clean_tasks`).iterate()) {
+          parsePersistedCleanTask(this.#decodeRow(row));
+        }
+        const globalLease = this.#readDistillLease();
+        if (globalLease.claimToken !== null && globalLease.taskKind !== null && globalLease.taskId !== null) {
+          if (globalLease.taskKind === "job") {
+            const leasedJob = jobsById.get(globalLease.taskId);
+            if (
+              leasedJob === undefined || leasedJob.status !== "pending" ||
+              leasedJob.leaseOwner !== globalLease.claimToken ||
+              leasedJob.leaseUntil !== globalLease.leaseUntil
+            ) throw new TypeError("Stored global distill lease does not match its consolidation job.");
+          } else {
+            const leasedTrigger = triggers.get(globalLease.taskId);
+            if (leasedTrigger === undefined || leasedTrigger.status !== "pending") {
+              throw new TypeError("Stored global distill lease does not match its trigger.");
+            }
+          }
+        }
+      }
     }
   }
 

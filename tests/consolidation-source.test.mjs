@@ -42,6 +42,33 @@ function allEvidence(batches) {
   return batches.flatMap((batch) => batch.evidence);
 }
 
+test('source validation distinguishes an empty boundary from malformed or over-budget evidence', async () => {
+  const { isValidSourceSnapshot } = await import('../src/consolidation-source.ts');
+  const empty={sessionId:'empty',sessionFile:null,cwd:'/synthetic/project',leafId:null,entries:[]};
+  assert.equal(isValidSourceSnapshot(empty),true);
+  assert.equal(isValidSourceSnapshot({...empty,pending:true}),false);
+  assert.equal(isValidSourceSnapshot({...empty,leafId:'missing'}),false);
+  assert.equal(isValidSourceSnapshot({...empty,entries:[messageEntry('a',null,'user','text')]}),false);
+  assert.equal(isValidSourceSnapshot({...empty,leafId:'a',entries:[messageEntry('a',null,'user','x'.repeat(17*1024*1024))]}),false);
+  assert.equal(isValidSourceSnapshot({...empty,leafId:'a',entries:[messageEntry('a',null,'user','Valid synthetic evidence.')]}),true);
+});
+
+test("compaction recovery finds the durable record even after another branch becomes current", async t => {
+  const { findCompactionRecord } = await import('../src/consolidation-source.ts');
+  const manager = SessionManager.inMemory('/synthetic/project');
+  const root = manager.appendMessage({role:'user',content:'Synthetic shared context.',timestamp:1});
+  const boundary = manager.appendMessage({role:'assistant',content:[{type:'text',text:'Branch ready for compact.'}],timestamp:2});
+  const record = manager.appendCompaction('Synthetic summary.',root,100);
+  manager.branch(root);
+  manager.appendMessage({role:'user',content:'An alternate branch.',timestamp:3});
+  const path = await writeSession(t,[manager.getHeader(),...manager.getEntries()]);
+  assert.equal(await findCompactionRecord(path,manager.getSessionId(),manager.getCwd(),boundary),record);
+  assert.equal(await findCompactionRecord(path,manager.getSessionId(),manager.getCwd(),root),undefined);
+  await assert.rejects(()=>findCompactionRecord(path,'different-session',manager.getCwd(),boundary));
+  await writeFile(path,(await readFile(path,'utf8'))+'{"type":');
+  await assert.rejects(()=>findCompactionRecord(path,manager.getSessionId(),manager.getCwd(),boundary));
+});
+
 test("snapshotSession selects the active parent chain and applies Pi context edits", () => {
   const manager = SessionManager.inMemory("/synthetic/project");
   const sharedId = manager.appendMessage({

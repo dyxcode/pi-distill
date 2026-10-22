@@ -269,6 +269,7 @@ export function assessTaskMemories(records, {
   project,
   cancelled,
   pendingJobs = 0,
+  pendingTriggers = 0,
   previous,
   unchanged = false,
 } = {}) {
@@ -277,6 +278,8 @@ export function assessTaskMemories(records, {
   if (typeof cancelled !== "boolean") addIssue(issues, "invalid_cancelled_status");
   if (!Number.isSafeInteger(pendingJobs) || pendingJobs < 0) addIssue(issues, "invalid_pending_jobs");
   else if (pendingJobs > 0) addIssue(issues, "pending_jobs");
+  if (!Number.isSafeInteger(pendingTriggers) || pendingTriggers < 0) addIssue(issues, "invalid_pending_triggers");
+  else if (pendingTriggers > 0) addIssue(issues, "pending_triggers");
   if (typeof unchanged !== "boolean") addIssue(issues, "invalid_unchanged_flag");
 
   const current = validSnapshot(records, issues, "current");

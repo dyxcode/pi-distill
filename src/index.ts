@@ -6,6 +6,7 @@ import { openMemoryStore, resolveMemoryDatabasePath } from "./memory-path.js";
 import { ConsolidationCoordinator } from "./consolidation.ts";
 import { memoryReadRenderers, memorySearchRenderers } from "./memory-rendering.ts";
 import { SessionUsageCoordinator } from "./session-usage.ts";
+import { CleanupCoordinator } from "./cleanup.ts";
 
 const searchParameters = Type.Object({
   terms: Type.Array(Type.String({ minLength: 1, maxLength: 128 }), {
@@ -38,9 +39,14 @@ const searchGuidelines = [
 
 export default function piDistill(pi: ExtensionAPI): void {
   const memoryTools = new MemoryTools(() => openMemoryStore(getAgentDir()));
+  const cleanup = new CleanupCoordinator({
+    openStore: () => openMemoryStore(getAgentDir()),
+    hasStore: () => existsSync(resolveMemoryDatabasePath(getAgentDir())),
+  });
   const consolidation = new ConsolidationCoordinator({
     openStore: () => openMemoryStore(getAgentDir()),
     hasStore: () => existsSync(resolveMemoryDatabasePath(getAgentDir())),
+    onProgress: () => cleanup.wake(),
   });
   const usage = new SessionUsageCoordinator({
     namespace: getAgentDir(),
@@ -80,18 +86,29 @@ export default function piDistill(pi: ExtensionAPI): void {
     },
   });
 
-  pi.on("agent_start", () => memoryTools.reset());
+  pi.on("agent_start", () => { memoryTools.reset(); consolidation.setForegroundBusy(true); });
+  pi.on("agent_settled", (_event, ctx) => {
+    consolidation.observe(ctx);
+    consolidation.setForegroundBusy(false);
+    cleanup.wake();
+  });
   pi.on("session_start", (event, ctx) => {
     usage.start(event, ctx);
     consolidation.start(ctx);
+    cleanup.wake();
   });
   pi.on("message_end", (_event, ctx) => { usage.observe(ctx); consolidation.observe(ctx); });
   pi.on("agent_end", (_event, ctx) => { usage.observe(ctx); consolidation.observe(ctx); });
-  pi.on("session_tree", (_event, ctx) => usage.observe(ctx));
+  pi.on("session_tree", (_event, ctx) => { usage.observe(ctx); consolidation.observe(ctx); cleanup.wake(); });
   pi.on("session_before_compact", (_event, ctx) => consolidation.beforeCompact(ctx));
-  pi.on("session_compact", (_event, ctx) => { usage.observe(ctx); consolidation.afterCompact(ctx); });
+  pi.on("session_compact", (event, ctx) => {
+    usage.observe(ctx);
+    consolidation.afterCompact(ctx, event.compactionEntry.id);
+    cleanup.wake();
+  });
   pi.on("session_compact_failed", () => consolidation.compactFailed());
   pi.on("session_shutdown", async (event, ctx) => {
+    cleanup.close();
     await consolidation.shutdown(ctx, event.reason);
     usage.shutdown(event, ctx);
     memoryTools.close();

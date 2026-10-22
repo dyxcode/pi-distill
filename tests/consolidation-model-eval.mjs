@@ -2,7 +2,7 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { assessCurrentMemories, assessRecall, evaluationFailureStatus, sanitizeEvaluationTrace, trackStreamCompletion, waitForConsolidation } from "./consolidation-model-eval-support.mjs";
+import { assessCurrentMemories, assessRecall, countOutstandingDistillTriggers, evaluationFailureStatus, sanitizeEvaluationTrace, trackStreamCompletion, waitForConsolidation } from "./consolidation-model-eval-support.mjs";
 import { assessTaskMemories, assessTaskRecall } from "./task-cancellation-eval-support.mjs";
 
 const repoRoot = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -319,6 +319,7 @@ async function runLifecycle(pi, SQLiteMemoryStore, modelRuntime, model, isolated
         memories.push(...rows.map(({ memory }) => ({ id: memory.id, revision: memory.revision, content: memory.content })));
         if (rows.length < 128) return {
           memories, pendingJobs: store.listConsolidationJobs().length,
+          pendingTriggers: countOutstandingDistillTriggers(options => store.listDistillTriggers(options)),
           pendingObservations: store.observedSessions().length,
         };
         const next = rows.at(-1).memory.id;
@@ -365,6 +366,7 @@ async function runLifecycle(pi, SQLiteMemoryStore, modelRuntime, model, isolated
       settled,
       pendingObservations: state.pendingObservations,
       pendingJobs: state.pendingJobs,
+      pendingTriggers: state.pendingTriggers,
       memories: state.memories,
       assessment,
     };
@@ -402,7 +404,8 @@ async function runLifecycle(pi, SQLiteMemoryStore, modelRuntime, model, isolated
     activeStage = stage;
     const { state, settled } = await advanceBoundary(compact);
     const assessment = assessTaskMemories(state.memories, {
-      project: fixture.project, cancelled, previous, unchanged, pendingJobs: state.pendingJobs,
+      project: fixture.project, cancelled, previous, unchanged,
+      pendingJobs: state.pendingJobs, pendingTriggers: state.pendingTriggers,
     });
     const result = {
       name: stage, status: !settled ? "incomplete" : assessment.accepted ? "passed" : "needs_review",
@@ -564,10 +567,11 @@ async function main() {
     model: report.model,
     node: report.node,
     providerRequests: report.providerRequests ?? 0,
-    stages: (report.stages ?? []).map(({ name, status, pendingJobs, assessment, signals }) => ({
+    stages: (report.stages ?? []).map(({ name, status, pendingJobs, pendingTriggers, assessment, signals }) => ({
       name,
       status,
       ...(pendingJobs === undefined ? {} : { pendingJobs }),
+      ...(pendingTriggers === undefined ? {} : { pendingTriggers }),
       ...(assessment === undefined ? {} : { assessment }),
       ...(signals === undefined ? {} : { signals }),
     })),

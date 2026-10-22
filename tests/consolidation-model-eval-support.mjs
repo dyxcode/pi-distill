@@ -1,5 +1,8 @@
 const forbiddenKey = /(?:usage|tokens?|credential|authorization|headers?|api.?key|thinking|cost)/iu;
 const localPath = /(?:\/Users\/[^/\s"']+\/[^\s"']*|\/home\/[^/\s"']+\/[^\s"']*|\/(?:private\/)?(?:tmp|var\/folders)\/[^\s"']*)/gu;
+const OUTSTANDING_TRIGGER_STATUSES = new Set(["candidate", "pending", "prepared"]);
+const TRIGGER_PAGE_SIZE = 128;
+const MAX_TRIGGER_PAGES = 64;
 
 /** Compaction consumes stream.result() without a foreground message_end event. */
 export async function trackStreamCompletion(start, finish) {
@@ -23,6 +26,31 @@ export function evaluationFailureStatus(reason, report = {}) {
   return (report.providerRequests ?? 0) > 0 || (report.stages?.length ?? 0) > 0 ? "incomplete" : "not_run";
 }
 
+/** Count every durable trigger that has not completed, paging past terminal history. */
+export function countOutstandingDistillTriggers(listPage) {
+  if (typeof listPage !== "function") throw new TypeError("A distill trigger page reader is required.");
+  let cursor;
+  let count = 0;
+  for (let pageNumber = 0; pageNumber < MAX_TRIGGER_PAGES; pageNumber += 1) {
+    const page = listPage({ limit: TRIGGER_PAGE_SIZE, ...(cursor === undefined ? {} : { cursor }) });
+    if (!page || typeof page !== "object" || !Array.isArray(page.items)) {
+      throw new Error("evaluation_trigger_page_invalid");
+    }
+    for (const trigger of page.items) {
+      if (!trigger || typeof trigger !== "object" || typeof trigger.status !== "string") {
+        throw new Error("evaluation_trigger_record_invalid");
+      }
+      if (OUTSTANDING_TRIGGER_STATUSES.has(trigger.status)) count += 1;
+    }
+    if (page.nextCursor === undefined) return count;
+    if (!Number.isSafeInteger(page.nextCursor) || page.nextCursor <= (cursor ?? 0)) {
+      throw new Error("evaluation_trigger_cursor_invalid");
+    }
+    cursor = page.nextCursor;
+  }
+  throw new Error("evaluation_trigger_scan_limit");
+}
+
 /** Wait for durable completion, including capture recovery and active requests. */
 export async function waitForConsolidation({
   readState, activity, signal, timeoutMs = 45_000, completedBefore = activity().completedRequests,
@@ -36,7 +64,7 @@ export async function waitForConsolidation({
     let readable = false;
     try { last = readState(); readable = true; } catch { /* Opening or a bounded lock can be retried. */ }
     const current = activity();
-    const idle = readable && last.pendingJobs === 0 && last.pendingObservations === 0 && current.inFlightRequests === 0;
+    const idle = readable && last.pendingJobs === 0 && last.pendingTriggers === 0 && current.inFlightRequests === 0;
     if (idle) {
       const next = JSON.stringify(last);
       if (next !== fingerprint || stableSince === undefined) {

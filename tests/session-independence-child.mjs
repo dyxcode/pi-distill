@@ -187,7 +187,7 @@ try {
   assert.ok(originalSessionFile);
   assert.ok(originalSessionFile.startsWith(`${root}${sep}`), 'the original source must be inside the disposable fixture');
   await runtime.dispose();
-  runtime = undefined;
+  runtime = await createRuntime(modelRuntime, settings);
 
   const originalState = await waitForSettledMemory(memory => memory.content === originalContent);
   assert.equal(originalState.memory?.content, originalContent);
@@ -202,7 +202,6 @@ try {
   assert.equal(existsSync(originalSessionFile), false);
 
   setScript();
-  runtime = await createRuntime(modelRuntime, settings);
   const freshSessionId = runtime.session.sessionManager.getSessionId();
   const retrievalEvents = [];
   runtime.session.subscribe(event => {
@@ -236,7 +235,7 @@ try {
 
   await runtime.session.prompt('Correction: For fictional Cedar, retain logs for 7 days by default and 30 days during incident investigations.');
   await runtime.dispose();
-  runtime = undefined;
+  runtime = await createRuntime(modelRuntime, settings);
 
   const correctedState = await waitForSettledMemory(memory => memory.content === correctedContent);
   assert.equal(correctedState.memory?.id, memoryId, 'the correction must update the same durable record');

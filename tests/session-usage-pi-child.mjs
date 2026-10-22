@@ -66,6 +66,18 @@ async function assess(file, processToken, probeProcess = pid => pid === process.
   }
 }
 
+async function assertReleasedUsage(file, token) {
+  let result;
+  for (let attempt = 0; attempt < 10; attempt++) {
+    result = (await assess(file, token)).sessions[0];
+    // Background preparation may change coverage during this read. Retry that
+    // invalidated snapshot; the next stable read must identify released usage.
+    if (result.reason !== "checkpoint-changed") break;
+    await new Promise(resolveWait => setTimeout(resolveWait, 10));
+  }
+  assert.equal(result.usage, "released", JSON.stringify(result));
+}
+
 async function createRuntime(sessionManager) {
   const settingsManager = pi.SettingsManager.inMemory();
   const factory = async options => {
@@ -181,7 +193,7 @@ if (mode === "worker") {
       assert.equal(newResult.cancelled, false);
       const afterNew = activeSession(runtime);
       assert.equal(findUsage(initial.usage.ownerId).state, "released");
-      assert.equal((await assess(initial.sessionFile, initial.usage.processToken)).sessions[0].usage, "released");
+      await assertReleasedUsage(initial.sessionFile, initial.usage.processToken);
       assert.notEqual(afterNew.usage.ownerId, initial.usage.ownerId);
       assert.equal(afterNew.usage.processToken, initial.usage.processToken);
 
@@ -199,7 +211,7 @@ if (mode === "worker") {
       assert.equal(forkResult.cancelled, false);
       const afterFork = activeSession(runtime);
       assert.equal(findUsage(afterResume.usage.ownerId).state, "released");
-      assert.equal((await assess(target.sessionFile, initial.usage.processToken)).sessions[0].usage, "released");
+      await assertReleasedUsage(target.sessionFile, initial.usage.processToken);
       assert.notEqual(afterFork.sessionFile, target.sessionFile);
       assert.equal(afterFork.usage.processToken, initial.usage.processToken);
       console.log(JSON.stringify({ mode, new: "released", resume: "released", fork: "released", passed: true }));
@@ -215,6 +227,10 @@ if (mode === "worker") {
       assert.equal(after.sessionFile, initial.sessionFile);
       assert.equal(after.leafId, assistantMessage);
       assert.notEqual(after.leafId, before.leafId);
+      const treeStore = new SQLiteMemoryStore(storePath);
+      try {
+        assert.equal(treeStore.observedSessions().find(source => source.sessionId === after.sessionId)?.leafId, assistantMessage);
+      } finally { treeStore.close(); }
       assert.notEqual(firstMessage, assistantMessage);
       console.log(JSON.stringify({ mode, previousCheckpoint: before.leafId, currentCheckpoint: after.leafId, passed: true }));
     } else if (mode === "cancel") {

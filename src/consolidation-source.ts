@@ -145,6 +145,20 @@ export async function loadSnapshot(sessionFile: string, leafId?: string | null):
   return snapshotFromGraph(graph, sessionFile, leafId);
 }
 
+/** Recover a saved compaction across every branch, including an inactive branch. */
+export async function findCompactionRecord(
+  sessionFile: string,
+  sessionId: string,
+  cwd: string,
+  leafId: string | null,
+): Promise<string | undefined> {
+  const graph = await loadSessionGraph(resolve(sessionFile), new Set(), 0, { bytes: 0, entries: 0 });
+  if (graph.header.id !== sessionId || graph.header.cwd !== cwd || graph.pending || graph.parentSessionPending) {
+    throw new Error("Compaction recovery requires the complete original session and ancestry.");
+  }
+  return graph.entries.find(entry => entry.type === "compaction" && entry.parentId === leafId)?.id;
+}
+
 function snapshotFromGraph(
   graph: SessionGraph & { readonly parentSessionPending: boolean },
   sessionFile: string,
@@ -246,6 +260,22 @@ async function sessionFileVersion(path: string): Promise<string> {
   const info = await lstat(path, { bigint: true });
   if (!info.isFile()) throw new Error("Session coverage requires a regular file.");
   return [info.dev, info.ino, info.size, info.mtimeNs, info.ctimeNs].join(":");
+}
+
+/** Establish whether an empty plan is valid rather than a failed source parse. */
+export function isValidSourceSnapshot(snapshot: SourceSnapshot): boolean {
+  if (snapshot.pending || snapshot.ancestry?.unresolved) return false;
+  if (!validNonEmptyString(snapshot.sessionId, MAX_SESSION_ID_LENGTH) || typeof snapshot.cwd !== "string" ||
+    !Array.isArray(snapshot.entries)) return false;
+  const budget: AggregateBudget = { bytes: 0, entries: 0 };
+  if (!consumeAggregateBudget(budget, [snapshot.sessionId, snapshot.sessionFile, snapshot.cwd, snapshot.entries], snapshot.entries.length)) return false;
+  if (snapshot.leafId === null) return snapshot.entries.length === 0;
+  try {
+    const branch = validateBranch(snapshot.entries, snapshot.leafId);
+    if (validateContextEdits(branch).reason) return false;
+    getProjection(snapshot);
+    return true;
+  } catch { return false; }
 }
 
 export function planSources(snapshot: SourceSnapshot, processed: ReadonlySet<string>): readonly SourceBatch[] {

@@ -74,6 +74,15 @@ test('capture acknowledgement does not establish processing, and queued work rem
   assert.equal(result.pendingJobs, 1);
 });
 
+test('a queued source range blocks processed assessment before model batches are prepared', async t => {
+  const f = await fixture(t);
+  const leafId = f.message(); await f.save(); await f.complete();
+  assert.equal((await single(f)).status, 'processed');
+  f.store.enqueueDistillTrigger({id:'closed-range',sessionId:f.manager.getSessionId(),sessionFile:f.file,
+    cwd:f.root,leafId,reason:'close'});
+  assert.equal((await single(f)).status, 'pending');
+});
+
 test('new messages after a processed compact checkpoint require processing', async t => {
   const f = await fixture(t);
   const first = f.message();

@@ -280,6 +280,13 @@ test("pending consolidation work prevents acceptance", () => {
   assert.ok(result.issues.includes("pending_jobs"));
 });
 
+test("an unprepared durable trigger prevents acceptance before model jobs exist", () => {
+  const result = evaluate([memory("river-work", 1, cancelledContent)], { pendingJobs: 0, pendingTriggers: 1 });
+
+  assert.equal(result.accepted, false);
+  assert.ok(result.issues.includes("pending_triggers"));
+});
+
 test("surviving unchanged content keeps its revision and changed content increments exactly once", () => {
   const before = [memory("river-work", 4, initialContent)];
   const unchanged = assessTaskMemories([memory("river-work", 4, initialContent)], {
