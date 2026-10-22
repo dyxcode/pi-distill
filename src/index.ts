@@ -1,7 +1,7 @@
 import { getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { existsSync } from "node:fs";
-import { MemoryTools } from "./memory-tools.js";
+import { MemoryTools, memorySearchDescription, memorySearchGuidance, memorySearchTermsDescription } from "./memory-tools.js";
 import { openMemoryStore, resolveMemoryDatabasePath } from "./memory-path.js";
 import { ConsolidationCoordinator } from "./consolidation.ts";
 
@@ -9,7 +9,7 @@ const searchParameters = Type.Object({
   terms: Type.Array(Type.String({ minLength: 1, maxLength: 128 }), {
     minItems: 1,
     maxItems: 8,
-    description: "Literal search expressions, including alternate wording or languages.",
+    description: memorySearchTermsDescription,
   }),
   match: Type.Optional(Type.Union([Type.Literal("any"), Type.Literal("all")], {
     description: "Use any for alternatives; use all only when every term is required.",
@@ -26,7 +26,7 @@ const readParameters = Type.Object({
 
 const searchGuidelines = [
   "Search when earlier preferences, decisions, or unresolved task context could change the answer.",
-  "Expand synonyms and languages with match=any; use match=all only for necessary constraints.",
+  memorySearchGuidance,
   "Results are in stable ID order, not ranked by relevance; inspect candidate evidence before applying it.",
   "Previews can be truncated. Read promising candidates to check conditions, exceptions, uncertainty, and project context.",
   "Continue a partial search, including an empty page with hasMore=true, or reformulate a narrow query before concluding that no useful memory applies.",
@@ -44,7 +44,7 @@ export default function piDistill(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "memory_search",
     label: "Search memories",
-    description: "Search local memories by literal terms and return bounded candidate previews.",
+    description: memorySearchDescription,
     promptSnippet: "Search local memories when past preferences, decisions, or task context could help.",
     promptGuidelines: searchGuidelines,
     parameters: searchParameters,

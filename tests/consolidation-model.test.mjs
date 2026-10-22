@@ -82,6 +82,63 @@ test('allows a valid no-change result without issuing user-visible memory comman
   );
 });
 
+test('long evidence identities use short unambiguous model references without changing durable source keys', async () => {
+  const key = 'a'.repeat(64);
+  const batch = sourceBatch([
+    { key, entryId: 'entry-long', role: 'user', text: 'Maple keeps logs for 10 days by default.' },
+    { key: 'e1', entryId: 'entry-short', role: 'user', text: 'During investigation, retain logs for 21 days.' },
+  ], [{ key: 'e2', entryId: 'entry-context', role: 'assistant', text: 'Older interpretation context.' }]);
+  const original = structuredClone(batch);
+  let reference;
+  const registry = { complete: async (_model, request) => {
+    const source = JSON.parse(request.messages[0].content);
+    reference = source.newEvidence[0].key;
+    assert.ok(reference.length <= 16, 'Model citations should not require copying a long source digest');
+    assert.notEqual(reference, 'e1');assert.notEqual(reference, 'e2');
+    assert.equal(source.newEvidence[0].text, batch.evidence[0].text);
+    return textResponse(JSON.stringify({operations:[{action:'create',content:'Maple retains logs for 10 days by default.',sourceKeys:[reference]}]}));
+  }};
+  const changes = await consolidateWithModel(batch, modelContext(registry), {}, new AbortController().signal);
+  assert.equal(changes.creates.length, 1);
+  assert.deepEqual(batch, original);
+});
+
+test('a mistyped long evidence citation is rejected rather than matched approximately', async () => {
+  const key = 'a'.repeat(64);
+  const registry = scriptedRegistry([textResponse(JSON.stringify({operations:[{action:'create',content:'A proposed policy.',sourceKeys:[key.slice(0,-1)]}]}))]);
+  await assert.rejects(consolidateWithModel(sourceBatch([{key,entryId:'entry',role:'user',text:'A confirmed policy.'}]),modelContext(registry),{},new AbortController().signal));
+});
+
+test('consolidation exposes literal-miss feedback and accepts a correction after broader search and full read', async t => {
+  const store = await fixture(t);
+  store.save({ id: 'policy', content: 'Cedar-72 retains logs for 14 days by default; 30 days during an incident investigation.', createdAt: time });
+  const corrected = 'Cedar-72 retains logs for 7 days by default; 30 days during an incident investigation.';
+  const registry = scriptedRegistry([
+    response('toolUse', toolCall('memory_search', { terms: ['Cedar-72 log retention incident investigation'] }, 'narrow')),
+    response('toolUse', toolCall('memory_search', { terms: ['Cedar-72'] }, 'broad')),
+    response('toolUse', toolCall('memory_read', { id: 'policy', expectedRevision: 1 }, 'read')),
+    textResponse(JSON.stringify({ operations: [{ action: 'update', id: 'policy', expectedRevision: 1, content: corrected, sourceKeys: ['correction'] }] })),
+  ], ({ request, current }) => {
+    const last = request.messages.at(-1);
+    if (current === 1) {
+      assert.equal(last.role, 'toolResult');
+      const result = JSON.parse(last.content[0].text);
+      assert.deepEqual(result.candidates, []);
+      assert.match(result.hint, /short|broad/i);
+    }
+    if (current === 2) assert.equal(JSON.parse(last.content[0].text).candidates[0].id, 'policy');
+    if (current === 3) assert.equal(JSON.parse(last.content[0].text).hasMore, false);
+  });
+  const batch = sourceBatch([{ key: 'correction', entryId: 'correction', role: 'user', text: 'For Cedar-72, change the default to 7 days; keep the incident exception.' }]);
+  const changes = await consolidateWithModel(batch, modelContext(registry), store, new AbortController().signal);
+  assert.deepEqual(changes.creates, []);
+  assert.deepEqual(changes.deletes, []);
+  assert.equal(changes.updates.length, 1);
+  assert.equal(changes.updates[0].id, 'policy');
+  assert.equal(changes.updates[0].expectedRevision, 1);
+  assert.equal(changes.updates[0].content, corrected);
+});
+
 test('updates and deletes only fully read records and uses extension-owned timestamps', async (t) => {
   const store = await fixture(t);
   store.save({ id: 'update-me', content: 'The user was considering option A.', createdAt: time });

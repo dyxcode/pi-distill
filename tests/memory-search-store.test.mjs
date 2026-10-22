@@ -126,6 +126,7 @@ test("uses BINARY ID keyset order across Unicode and NUL IDs", async (t) => {
     });
     seen.push(...page.map(({ memory }) => memory.id));
     if (page.length < 2) break;
+    assert.notEqual(page.at(-1).memory.id, after, "Pagination must advance the cursor rather than repeat a page");
     after = page.at(-1).memory.id;
   }
   assert.deepEqual(seen, ["a", "a\0", "a\0A", "a\0z", "b", "é", "中"]);

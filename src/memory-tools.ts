@@ -2,6 +2,10 @@ import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { setImmediate as yieldToEventLoop } from "node:timers/promises";
 import type { Memory, SQLiteMemoryStore } from "./memory-store.js";
 
+export const memorySearchDescription = "Search local memories by literal substrings and return bounded candidate previews.";
+export const memorySearchTermsDescription = "Short literal substrings: names, topic words, or alternate wording/languages. Each term is matched whole, not split into words.";
+export const memorySearchGuidance = "Start with short distinctive names or topic words and match=any. After no matches, shorten or broaden terms before concluding absence. Continue partial searches with their cursor; use match=all only for necessary constraints.";
+
 export interface MemoryToolResult {
   content: { type: "text"; text: string }[];
   details: Record<string, unknown>;
@@ -251,6 +255,9 @@ export class MemoryTools {
     const result = (hasMore: boolean, stopReason: string): Body => {
       const uniqueCandidates = new Set([...this.#seen.keys(), ...candidates.map(candidate => candidate.id)]).size;
       const body: Body = { status: "ok", candidates, hasMore, stopReason, uniqueCandidates };
+      if (!hasMore && candidates.length === 0 && this.#calls < RUN_CALLS) {
+        body["hint"] = "No literal matches on this page. If relevant evidence is still missing, try shorter names or broader topic words with match=any; a literal miss does not establish semantic absence.";
+      }
       if (hasMore && after !== undefined) body["nextCursor"] = this.#encode({ kind: "search", query, after });
       return body;
     };

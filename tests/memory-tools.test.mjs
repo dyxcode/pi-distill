@@ -32,6 +32,31 @@ test('search uses literal alternatives, returns exact original previews and leav
  assert.equal(data(await tools.search({terms:['测试','absent'],match:'all'})).candidates.length,0);
 });
 
+test('an exhausted literal miss advises a broader query that can recover the policy', async t => {
+ const {tools,writer}=await fixture(t,[['policy','For fictional Cedar-72, retain logs for 14 days by default; 30 days during an incident investigation.']]);
+ const before=writer.get('policy');
+ const miss=data(await tools.search({terms:['Cedar-72 log retention incident investigation','Cedar 72 retention period','incident investigation exception log'],match:'any'}));
+ assert.equal(miss.status,'ok');assert.equal(miss.hasMore,false);assert.deepEqual(miss.candidates,[]);
+ assert.match(miss.hint,/literal/i);assert.match(miss.hint,/short|broad/i);
+ const found=data(await tools.search({terms:['Cedar-72'],match:'any'}));
+ assert.deepEqual(found.candidates.map(candidate=>candidate.id),['policy']);
+ assert.equal(found.hint,undefined);
+ assert.deepEqual(writer.get('policy'),before);
+});
+
+test('retrieval failures and budget exhaustion do not advise another search', async t => {
+ const unavailable=new MemoryTools(()=>{throw Error('storage unavailable');});
+ t.after(()=>unavailable.close());
+ const failed=data(await unavailable.search({terms:['policy']}));
+ assert.equal(failed.status,'unavailable');assert.equal(failed.hint,undefined);
+ const {tools}=await fixture(t);
+ for(let index=0;index<11;index++)await tools.search({terms:['missing']});
+ const last=data(await tools.search({terms:['missing']}));
+ assert.equal(last.status,'ok');assert.equal(last.remaining.calls,0);assert.equal(last.hint,undefined);
+ const exhausted=data(await tools.search({terms:['missing']}));
+ assert.equal(exhausted.status,'budget_exhausted');assert.equal(exhausted.hint,undefined);
+});
+
 test('stable pagination reaches later matches after many nonmatches without duplicates', async t => {
  const records=Array.from({length:350},(_,i)=>[String(i).padStart(4,'0'),i%3===0?'needle':'noise']);
  const {tools}=await fixture(t,records); const ids=[]; let cursor;
