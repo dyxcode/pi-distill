@@ -5,6 +5,7 @@ import {
   type SessionCoverage,
 } from "./consolidation-source.ts";
 import type { SQLiteMemoryStore } from "./memory-store.js";
+import type { SessionUsage } from "./session-usage-types.ts";
 
 export interface SessionRetentionAssessment {
   readonly sessionFile: string;
@@ -13,6 +14,8 @@ export interface SessionRetentionAssessment {
   readonly reason: "source-unavailable" | "progress-unavailable" | "checkpoint-changed" | "source-changed" | "duplicate-session-id" | null;
   readonly unprocessedSources: number | null;
   readonly pendingJobs: number | null;
+  /** Registered usage only: released never means globally unused or deletable. */
+  readonly usage: "active" | "released" | "unknown";
   /** Every ancestor needed to resolve this session, including paths outside the input. */
   readonly dependsOn: readonly string[];
   /** Supplied sessions that still require this file, even if they are processed. */
@@ -28,6 +31,28 @@ export interface SessionRetentionReport {
 
 type ProgressReader = Pick<SQLiteMemoryStore, "readConsolidationStatus">;
 
+interface UsageEvidence {
+  readonly processToken?: string;
+  readonly probeProcess?: (pid: number) => "alive" | "dead" | "unknown";
+}
+
+function processStatus(pid: number): "alive" | "unknown" {
+  try { process.kill(pid, 0); return "alive"; } catch { return "unknown"; }
+}
+
+function assessUsage(owners: readonly SessionUsage[], evidence: UsageEvidence): SessionRetentionAssessment["usage"] {
+  if (!owners.length) return "unknown";
+  const outstanding = owners.filter(owner => owner.state !== "released");
+  if (!outstanding.length) return "released";
+  for (const owner of outstanding) {
+    // A live PID does not identify a foreign process incarnation. Without a
+    // matching local token, preserve uncertainty (including PID reuse).
+    if (owner.ownerPid !== process.pid || owner.processToken !== evidence.processToken) continue;
+    try { if ((evidence.probeProcess ?? processStatus)(owner.ownerPid) === "alive") return "active"; } catch { /* Unavailable evidence remains unknown. */ }
+  }
+  return "unknown";
+}
+
 /**
  * Read-only coverage of current file contents and known fork dependencies.
  * A processed result is not a deletion permit: it establishes neither inactivity,
@@ -37,6 +62,7 @@ type ProgressReader = Pick<SQLiteMemoryStore, "readConsolidationStatus">;
 export async function assessSessionRetention(
   sessionFiles: readonly string[],
   store: ProgressReader,
+  usageEvidence: UsageEvidence = {},
 ): Promise<SessionRetentionReport> {
   if (!Array.isArray(sessionFiles) || sessionFiles.length > 1024 ||
     [...sessionFiles].some(path => typeof path !== "string" || path.trim().length === 0 || path.includes("\0"))) {
@@ -54,7 +80,7 @@ export async function assessSessionRetention(
   const budget = { bytes: 0, entries: 0 };
   for (const path of paths) {
     try {
-      coverage.set(path, await loadSessionCoverage(path, initial?.observations, budget));
+      coverage.set(path, await loadSessionCoverage(path, initial ? [...initial.observations, ...initial.usages] : [], budget));
     } catch {
       // A malformed/unstable source cannot be interpreted as an empty conversation.
     }
@@ -87,8 +113,10 @@ export async function assessSessionRetention(
     else if ((identities.get(source.sessionId) ?? 0) > 1) reason = "duplicate-session-id";
     else if (!progress || !initial) reason = "progress-unavailable";
     else {
-      const checkpoints = (state: typeof progress): string => JSON.stringify(state.observations.filter(observation =>
-        observation.sessionId === source.sessionId || resolve(observation.sessionFile) === path));
+      const checkpoints = (state: typeof progress): string => JSON.stringify({
+        observations: state.observations.filter(observation => observation.sessionId === source.sessionId || resolve(observation.sessionFile) === path),
+        usages: state.usages.filter(owner => owner.sessionId === source.sessionId || resolve(owner.sessionFile) === path),
+      });
       if (checkpoints(initial) !== checkpoints(progress)) reason = "checkpoint-changed";
     }
     if (reason === "source-unavailable" || reason === "source-changed" || reason === "duplicate-session-id") dependenciesComplete = false;
@@ -103,6 +131,8 @@ export async function assessSessionRetention(
       reason,
       unprocessedSources,
       pendingJobs,
+      usage: reason || !source || !progress ? "unknown" : assessUsage(progress.usages.filter(owner =>
+        owner.sessionId === source.sessionId || resolve(owner.sessionFile) === path), usageEvidence),
       dependsOn,
       requiredBy,
     });

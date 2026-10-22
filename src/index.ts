@@ -5,6 +5,7 @@ import { MemoryTools, memorySearchDescription, memorySearchGuidance, memorySearc
 import { openMemoryStore, resolveMemoryDatabasePath } from "./memory-path.js";
 import { ConsolidationCoordinator } from "./consolidation.ts";
 import { memoryReadRenderers, memorySearchRenderers } from "./memory-rendering.ts";
+import { SessionUsageCoordinator } from "./session-usage.ts";
 
 const searchParameters = Type.Object({
   terms: Type.Array(Type.String({ minLength: 1, maxLength: 128 }), {
@@ -41,6 +42,10 @@ export default function piDistill(pi: ExtensionAPI): void {
     openStore: () => openMemoryStore(getAgentDir()),
     hasStore: () => existsSync(resolveMemoryDatabasePath(getAgentDir())),
   });
+  const usage = new SessionUsageCoordinator({
+    namespace: getAgentDir(),
+    openStore: () => openMemoryStore(getAgentDir()),
+  });
 
   pi.registerTool({
     ...memorySearchRenderers,
@@ -76,14 +81,19 @@ export default function piDistill(pi: ExtensionAPI): void {
   });
 
   pi.on("agent_start", () => memoryTools.reset());
-  pi.on("session_start", (_event, ctx) => consolidation.start(ctx));
-  pi.on("message_end", (_event, ctx) => consolidation.observe(ctx));
-  pi.on("agent_end", (_event, ctx) => consolidation.observe(ctx));
+  pi.on("session_start", (event, ctx) => {
+    usage.start(event, ctx);
+    consolidation.start(ctx);
+  });
+  pi.on("message_end", (_event, ctx) => { usage.observe(ctx); consolidation.observe(ctx); });
+  pi.on("agent_end", (_event, ctx) => { usage.observe(ctx); consolidation.observe(ctx); });
+  pi.on("session_tree", (_event, ctx) => usage.observe(ctx));
   pi.on("session_before_compact", (_event, ctx) => consolidation.beforeCompact(ctx));
-  pi.on("session_compact", (_event, ctx) => consolidation.afterCompact(ctx));
+  pi.on("session_compact", (_event, ctx) => { usage.observe(ctx); consolidation.afterCompact(ctx); });
   pi.on("session_compact_failed", () => consolidation.compactFailed());
   pi.on("session_shutdown", async (event, ctx) => {
     await consolidation.shutdown(ctx, event.reason);
+    usage.shutdown(event, ctx);
     memoryTools.close();
   });
 }

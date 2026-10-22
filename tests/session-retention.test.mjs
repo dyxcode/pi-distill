@@ -294,3 +294,43 @@ test('an oversized file consumes the shared read budget instead of resetting it 
   const report = await assessSessionRetention([large, f.file], f.store);
   assert.ok(report.sessions.every(session => session.status === 'unknown'));
 });
+
+test('usage remains separate from processing: unknown without registrations, active current incarnation, released after handoff', async t => {
+  const f = await fixture(t); f.message(); await f.save(); await f.complete();
+  let result = await single(f); assert.equal(result.status, 'processed'); assert.equal(result.usage, 'unknown');
+  const owner = { ownerId: 'one', processToken: 'this-process', state: 'active', sessionId: f.manager.getSessionId(), sessionFile: f.file, cwd: f.root, leafId: f.manager.getLeafId(), ownerPid: process.pid };
+  f.store.saveSessionUsage(owner);
+  const assessment = async options => (await assessSessionRetention([f.file], f.store, options)).sessions[0];
+  result = await assessment({ processToken: 'this-process' });
+  assert.equal(result.status, 'processed'); assert.equal(result.usage, 'active');
+  assert.equal((await assessment({ processToken: 'another-incarnation' })).usage, 'unknown', 'PID reuse is not proof of the registered owner');
+  assert.equal((await assessment({ processToken: 'this-process', probeProcess: () => 'unknown' })).usage, 'unknown');
+  assert.equal((await assessment({ processToken: 'this-process', probeProcess: () => 'dead' })).usage, 'unknown', 'crash does not release a claim');
+  f.store.saveSessionUsage({ ...owner, state: 'closing' });
+  assert.equal((await assessment({ processToken: 'this-process' })).usage, 'active', 'shutdown hook is not disposal');
+  f.store.saveSessionUsage({ ...owner, state: 'released' });
+  assert.equal((await assessment({ processToken: 'this-process' })).usage, 'released');
+  f.store.saveSessionUsage({ ...owner, ownerId: 'other-window', processToken: 'other-process', state: 'active' });
+  assert.equal((await assessment({ processToken: 'this-process' })).usage, 'unknown', 'one owner cannot release another');
+});
+
+test('all owners checkpoints contribute to coverage even after a durable release', async t => {
+  const f = await fixture(t);
+  const original = f.message('Original checkpoint.');
+  f.manager.appendContextEdit(original, { content: [{ type: 'text', text: 'Edited checkpoint.' }] });
+  await f.save(); await f.complete();
+  const owner = { ownerId: 'previous', processToken: 'previous-process', state: 'active', sessionId: f.manager.getSessionId(), sessionFile: f.file, cwd: f.root, leafId: original, ownerPid: process.pid };
+  f.store.saveSessionUsage(owner); f.store.saveSessionUsage({ ...owner, state: 'closing' }); f.store.saveSessionUsage({ ...owner, state: 'released' });
+  assert.equal((await single(f)).status, 'pending');
+  await f.complete(f.file, original);
+  assert.equal((await single(f)).status, 'processed');
+});
+
+test('owner changes during assessment invalidate the snapshot', async t => {
+  const f = await fixture(t); f.message(); await f.save(); await f.complete();
+  const reader = { readConsolidationStatus(keys) {
+    if (keys.length) f.store.saveSessionUsage({ ownerId: 'concurrent-open', processToken: 'other', state: 'active', sessionId: f.manager.getSessionId(), sessionFile: f.file, cwd: f.root, leafId: f.manager.getLeafId(), ownerPid: process.pid });
+    return f.store.readConsolidationStatus(keys);
+  } };
+  const result = await single(f, reader); assert.equal(result.status, 'unknown'); assert.equal(result.usage, 'unknown');
+});

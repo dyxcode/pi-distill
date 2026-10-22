@@ -343,6 +343,7 @@ test("processing assessments read committed progress while another connection ho
       processedSources: first.sourceKeys,
       pendingJobs: [second],
       observations: [],
+      usages: [],
     });
     writer.exec("ROLLBACK");
   } finally {
@@ -517,7 +518,7 @@ test("schema v0 and v1 migrations preserve every current memory field and create
     }
     const check = database(f.path);
     try {
-      assert.equal(check.prepare("PRAGMA user_version").get()["user_version"], 2);
+      assert.equal(check.prepare("PRAGMA user_version").get()["user_version"], 3);
       const names = check.prepare("SELECT name FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*' ORDER BY name")
         .all().map((row) => row["name"]);
       assert.deepEqual(names, [
@@ -526,6 +527,7 @@ test("schema v0 and v1 migrations preserve every current memory field and create
         "memories",
         "memory_origins",
         "session_observations",
+        "session_usages",
       ]);
       assert.deepEqual(check.prepare("PRAGMA table_info(memory_origins)").all().map((row) => row["name"]), [
         "memory_id",
@@ -552,21 +554,21 @@ test("schema v0 and v1 migrations preserve every current memory field and create
 test("future and unknown schemas fail without being reset", async (t) => {
   const f = await fixture(t);
   const raw = database(f.path);
-  raw.exec("CREATE TABLE future_data (value TEXT NOT NULL) STRICT; PRAGMA user_version = 3");
+  raw.exec("CREATE TABLE future_data (value TEXT NOT NULL) STRICT; PRAGMA user_version = 4");
   raw.prepare("INSERT INTO future_data VALUES (?)").run("preserve");
   raw.close();
 
   assert.throws(() => new SQLiteMemoryStore(f.path), /unsupported.*schema version/i);
   const verify = database(f.path);
   try {
-    assert.equal(verify.prepare("PRAGMA user_version").get()["user_version"], 3);
+    assert.equal(verify.prepare("PRAGMA user_version").get()["user_version"], 4);
     assert.equal(verify.prepare("SELECT value FROM future_data").get()["value"], "preserve");
   } finally {
     verify.close();
   }
 });
 
-test("a version-two database with an unrecognized object is rejected and preserved", async (t) => {
+test("a version-three database with an unrecognized object is rejected and preserved", async (t) => {
   const f = await fixture(t);
   const store = f.open();
   store.save(memory("preserve-current"));
@@ -587,7 +589,7 @@ test("a version-two database with an unrecognized object is rejected and preserv
   }
 });
 
-test("version-two memory origins reject unexpected content columns", async (t) => {
+test("version-three memory origins reject unexpected content columns", async (t) => {
   const f = await fixture(t);
   const store = f.open();
   store.close();

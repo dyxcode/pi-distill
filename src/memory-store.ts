@@ -5,6 +5,7 @@ import type {
   ConsolidationJob,
   SessionObservation,
 } from "./consolidation-types.js";
+import type { SessionUsage } from "./session-usage-types.js";
 
 const initialColumns = `
   id TEXT PRIMARY KEY NOT NULL,
@@ -16,6 +17,9 @@ const currentSchema = `CREATE TABLE memories (${initialColumns},
   updated_at TEXT NOT NULL
 ) STRICT`;
 const maxSearchBatchSize = 128;
+const maxKnownSessionFiles = 1_024;
+// Assessment reads validate at most this many persisted metadata records per snapshot.
+const maxSessionMetadataRows = 16_384;
 
 const consolidationJobsSchema =
   "CREATE TABLE consolidation_jobs (" +
@@ -48,7 +52,18 @@ const sessionObservationsSchema =
   "owner_pid INTEGER NOT NULL, " +
   "captured INTEGER NOT NULL DEFAULT 0 CHECK (captured IN (0, 1))" +
   ") STRICT";
-const latestSchemaVersion = 2;
+const sessionUsagesSchema =
+  "CREATE TABLE session_usages (" +
+  "owner_id TEXT PRIMARY KEY NOT NULL, " +
+  "process_token TEXT NOT NULL, " +
+  "session_id TEXT NOT NULL, " +
+  "session_file TEXT NOT NULL, " +
+  "cwd TEXT NOT NULL, " +
+  "leaf_id TEXT, " +
+  "owner_pid INTEGER NOT NULL CHECK (owner_pid > 0), " +
+  "state TEXT NOT NULL CHECK (state IN ('active', 'closing', 'released'))" +
+  ") STRICT";
+const latestSchemaVersion = 3;
 
 // Node 22 truncates TEXT results at NUL. Return bytes only at the result boundary;
 // predicates and ordering must continue to use the original TEXT columns.
@@ -70,6 +85,12 @@ const originColumns = [textColumn("memory_id", "memoryId"), textColumn("job_id",
 const observationColumns = [
   textColumn("session_id"), textColumn("session_file"), textColumn("cwd"),
   textColumn("leaf_id"), "owner_pid", "captured",
+].join(", ");
+const sessionUsageColumns = [
+  textColumn("owner_id", "ownerId"), textColumn("process_token", "processToken"),
+  textColumn("session_id", "sessionId"), textColumn("session_file", "sessionFile"),
+  textColumn("cwd"), textColumn("leaf_id", "leafId"), "owner_pid AS ownerPid",
+  textColumn("state"),
 ].join(", ");
 const schemaColumns = [textColumn("name"), textColumn("type"), textColumn("sql")].join(", ");
 
@@ -332,6 +353,24 @@ function parseSessionObservation(value: unknown): SessionObservation {
   return { sessionId, sessionFile, cwd, leafId: parsedLeafId, ownerPid };
 }
 
+function parseSessionUsage(value: unknown): SessionUsage {
+  const { ownerId, processToken, sessionId, sessionFile, cwd, leafId, ownerPid, state } = fields(
+    value,
+    ["sessionId", "sessionFile", "cwd", "leafId", "ownerPid", "ownerId", "processToken", "state"],
+  );
+  validateText(ownerId, "session usage owner ID");
+  validateText(processToken, "session usage process token");
+  if (state !== "active" && state !== "closing" && state !== "released") {
+    throw new TypeError("Session usage state must be active, closing, or released.");
+  }
+  return {
+    ...parseSessionObservation({ sessionId, sessionFile, cwd, leafId, ownerPid }),
+    ownerId,
+    processToken,
+    state,
+  };
+}
+
 function parseStoredSessionObservation(value: unknown): {
   readonly observation: SessionObservation;
   readonly captured: boolean;
@@ -352,6 +391,23 @@ function parseStoredSessionObservation(value: unknown): {
     }),
     captured: captured === 1,
   };
+}
+
+function parseStoredSessionUsage(value: unknown): SessionUsage {
+  const { ownerId, processToken, sessionId, sessionFile, cwd, leafId, ownerPid, state } = fields(
+    value,
+    ["ownerId", "processToken", "sessionId", "sessionFile", "cwd", "leafId", "ownerPid", "state"],
+  );
+  return parseSessionUsage({ ownerId, processToken, sessionId, sessionFile, cwd, leafId, ownerPid, state });
+}
+
+function sameSessionUsageIdentity(first: SessionUsage, second: SessionUsage): boolean {
+  return first.ownerId === second.ownerId &&
+    first.processToken === second.processToken &&
+    first.sessionId === second.sessionId &&
+    first.sessionFile === second.sessionFile &&
+    first.cwd === second.cwd &&
+    first.ownerPid === second.ownerPid;
 }
 
 function validateNow(value: unknown, field: string): asserts value is number {
@@ -883,20 +939,40 @@ export class SQLiteMemoryStore {
     return result;
   }
 
-  /** One read snapshot for processing coverage and outstanding consolidation work. */
+  /** One snapshot; fails closed when pending jobs, observations, and usages exceed 16,384 rows. */
   readConsolidationStatus(keys: readonly string[]): {
     readonly processedSources: readonly string[];
     readonly pendingJobs: readonly ConsolidationJob[];
     readonly observations: readonly SessionObservation[];
+    readonly usages: readonly SessionUsage[];
   } {
     this.#ensureOpen();
-    return this.#transaction(() => ({
-      processedSources: this.processedSources(keys),
-      pendingJobs: this.listConsolidationJobs(),
-      observations: this.#database.prepare(
-        `SELECT ${observationColumns} FROM session_observations ORDER BY session_id COLLATE BINARY`,
-      ).all().map(row => parseStoredSessionObservation(this.#decodeRow(row)).observation),
-    }), "DEFERRED");
+    return this.#transaction(() => {
+      const rowCount = this.#database.prepare(
+        "SELECT COUNT(*) AS totalRows FROM (" +
+        "SELECT 1 FROM consolidation_jobs WHERE status = 'pending' " +
+        "UNION ALL SELECT 1 FROM session_observations " +
+        "UNION ALL SELECT 1 FROM session_usages LIMIT ?)",
+      ).get(maxSessionMetadataRows + 1)?.["totalRows"];
+      if (typeof rowCount !== "number" || !Number.isSafeInteger(rowCount) || rowCount < 0) {
+        throw new TypeError("SQLite returned an invalid consolidation status row count.");
+      }
+      if (rowCount > maxSessionMetadataRows) {
+        throw new RangeError(
+          "Consolidation status exceeds the " + maxSessionMetadataRows + "-row metadata limit.",
+        );
+      }
+      return {
+        processedSources: this.processedSources(keys),
+        pendingJobs: this.listConsolidationJobs(),
+        observations: this.#database.prepare(
+          `SELECT ${observationColumns} FROM session_observations ORDER BY session_id COLLATE BINARY`,
+        ).all().map(row => parseStoredSessionObservation(this.#decodeRow(row)).observation),
+        usages: this.#database.prepare(
+          `SELECT ${sessionUsageColumns} FROM session_usages ORDER BY owner_id COLLATE BINARY`,
+        ).all().map(row => parseStoredSessionUsage(this.#decodeRow(row))),
+      };
+    }, "DEFERRED");
   }
 
   commitConsolidation(commit: ConsolidationCommit): boolean {
@@ -1034,6 +1110,54 @@ export class SQLiteMemoryStore {
     });
   }
 
+  saveSessionUsage(usage: SessionUsage): void {
+    this.#ensureOpen();
+    const record = parseSessionUsage(usage);
+    this.#transaction(() => {
+      const row = this.#database.prepare(
+        `SELECT ${sessionUsageColumns} FROM session_usages WHERE owner_id = ?`,
+      ).get(record.ownerId);
+      if (row === undefined) {
+        if (record.state !== "active") {
+          throw new ConsolidationConflictError(record.ownerId, "cannot be created outside the active state");
+        }
+        this.#database.prepare(
+          "INSERT INTO session_usages " +
+          "(owner_id, process_token, session_id, session_file, cwd, leaf_id, owner_pid, state) " +
+          "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        ).run(
+          record.ownerId,
+          record.processToken,
+          record.sessionId,
+          record.sessionFile,
+          record.cwd,
+          record.leafId,
+          record.ownerPid,
+          record.state,
+        );
+        return;
+      }
+
+      const current = parseStoredSessionUsage(this.#decodeRow(row));
+      if (!sameSessionUsageIdentity(current, record)) {
+        throw new ConsolidationConflictError(record.ownerId, "already exists with different owner identity");
+      }
+      const checkpointChanged = current.leafId !== record.leafId;
+      const transitionAllowed = current.state === "active"
+        ? record.state === "active" || record.state === "closing"
+        : current.state === "closing"
+          ? (record.state === "closing" || record.state === "released") && !checkpointChanged
+          : record.state === "released" && !checkpointChanged;
+      if (!transitionAllowed) {
+        throw new ConsolidationConflictError(record.ownerId, "cannot change its session usage state or checkpoint");
+      }
+      if (current.state === record.state && !checkpointChanged) return;
+      this.#database.prepare(
+        "UPDATE session_usages SET leaf_id = ?, state = ? WHERE owner_id = ?",
+      ).run(record.leafId, record.state, record.ownerId);
+    });
+  }
+
   acknowledgeObservation(sessionId: string, leafId: string | null): void {
     this.#ensureOpen();
     validateText(sessionId, "session ID");
@@ -1053,6 +1177,65 @@ export class SQLiteMemoryStore {
     ).all().map((row) => parseStoredSessionObservation(this.#decodeRow(row)).observation);
   }
 
+  listSessionUsages(): readonly SessionUsage[] {
+    this.#ensureOpen();
+    return this.#database.prepare(
+      `SELECT ${sessionUsageColumns} FROM session_usages ORDER BY owner_id COLLATE BINARY`,
+    ).all().map((row) => parseStoredSessionUsage(this.#decodeRow(row)));
+  }
+
+  /** Returns at most 1,024 paths after validating no more than 16,384 metadata rows. */
+  listKnownSessionFiles(limit = maxKnownSessionFiles): readonly string[] {
+    this.#ensureOpen();
+    if (
+      typeof limit !== "number" || !Number.isSafeInteger(limit) ||
+      limit < 1 || limit > maxKnownSessionFiles
+    ) {
+      throw new TypeError(
+        "Known session file limit must be an integer from 1 through " + maxKnownSessionFiles + ".",
+      );
+    }
+    return this.#transaction(() => {
+      const rowCount = this.#database.prepare(
+        "SELECT COUNT(*) AS totalRows FROM (" +
+        "SELECT 1 FROM consolidation_jobs " +
+        "UNION ALL SELECT 1 FROM session_observations " +
+        "UNION ALL SELECT 1 FROM session_usages LIMIT ?)",
+      ).get(maxSessionMetadataRows + 1)?.["totalRows"];
+      if (typeof rowCount !== "number" || !Number.isSafeInteger(rowCount) || rowCount < 0) {
+        throw new TypeError("SQLite returned an invalid session metadata row count.");
+      }
+      if (rowCount > maxSessionMetadataRows) {
+        throw new RangeError(
+          "Session discovery exceeds the " + maxSessionMetadataRows + "-row metadata limit.",
+        );
+      }
+      for (const row of this.#database.prepare(`SELECT ${jobColumns} FROM consolidation_jobs`).iterate()) {
+        parsePersistedJobRow(this.#decodeRow(row));
+      }
+      for (const row of this.#database.prepare(
+        `SELECT ${observationColumns} FROM session_observations`,
+      ).iterate()) parseStoredSessionObservation(this.#decodeRow(row));
+      for (const row of this.#database.prepare(
+        `SELECT ${sessionUsageColumns} FROM session_usages`,
+      ).iterate()) {
+        parseStoredSessionUsage(this.#decodeRow(row));
+      }
+      const paths = this.#database.prepare(
+        "SELECT " + textColumn("path") + " FROM (" +
+        "SELECT json_extract(job_json, '$.sessionFile') AS path FROM consolidation_jobs " +
+        "UNION SELECT session_file AS path FROM session_observations " +
+        "UNION SELECT session_file AS path FROM session_usages" +
+        ") WHERE path IS NOT NULL ORDER BY path COLLATE BINARY LIMIT ?",
+      ).all(limit);
+      return paths.map((row) => {
+        const { path } = fields(this.#decodeRow(row), ["path"]);
+        validateAbsolutePath(path, "known session file");
+        return path;
+      });
+    }, "DEFERRED");
+  }
+
   close(): void {
     if (this.#database.isOpen) this.#database.close();
   }
@@ -1066,7 +1249,7 @@ export class SQLiteMemoryStore {
 
   #initializeSchema(): void {
     const version = this.#database.prepare("PRAGMA user_version").get()?.["user_version"];
-    if (version !== 0 && version !== 1 && version !== latestSchemaVersion) {
+    if (version !== 0 && version !== 1 && version !== 2 && version !== latestSchemaVersion) {
       throw new Error("Unsupported memory database schema version: " + String(version) + ".");
     }
     const objects = this.#database.prepare(
@@ -1075,7 +1258,7 @@ export class SQLiteMemoryStore {
     if (version === 0 && objects.length === 0) {
       this.#database.exec(currentSchema);
       this.#createAuxiliaryTables();
-      this.#database.exec("PRAGMA user_version = 2");
+      this.#database.exec("PRAGMA user_version = 3");
     } else if (version === 0) {
       if (
         objects.length !== 1 ||
@@ -1103,7 +1286,7 @@ export class SQLiteMemoryStore {
         "DROP TABLE memories_legacy",
       );
       this.#createAuxiliaryTables();
-      this.#database.exec("PRAGMA user_version = 2");
+      this.#database.exec("PRAGMA user_version = 3");
     } else if (version === 1) {
       if (
         objects.length !== 1 ||
@@ -1124,7 +1307,12 @@ export class SQLiteMemoryStore {
       );
       this.#validateMemoryRows();
       this.#createAuxiliaryTables();
-      this.#database.exec("PRAGMA user_version = 2");
+      this.#database.exec("PRAGMA user_version = 3");
+    } else if (version === 2) {
+      this.#validateSchema(false);
+      this.#validateAllRows(false);
+      this.#database.exec(sessionUsagesSchema);
+      this.#database.exec("PRAGMA user_version = 3");
     }
     this.#validateLatestSchema();
     this.#validateAllRows();
@@ -1135,9 +1323,14 @@ export class SQLiteMemoryStore {
     this.#database.exec(consolidationProgressSchema);
     this.#database.exec(memoryOriginsSchema);
     this.#database.exec(sessionObservationsSchema);
+    this.#database.exec(sessionUsagesSchema);
   }
 
   #validateLatestSchema(): void {
+    this.#validateSchema(true);
+  }
+
+  #validateSchema(includeSessionUsages: boolean): void {
     const objects = this.#database.prepare(
       `SELECT ${schemaColumns} FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*'`,
     ).all().map((row) => this.#decodeRow(row));
@@ -1190,6 +1383,21 @@ export class SQLiteMemoryStore {
         ],
       }],
     ]);
+    if (includeSessionUsages) {
+      schemas.set("session_usages", {
+        sql: sessionUsagesSchema,
+        columns: [
+          { name: "owner_id", type: "TEXT", notNull: 1, primaryKey: 1 },
+          { name: "process_token", type: "TEXT", notNull: 1, primaryKey: 0 },
+          { name: "session_id", type: "TEXT", notNull: 1, primaryKey: 0 },
+          { name: "session_file", type: "TEXT", notNull: 1, primaryKey: 0 },
+          { name: "cwd", type: "TEXT", notNull: 1, primaryKey: 0 },
+          { name: "leaf_id", type: "TEXT", notNull: 0, primaryKey: 0 },
+          { name: "owner_pid", type: "INTEGER", notNull: 1, primaryKey: 0 },
+          { name: "state", type: "TEXT", notNull: 1, primaryKey: 0 },
+        ],
+      });
+    }
     if (objects.length !== schemas.size) throw new Error("Unsupported memory database schema.");
     for (const object of objects) {
       const name = object["name"];
@@ -1238,7 +1446,7 @@ export class SQLiteMemoryStore {
     ).iterate()) parseMemory(this.#decodeRow(row));
   }
 
-  #validateAllRows(): void {
+  #validateAllRows(includeSessionUsages = true): void {
     this.#validateMemoryRows();
     const jobs = this.#database.prepare(
       `SELECT ${jobColumns} FROM consolidation_jobs`,
@@ -1265,6 +1473,11 @@ export class SQLiteMemoryStore {
     for (const row of this.#database.prepare(
       `SELECT ${observationColumns} FROM session_observations`,
     ).iterate()) parseStoredSessionObservation(this.#decodeRow(row));
+    if (includeSessionUsages) {
+      for (const row of this.#database.prepare(
+        `SELECT ${sessionUsageColumns} FROM session_usages`,
+      ).iterate()) parseStoredSessionUsage(this.#decodeRow(row));
+    }
   }
 
   #transaction<T>(operation: () => T, mode: "IMMEDIATE" | "DEFERRED" = "IMMEDIATE"): T {
