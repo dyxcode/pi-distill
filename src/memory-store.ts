@@ -50,6 +50,29 @@ const sessionObservationsSchema =
   ") STRICT";
 const latestSchemaVersion = 2;
 
+// Node 22 truncates TEXT results at NUL. Return bytes only at the result boundary;
+// predicates and ordering must continue to use the original TEXT columns.
+function textColumn(column: string, alias = column): string {
+  // Keep NULL distinct and make other storage classes fail text validation.
+  return `CASE typeof(${column}) WHEN 'text' THEN CAST(${column} AS BLOB) WHEN 'null' THEN NULL ELSE 0 END AS ${alias}`;
+}
+
+const memoryColumns = [
+  textColumn("id"), textColumn("content"), textColumn("created_at", "createdAt"),
+  "revision", textColumn("updated_at", "updatedAt"),
+].join(", ");
+const jobColumns = [
+  textColumn("id"), textColumn("job_json"), textColumn("status"),
+  textColumn("lease_owner"), "lease_until",
+].join(", ");
+const progressColumns = [textColumn("source_key"), textColumn("job_id"), "processed_at"].join(", ");
+const originColumns = [textColumn("memory_id", "memoryId"), textColumn("job_id", "jobId"), "revision"].join(", ");
+const observationColumns = [
+  textColumn("session_id"), textColumn("session_file"), textColumn("cwd"),
+  textColumn("leaf_id"), "owner_pid", "captured",
+].join(", ");
+const schemaColumns = [textColumn("name"), textColumn("type"), textColumn("sql")].join(", ");
+
 interface PersistedConsolidationJob {
   readonly job: ConsolidationJob;
   readonly status: "pending" | "complete";
@@ -507,6 +530,7 @@ function parseSearchRequest(value: unknown): MemorySearchRequest {
 
 export class SQLiteMemoryStore {
   readonly #database: DatabaseSync;
+  readonly #textDecoder: TextDecoder;
   readonly #select: StatementSync;
   readonly #insert: StatementSync;
   readonly #update: StatementSync;
@@ -522,11 +546,17 @@ export class SQLiteMemoryStore {
     // Keep lock contention bounded; callers can retry a failed operation.
     this.#database = new DatabaseSync(path, { timeout: 1_000 });
     try {
+      const encoding = this.#database.prepare("PRAGMA encoding").get()?.["encoding"];
+      if (encoding !== "UTF-8" && encoding !== "UTF-16le" && encoding !== "UTF-16be") {
+        throw new Error("Unsupported memory database text encoding.");
+      }
+      // CAST(TEXT AS BLOB) uses the database encoding. Preserve a literal BOM
+      // and reject malformed bytes instead of silently replacing characters.
+      this.#textDecoder = new TextDecoder(encoding, { fatal: true, ignoreBOM: true });
       this.#database.exec("PRAGMA synchronous = FULL");
       this.#transaction(() => this.#initializeSchema());
       this.#select = this.#database.prepare(
-        `SELECT id, content, created_at AS createdAt, revision, updated_at AS updatedAt
-         FROM memories WHERE id = ?`,
+        `SELECT ${memoryColumns} FROM memories WHERE id = ?`,
       );
       this.#insert = this.#database.prepare(
         `INSERT INTO memories (id, content, created_at, revision, updated_at)
@@ -614,18 +644,22 @@ export class SQLiteMemoryStore {
     this.#ensureOpen();
     validateText(id, "ID");
     const row = this.#select.get(id);
-    return row === undefined ? undefined : parseMemory(row);
+    return row === undefined ? undefined : parseMemory(this.#decodeRow(row));
   }
 
   memoryOrigin(id: string): MemoryOrigin | undefined {
     this.#ensureOpen();
     validateText(id, "ID");
     const row = this.#database.prepare(
-      "SELECT m.id AS currentId, m.content, m.created_at AS createdAt, " +
-      "m.revision AS currentRevision, m.updated_at AS updatedAt, " +
-      "o.memory_id AS memoryId, o.job_id AS originJobId, o.revision AS originRevision, " +
-      "j.id AS jobRecordId, j.job_json AS jobJson, j.status AS jobStatus, " +
-      "j.lease_owner AS leaseOwner, j.lease_until AS leaseUntil " +
+      "SELECT " + [
+        textColumn("m.id", "currentId"), textColumn("m.content", "content"),
+        textColumn("m.created_at", "createdAt"), "m.revision AS currentRevision",
+        textColumn("m.updated_at", "updatedAt"), textColumn("o.memory_id", "memoryId"),
+        textColumn("o.job_id", "originJobId"), "o.revision AS originRevision",
+        textColumn("j.id", "jobRecordId"), textColumn("j.job_json", "jobJson"),
+        textColumn("j.status", "jobStatus"), textColumn("j.lease_owner", "leaseOwner"),
+        "j.lease_until AS leaseUntil",
+      ].join(", ") + " " +
       "FROM memories AS m " +
       "LEFT JOIN memory_origins AS o ON o.memory_id = m.id " +
       "LEFT JOIN consolidation_jobs AS j ON j.id = o.job_id " +
@@ -646,7 +680,7 @@ export class SQLiteMemoryStore {
       jobStatus,
       leaseOwner,
       leaseUntil,
-    } = fields(row, [
+    } = fields(this.#decodeRow(row), [
       "currentId",
       "content",
       "createdAt",
@@ -713,16 +747,20 @@ export class SQLiteMemoryStore {
         ORDER BY id COLLATE BINARY
         LIMIT ?
       )
-      SELECT id, content, createdAt, revision, updatedAt,
+      SELECT ${[
+        textColumn("id"), textColumn("content"), textColumn("createdAt"),
+        "revision", textColumn("updatedAt"),
+      ].join(", ")},
         ${matchedTermColumns}
       FROM examined
-      ORDER BY id COLLATE BINARY
+      ORDER BY examined.id COLLATE BINARY
     `);
     const parameters: (string | number)[] = [];
     if (search.after !== undefined) parameters.push(search.after);
     parameters.push(limit, ...search.terms);
 
-    return statement.all(...parameters).map((row) => {
+    return statement.all(...parameters).map((rawRow) => {
+      const row = this.#decodeRow(rawRow);
       const memory = parseMemory({
         id: row["id"],
         content: row["content"],
@@ -751,10 +789,10 @@ export class SQLiteMemoryStore {
     const serialized = JSON.stringify(record);
     this.#transaction(() => {
       const row = this.#database.prepare(
-        "SELECT id, job_json, status, lease_owner, lease_until FROM consolidation_jobs WHERE id = ?",
+        `SELECT ${jobColumns} FROM consolidation_jobs WHERE id = ?`,
       ).get(record.id);
       if (row !== undefined) {
-        const existing = parsePersistedJobRow(row);
+        const existing = parsePersistedJobRow(this.#decodeRow(row));
         if (JSON.stringify(existing.job) !== serialized) {
           throw new ConsolidationConflictError(record.id, "already exists with a different payload");
         }
@@ -769,10 +807,10 @@ export class SQLiteMemoryStore {
   listConsolidationJobs(): readonly ConsolidationJob[] {
     this.#ensureOpen();
     const rows = this.#database.prepare(
-      "SELECT id, job_json, status, lease_owner, lease_until FROM consolidation_jobs " +
+      `SELECT ${jobColumns} FROM consolidation_jobs ` +
       "WHERE status = 'pending' ORDER BY rowid",
     ).all();
-    return rows.map(parsePersistedJobRow).map((record) => record.job);
+    return rows.map((row) => parsePersistedJobRow(this.#decodeRow(row)).job);
   }
 
   claimConsolidation(id: string, owner: string, now: number, leaseMs: number): boolean {
@@ -790,10 +828,10 @@ export class SQLiteMemoryStore {
 
     return this.#transaction(() => {
       const row = this.#database.prepare(
-        "SELECT id, job_json, status, lease_owner, lease_until FROM consolidation_jobs WHERE id = ?",
+        `SELECT ${jobColumns} FROM consolidation_jobs WHERE id = ?`,
       ).get(id);
       if (row === undefined) return false;
-      const current = parsePersistedJobRow(row);
+      const current = parsePersistedJobRow(this.#decodeRow(row));
       if (current.status !== "pending") return false;
       if (current.leaseUntil !== null && current.leaseUntil > now) return false;
       const earlierPending = this.#database.prepare(
@@ -816,10 +854,10 @@ export class SQLiteMemoryStore {
     validateText(owner, "consolidation lease owner");
     this.#transaction(() => {
       const row = this.#database.prepare(
-        "SELECT id, job_json, status, lease_owner, lease_until FROM consolidation_jobs WHERE id = ?",
+        `SELECT ${jobColumns} FROM consolidation_jobs WHERE id = ?`,
       ).get(id);
       if (row === undefined) return;
-      const current = parsePersistedJobRow(row);
+      const current = parsePersistedJobRow(this.#decodeRow(row));
       if (current.status === "pending" && current.leaseOwner === owner) {
         this.#database.prepare(
           "UPDATE consolidation_jobs SET lease_owner = NULL, lease_until = NULL WHERE id = ? AND status = 'pending'",
@@ -832,13 +870,13 @@ export class SQLiteMemoryStore {
     this.#ensureOpen();
     const requested = parseSourceKeys(keys, "processed source keys", true);
     const select = this.#database.prepare(
-      "SELECT source_key, job_id, processed_at FROM consolidation_progress WHERE source_key = ?",
+      `SELECT ${progressColumns} FROM consolidation_progress WHERE source_key = ?`,
     );
     const result: string[] = [];
     for (const key of requested) {
       const row = select.get(key);
       if (row !== undefined) {
-        const processed = parseProgressRow(row);
+        const processed = parseProgressRow(this.#decodeRow(row));
         result.push(processed.sourceKey);
       }
     }
@@ -850,12 +888,12 @@ export class SQLiteMemoryStore {
     const request = parseConsolidationCommit(commit);
     return this.#transaction(() => {
       const row = this.#database.prepare(
-        "SELECT id, job_json, status, lease_owner, lease_until FROM consolidation_jobs WHERE id = ?",
+        `SELECT ${jobColumns} FROM consolidation_jobs WHERE id = ?`,
       ).get(request.jobId);
       if (row === undefined) {
         throw new ConsolidationConflictError(request.jobId, "does not exist");
       }
-      const current = parsePersistedJobRow(row);
+      const current = parsePersistedJobRow(this.#decodeRow(row));
       if (current.status === "complete") return false;
       if (
         current.leaseOwner !== request.owner ||
@@ -866,12 +904,12 @@ export class SQLiteMemoryStore {
       }
 
       const selectProgress = this.#database.prepare(
-        "SELECT source_key, job_id, processed_at FROM consolidation_progress WHERE source_key = ?",
+        `SELECT ${progressColumns} FROM consolidation_progress WHERE source_key = ?`,
       );
       const processed = new Set<string>();
       for (const key of current.job.sourceKeys) {
         const processedRow = selectProgress.get(key);
-        if (processedRow !== undefined) processed.add(parseProgressRow(processedRow).sourceKey);
+        if (processedRow !== undefined) processed.add(parseProgressRow(this.#decodeRow(processedRow)).sourceKey);
       }
       const remaining = current.job.sourceKeys.filter((key) => !processed.has(key));
       const requestedSources = request.sourceKeys ?? remaining;
@@ -994,13 +1032,20 @@ export class SQLiteMemoryStore {
   observedSessions(): readonly SessionObservation[] {
     this.#ensureOpen();
     return this.#database.prepare(
-      "SELECT session_id, session_file, cwd, leaf_id, owner_pid, captured " +
-      "FROM session_observations WHERE captured = 0 ORDER BY session_id COLLATE BINARY",
-    ).all().map((row) => parseStoredSessionObservation(row).observation);
+      `SELECT ${observationColumns} FROM session_observations ` +
+      "WHERE captured = 0 ORDER BY session_observations.session_id COLLATE BINARY",
+    ).all().map((row) => parseStoredSessionObservation(this.#decodeRow(row)).observation);
   }
 
   close(): void {
     if (this.#database.isOpen) this.#database.close();
+  }
+
+  #decodeRow(row: Record<string, unknown>): Record<string, unknown> {
+    for (const [key, value] of Object.entries(row)) {
+      if (value instanceof Uint8Array) row[key] = this.#textDecoder.decode(value);
+    }
+    return row;
   }
 
   #initializeSchema(): void {
@@ -1009,8 +1054,8 @@ export class SQLiteMemoryStore {
       throw new Error("Unsupported memory database schema version: " + String(version) + ".");
     }
     const objects = this.#database.prepare(
-      "SELECT name, type, sql FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*'",
-    ).all();
+      `SELECT ${schemaColumns} FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*'`,
+    ).all().map((row) => this.#decodeRow(row));
     if (version === 0 && objects.length === 0) {
       this.#database.exec(currentSchema);
       this.#createAuxiliaryTables();
@@ -1032,8 +1077,8 @@ export class SQLiteMemoryStore {
         ],
       );
       for (const row of this.#database.prepare(
-        "SELECT id, content, created_at AS createdAt FROM memories",
-      ).iterate()) parseInput(row);
+        `SELECT ${textColumn("id")}, ${textColumn("content")}, ${textColumn("created_at", "createdAt")} FROM memories`,
+      ).iterate()) parseInput(this.#decodeRow(row));
       this.#database.exec("ALTER TABLE memories RENAME TO memories_legacy");
       this.#database.exec(currentSchema);
       this.#database.exec(
@@ -1078,8 +1123,8 @@ export class SQLiteMemoryStore {
 
   #validateLatestSchema(): void {
     const objects = this.#database.prepare(
-      "SELECT name, type, sql FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*'",
-    ).all();
+      `SELECT ${schemaColumns} FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*'`,
+    ).all().map((row) => this.#decodeRow(row));
     const schemas = new Map<string, { readonly sql: string; readonly columns: readonly SchemaColumn[] }>([
       ["memories", {
         sql: currentSchema,
@@ -1154,7 +1199,9 @@ export class SQLiteMemoryStore {
     const table = this.#database.prepare(
       "SELECT strict, wr FROM pragma_table_list WHERE schema = 'main' AND name = ?",
     ).get(name);
-    const columns = this.#database.prepare("PRAGMA table_xinfo(" + name + ")").all();
+    const columns = this.#database.prepare(
+      `SELECT ${textColumn("name")}, ${textColumn("type")}, "notnull", pk, hidden FROM pragma_table_xinfo(?)`,
+    ).all(name).map((row) => this.#decodeRow(row));
     if (
       table?.["strict"] !== 1 || table["wr"] !== 0 || columns.length !== expectedColumns.length ||
       columns.some((column, index) => {
@@ -1171,38 +1218,37 @@ export class SQLiteMemoryStore {
 
   #validateMemoryRows(): void {
     for (const row of this.#database.prepare(
-      "SELECT id, content, created_at AS createdAt, revision, updated_at AS updatedAt FROM memories",
-    ).iterate()) parseMemory(row);
+      `SELECT ${memoryColumns} FROM memories`,
+    ).iterate()) parseMemory(this.#decodeRow(row));
   }
 
   #validateAllRows(): void {
     this.#validateMemoryRows();
     const jobs = this.#database.prepare(
-      "SELECT id, job_json, status, lease_owner, lease_until FROM consolidation_jobs",
-    ).all().map(parsePersistedJobRow);
+      `SELECT ${jobColumns} FROM consolidation_jobs`,
+    ).all().map((row) => parsePersistedJobRow(this.#decodeRow(row)));
     const jobsById = new Map(jobs.map((record) => [record.job.id, record]));
     for (const row of this.#database.prepare(
-      "SELECT source_key, job_id, processed_at FROM consolidation_progress",
+      `SELECT ${progressColumns} FROM consolidation_progress`,
     ).iterate()) {
-      const progress = parseProgressRow(row);
+      const progress = parseProgressRow(this.#decodeRow(row));
       const sourceJob = jobsById.get(progress.jobId);
       if (sourceJob === undefined || !sourceJob.job.sourceKeys.includes(progress.sourceKey)) {
         throw new TypeError("Stored source progress does not match its consolidation job.");
       }
     }
     for (const row of this.#database.prepare(
-      "SELECT memory_id AS memoryId, job_id AS jobId, revision FROM memory_origins",
+      `SELECT ${originColumns} FROM memory_origins`,
     ).iterate()) {
-      const origin = parseMemoryOriginRow(row);
+      const origin = parseMemoryOriginRow(this.#decodeRow(row));
       const sourceJob = jobsById.get(origin.jobId);
       if (sourceJob === undefined || sourceJob.status !== "complete") {
         throw new TypeError("Stored memory origin does not match a completed consolidation job.");
       }
     }
     for (const row of this.#database.prepare(
-      "SELECT session_id, session_file, cwd, leaf_id, owner_pid, captured " +
-      "FROM session_observations",
-    ).iterate()) parseStoredSessionObservation(row);
+      `SELECT ${observationColumns} FROM session_observations`,
+    ).iterate()) parseStoredSessionObservation(this.#decodeRow(row));
   }
 
   #transaction<T>(operation: () => T): T {
