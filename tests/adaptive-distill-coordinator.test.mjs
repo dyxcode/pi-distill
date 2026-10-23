@@ -7,7 +7,7 @@ import { buildSessionProjection } from '@earendil-works/pi-coding-agent';
 import { fauxAssistantMessage, fauxToolCall } from '@earendil-works/pi-ai';
 import { SQLiteMemoryStore } from '../src/memory-store.ts';
 import { ConsolidationCoordinator } from '../src/consolidation.ts';
-import { consolidateWithModel } from '../src/consolidation-model.ts';
+import { consolidateWithModel, fitsConsolidationRequest } from '../src/consolidation-model.ts';
 
 async function fixture(t) {
   const root = await mkdtemp(join(tmpdir(), 'pi-distill-adaptive-coordinator-'));
@@ -70,6 +70,8 @@ test('smaller-model takeover preserves committed prefixes across failure and res
       content: `Cedar prefix ${committed.length}`, sourceKeys: [evidence[0].key] }] }));
   };
   const runModel = async (batch, context, store, signal, options) => {
+    assert.ok(fitsConsolidationRequest(batch,context.model,{reserveRetrieval:true}) ||
+      (batch.evidence.length===1 && batch.context.length===0 && fitsConsolidationRequest(batch,context.model)));
     const changes = await consolidateWithModel(batch, context, store, signal, options);
     committed.push({ keys: [...batch.sourceKeys], sourceTime: batch.sourceTime,
       branchAnchor: batch.branchAnchor, id: changes.creates[0].id });
@@ -110,6 +112,21 @@ test('smaller-model takeover preserves committed prefixes across failure and res
     assert.equal(store.listDistillTriggers({ limit: 20 }).items[0].status, 'complete');
     for (const group of committed) assert.deepEqual(store.memoryOrigin(group.id).sourceKeys, group.keys);
   });
+});
+
+test('soft headroom falls back to one hard-fitting source part without optional context', async t => {
+ const f=await fixture(t);const [job]=await prepare(f);
+ const batches=[];
+ const ctx=f.context(9600);
+ const worker=f.worker({runModel:async batch=>{
+  batches.push(batch);return {creates:[],updates:[],deletes:[]};
+ }});
+ await worker.start(ctx);await worker.whenIdle();
+ assert.equal(batches.length,1);
+ assert.equal(batches[0].evidence.length,1);assert.equal(batches[0].context.length,0);
+ assert.equal(fitsConsolidationRequest(batches[0],ctx.model,{reserveRetrieval:true}),false);
+ assert.equal(fitsConsolidationRequest(batches[0],ctx.model),true);
+ assert.deepEqual(f.inspect(store=>store.processedSources(job.sourceKeys)),job.sourceKeys.slice(0,1));
 });
 
 test('new durable job grouping is independent of the preparing model capacity', { timeout: 15000 }, async t => {
@@ -159,14 +176,18 @@ test('a later tool-result overflow preserves earlier prefixes and applies the mo
       first = false;
       return fauxAssistantMessage('{"operations":[]}');
     }
-    return fauxAssistantMessage(fauxToolCall('memory_read', { id: 'large-retrieval', expectedRevision: 1 }), { stopReason: 'toolUse' });
+    const last=request.messages.at(-1);
+    const page=last.role==='toolResult'?JSON.parse(last.content[0].text):{};
+    return fauxAssistantMessage(fauxToolCall('memory_read', { id: 'large-retrieval', expectedRevision: 1,
+      ...(page.nextCursor?{cursor:page.nextCursor}:{}) }), { stopReason: 'toolUse' });
   };
   const c = f.worker({});
   await c.start(ctx); await c.whenIdle();
   const saved = f.inspect(store => store.processedSources(job.sourceKeys));
   assert.ok(saved.length > 0 && saved.length < job.sourceKeys.length);
   await c.start(ctx); await c.whenIdle();
-  assert.equal(calls, 2, 'the tool result exceeds the second portion budget before another provider request');
+  assert.ok(calls >= 3, 'a bounded partial read fits, but the whole memory cannot fit the retained history');
+  const callsBeforeRestart = calls;
   f.inspect(store => {
     assert.deepEqual(store.processedSources(job.sourceKeys), saved);
     assert.equal(store.readDistillFailure('job', job.id)?.reason, 'model_budget');
@@ -175,7 +196,7 @@ test('a later tool-result overflow preserves earlier prefixes and applies the mo
   await c.shutdown(ctx, 'reload');
   const resumed = f.worker({});
   await resumed.start(ctx); await resumed.whenIdle();
-  assert.equal(calls, 2, 'a new worker cannot evade cooldown by subdividing remaining evidence again');
+  assert.equal(calls, callsBeforeRestart, 'a new worker cannot evade cooldown by subdividing remaining evidence again');
 });
 
 test('each prefix uses its supporting context edits without inheriting another prefix source time', async t => {

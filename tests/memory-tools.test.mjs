@@ -19,6 +19,41 @@ async function fixture(t, records = []) {
 const data = result => { assert.deepEqual(JSON.parse(result.content[0].text),result.details); return result.details; };
 const bytes = result => Buffer.byteLength(JSON.stringify(result));
 
+test('caller-constrained search pages preserve every candidate and exact read chunks', async t => {
+ const content = ('needle 条件🧠\u0000\\\n"').repeat(80);
+ const records = Array.from({length:8},(_,i)=>[String(i),content]);
+ const {tools}=await fixture(t,records);
+ const fitsResult = result => Buffer.byteLength(JSON.stringify({role:'toolResult',content:result.content,timestamp:1234567890123})) <= 1000;
+ const ids=[];let cursor;
+ do {
+  tools.reset();
+  const result=await tools.search({terms:['needle'],...(cursor?{cursor}:{})},undefined,{fitsResult});
+  assert.equal(result.details.status,'ok');assert.ok(fitsResult(result));
+  ids.push(...result.details.candidates.map(item=>item.id));cursor=result.details.nextCursor;
+  assert.equal(result.details.hasMore,Boolean(cursor));
+ } while(cursor);
+ assert.deepEqual(ids,records.map(([id])=>id));
+ const chunks=[];
+ do {
+  tools.reset();
+  const result=await tools.read({id:'0',expectedRevision:1,...(cursor?{cursor}:{})},undefined,{fitsResult});
+  assert.equal(result.details.status,'ok');assert.ok(fitsResult(result));
+  assert.ok(result.details.content.length>0);chunks.push(result.details.content);cursor=result.details.nextCursor;
+ } while(cursor);
+ assert.equal(chunks.join(''),content);
+});
+
+test('an unfit caller page acknowledges no candidates and does not fabricate completion', async t => {
+ const {tools}=await fixture(t,[['a','needle'],['b','needle']]);
+ const refused=await tools.search({terms:['needle']},undefined,{fitsResult:()=>false});
+ assert.notEqual(refused.details.status,'ok');assert.equal(refused.details.incomplete,true);
+ const accepted=await tools.search({terms:['needle'],limit:1});
+ assert.equal(accepted.details.uniqueCandidates,1);
+ assert.deepEqual(accepted.details.candidates.map(item=>item.id),['a']);
+ const read=await tools.read({id:'a',expectedRevision:1},undefined,{fitsResult:()=>false});
+ assert.notEqual(read.details.status,'ok');assert.equal(read.details.incomplete,true);
+});
+
 test('search uses literal alternatives, returns exact original previews and leaves records unchanged', async t => {
  const {tools,writer} = await fixture(t,[['a','本地单元测试 TESTS'],['b','Other project: unit test stays here.'],['c','Nothing relevant']]);
  const before=writer.get('a');

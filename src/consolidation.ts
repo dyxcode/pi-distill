@@ -726,15 +726,19 @@ export class ConsolidationCoordinator {
       let batch: SourceBatch | undefined;
       for (let count = 1; count <= evidence.length; count++) {
         const candidate = makeBatch(evidence.slice(0, count));
-        if (!fitsConsolidationRequest(candidate, context.model)) break;
+        if (!fitsConsolidationRequest(candidate, context.model, { reserveRetrieval: true })) break;
         batch = candidate;
+      }
+      if (!batch) {
+        const first = makeBatch(evidence.slice(0, 1));
+        if (fitsConsolidationRequest(first, context.model)) batch = first;
       }
       if (!batch) throw new DistillFailure("model_unavailable", "The selected model cannot fit one source part and the required consolidation request.");
       for (const part of currentParts.slice(0, Math.max(0, firstIndex)).reverse()) {
         const interpretation = [part, ...batch.context];
         if (Buffer.byteLength(JSON.stringify(interpretation)) > CONTEXT_BYTES) break;
         const candidate: SourceBatch = { ...batch, context: interpretation };
-        if (!fitsConsolidationRequest(candidate, context.model)) break;
+        if (!fitsConsolidationRequest(candidate, context.model, { reserveRetrieval: true })) break;
         batch = candidate;
       }
       await this.#waitUntilIdle(signal);

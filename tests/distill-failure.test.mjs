@@ -161,18 +161,20 @@ test('model output and tool-call caps are model_budget', async () => {
 test('input that grows beyond the request allowance after a retrieval call is model_budget', async () => {
   const store = {
     get: id => ({ id, revision: 1, content: 'm'.repeat(8_192), createdAt: '2026-10-23T00:00:00.000Z', updatedAt: '2026-10-23T00:00:00.000Z' }),
+    memoryOrigin: () => undefined,
   };
   let calls = 0;
   const registry = {
-    async complete() {
+    async complete(_model, request) {
       calls += 1;
-      if (calls === 1) {
-        return {
-          ...response('toolUse', ''),
-          content: [{ type: 'toolCall', id: 'read-large', name: 'memory_read', arguments: { id: 'large', expectedRevision: 1 } }],
-        };
-      }
-      return response('stop', '{"operations":[]}');
+      const last=request.messages.at(-1);
+      const page=last.role==='toolResult'?JSON.parse(last.content[0].text):{};
+      assert.notEqual(page.hasMore,false,'the whole memory cannot fit this retained request');
+      return {
+        ...response('toolUse', ''),
+        content: [{ type: 'toolCall', id: `read-large-${calls}`, name: 'memory_read',
+          arguments: { id: 'large', expectedRevision: 1,...(page.nextCursor?{cursor:page.nextCursor}:{}) } }],
+      };
     },
   };
   const batch = sourceBatch([{ key: 'source-1', entryId: 'entry-1', role: 'user', text: 'x'.repeat(57_000) }]);
@@ -180,7 +182,7 @@ test('input that grows beyond the request allowance after a retrieval call is mo
     consolidateWithModel(batch, modelContext(registry), store, new AbortController().signal),
     failureReason('model_budget'),
   );
-  assert.equal(calls, 1, 'the accumulated request should be rejected before another provider call');
+  assert.ok(calls>=2,'bounded partial reads fit before the retained request exhausts capacity');
 });
 
 test('provider stops and retrieval failures retain transient, conflict, or invalid-input causes', async () => {

@@ -4,7 +4,7 @@ import { mkdir } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 
 const [mode, root, sourceFile] = process.argv.slice(2);
-assert.ok(['prepare', 'partial', 'resume-and-recall'].includes(mode));
+assert.ok(['prepare', 'partial', 'resume-and-recall', 'retrieval-budget', 'retrieval-finish'].includes(mode));
 assert.ok(root);
 
 const agentDir = join(root, 'agent');
@@ -28,6 +28,7 @@ const models = [
   { id: 'synthetic-large', contextWindow: 128_000, maxTokens: 4_096 },
   { id: 'synthetic-small', contextWindow: 10_000, maxTokens: 1_024 },
   { id: 'synthetic-small-wake', contextWindow: 10_000, maxTokens: 1_024 },
+  { id: 'synthetic-retrieval', contextWindow: 12_000, maxTokens: 1_024 },
 ];
 const faux = ai.fauxProvider({ tokensPerSecond: 100_000, models });
 const largeModel = faux.getModel('synthetic-large');
@@ -55,6 +56,12 @@ let rememberedMemory;
 let runtime;
 let contenderRuntime;
 let activeModelRuntime;
+let holdRetrieval = true;
+let heldRetrievalSignal;
+let retrievalHeld;
+const retrievalReady = new Promise(resolve => { retrievalHeld = resolve; });
+let retrievalPages = 0;
+const retrievalContent = 'For fictional Cedar, fixture policy 000: retain 21 days; 30 during incidents.';
 
 function delay(milliseconds) {
   return new Promise(resolvePromise => setTimeout(resolvePromise, milliseconds));
@@ -137,6 +144,29 @@ function latestUserText(context) {
 
 function providerResponse(context, options, _state, model) {
   const payload = consolidationPayload(context);
+  if (payload && (mode === 'retrieval-budget' || mode === 'retrieval-finish')) {
+    const results = context.messages.filter(message => message.role === 'toolResult');
+    const last = results.at(-1);
+    const page = last ? JSON.parse(textOf(last.content)) : undefined;
+    if (!last) return ai.fauxAssistantMessage(ai.fauxToolCall('memory_search', { terms: ['fixture policy 000'] }), { stopReason: 'toolUse' });
+    if (last.toolName === 'memory_search') {
+      assert.equal(page.status, 'ok');
+      assert.equal(page.hasMore, true);
+      assert.ok(page.nextCursor);
+      assert.equal(page.candidates[0].id, '00-target');
+      retrievalPages++;
+      return ai.fauxAssistantMessage(ai.fauxToolCall('memory_read', { id: '00-target', expectedRevision: 1 }), { stopReason: 'toolUse' });
+    }
+    assert.equal(page.status, 'ok');
+    assert.equal(page.hasMore, false);
+    assert.ok(page.content.includes('30 during incidents'));
+    if (holdRetrieval) return abortableHold(options?.signal, signal => {
+      heldRetrievalSignal = signal;
+      retrievalHeld();
+    });
+    return ai.fauxAssistantMessage(JSON.stringify({ operations: [{ action: 'update', id: '00-target',
+      expectedRevision: 1, content: retrievalContent, sourceKeys: [payload.newEvidence[0].key] }] }));
+  }
   if (payload) {
     const keys = payload.newEvidence.map(part => part.key);
     const identity = payload.newEvidence.map(partSignature).join('|');
@@ -629,6 +659,72 @@ async function main() {
     refreshOnCreate: false,
   });
   activeModelRuntime.registerNativeProvider(faux.provider);
+
+  if (mode === 'retrieval-budget') {
+    await mkdir(join(agentDir, 'distill'), { recursive: true });
+    withStore(store => {
+      store.save({ id: '00-target', content: 'For fictional Cedar, fixture policy 000: retain 14 days; 30 during incidents.', createdAt: '2026-10-23T00:00:00.000Z' });
+      for (let index = 0; index < 30; index++) store.save({ id: `z${index}`, content: `fixture policy 000: unrelated ${'background '.repeat(80)}`, createdAt: '2026-10-23T00:00:00.000Z' });
+    });
+    runtime = await createRuntime(pi.SessionManager.create(cwd, sessionDir), largeModel);
+    await runtime.session.prompt('For fictional Cedar, change fixture policy 000 to retain 21 days. Keep the 30-day incident exception.');
+    const path = runtime.session.sessionManager.getSessionFile();
+    assert.ok(path && existsSync(path));
+    await runtime.dispose();
+    const retrievalModel = faux.getModel('synthetic-retrieval');
+    assert.ok(retrievalModel);
+    runtime = await createRuntime(pi.SessionManager.create(cwd, sessionDir), retrievalModel);
+    await awaitStarted(retrievalReady, 'the bounded retrieval update');
+    const job = withStore(store => findJobByFile(store, path));
+    assert.ok(job);
+    assert.deepEqual(withStore(store => store.processedSources(job.sourceKeys)), []);
+    assert.equal(withStore(store => store.get('00-target').revision), 1);
+    assert.ok(existsSync(path), 'an uncommitted update must retain its source');
+    await runtime.dispose();
+    assert.ok(heldRetrievalSignal.aborted);
+    console.log(JSON.stringify({ passed: true, retrievalPages, sourceFile: path, sourceKeys: job.sourceKeys }));
+    runtime = undefined;
+    return;
+  }
+  if (mode === 'retrieval-finish') {
+    const path = sourceFile;
+    assert.ok(path && existsSync(path));
+    const job = withStore(store => findJobByFile(store, path));
+    assert.ok(job);
+    assert.deepEqual(withStore(store => store.processedSources(job.sourceKeys)), []);
+    holdRetrieval = false;
+    const retrievalModel = faux.getModel('synthetic-retrieval');
+    assert.ok(retrievalModel);
+    runtime = await createRuntime(pi.SessionManager.create(cwd, sessionDir), retrievalModel);
+    const memory = await waitUntil(() => withStore(store => {
+      const current = store.get('00-target');
+      return current.revision === 2 ? current : undefined;
+    }), 'the corrected memory after restart');
+    assert.equal(memory.content, retrievalContent);
+    assert.deepEqual(withStore(store => store.processedSources(job.sourceKeys)), job.sourceKeys);
+    await runtime.session.prompt('Synthetic fixture wake: please reply with a brief acknowledgement.');
+    try {
+      await waitUntil(() => !existsSync(path), 'cleanup after the committed correction');
+    } catch (error) {
+      const diagnostics = withStore(store => ({ tasks: store.listCleanTasks({ limit: 20 }).items,
+        status: store.readConsolidationStatus(job.sourceKeys, [path]) }));
+      throw new Error(`${error.message} ${JSON.stringify(diagnostics)}`);
+    }
+    rememberedMemory = memory;
+    const recallTools = [];
+    let recalled = false;
+    runtime.session.subscribe(event => {
+      if (event.type === 'tool_execution_end') recallTools.push(event.toolName);
+      if (event.type === 'message_end' && event.message.role === 'assistant' && textOf(event.message.content) === retrievalContent) recalled = true;
+    });
+    await runtime.session.prompt('Please retrieve the first Cedar fixture policy.');
+    assert.deepEqual(recallTools, ['memory_search', 'memory_read']);
+    assert.ok(recalled);
+    assert.ok(withStore(store => store.memoryOrigin(memory.id)));
+    assert.equal(retrievalPages, 1, 'restart must replay the uncommitted retrieval exactly once');
+    console.log(JSON.stringify({ passed: true, retrievalPages, recalled, sourceDeleted: !existsSync(path) }));
+    return;
+  }
 
   if (mode === 'prepare') {
     const result = await prepareLargeRange();

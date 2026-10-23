@@ -33,6 +33,16 @@ function runChild(mode, root, sourceFile) {
   return report;
 }
 
+test('Pi SDK restarts a bounded search/read correction and recalls it after source cleanup', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-distill-retrieval-pi-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const interrupted = runChild('retrieval-budget', root);
+  const result = runChild('retrieval-finish', root, interrupted.sourceFile);
+  assert.equal(interrupted.retrievalPages + result.retrievalPages, 2);
+  assert.equal(result.recalled, true);
+  assert.equal(result.sourceDeleted, true);
+});
+
 test('Pi SDK resumes a large prepared range through bounded small-model prefixes and cleanup', async t => {
   const root = await mkdtemp(join(tmpdir(), 'pi-distill-adaptive-pi-'));
   t.after(() => rm(root, { recursive: true, force: true }));

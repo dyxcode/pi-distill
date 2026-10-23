@@ -12,6 +12,11 @@ export interface MemoryToolResult {
   isError?: boolean;
 }
 
+/** Internal caller constraint; refusal control results may still need caller-side handling. */
+export interface MemoryToolOptions {
+  readonly fitsResult?: (result: MemoryToolResult) => boolean;
+}
+
 type Body = Record<string, unknown>;
 type Match = "any" | "all";
 interface SearchRequest { terms: string[]; match: Match; limit: number; cursor?: string }
@@ -144,15 +149,15 @@ export class MemoryTools {
     this.#store = undefined;
   }
 
-  search(input: unknown, signal?: AbortSignal): Promise<MemoryToolResult> {
-    return this.#enqueue(async (cap, epoch) => this.#search(searchRequest(input), cap, epoch, signal), signal);
+  search(input: unknown, signal?: AbortSignal, options: MemoryToolOptions = {}): Promise<MemoryToolResult> {
+    return this.#enqueue(async (cap, epoch) => this.#search(searchRequest(input), cap, epoch, signal, options), signal, options);
   }
 
-  read(input: unknown, signal?: AbortSignal): Promise<MemoryToolResult> {
-    return this.#enqueue(async cap => this.#read(readRequest(input), cap), signal);
+  read(input: unknown, signal?: AbortSignal, options: MemoryToolOptions = {}): Promise<MemoryToolResult> {
+    return this.#enqueue(async cap => this.#read(readRequest(input), cap, options), signal, options);
   }
 
-  #enqueue(operation: (cap: number, epoch: number) => Promise<Body>, signal?: AbortSignal): Promise<MemoryToolResult> {
+  #enqueue(operation: (cap: number, epoch: number) => Promise<Body>, signal: AbortSignal | undefined, options: MemoryToolOptions): Promise<MemoryToolResult> {
     const epoch = this.#epoch;
     const pending = this.#queue.then(async () => {
       if (epoch !== this.#epoch) return envelope({ status: "cancelled", incomplete: true });
@@ -175,6 +180,18 @@ export class MemoryTools {
       if (epoch !== this.#epoch) return envelope({ status: "cancelled", incomplete: true });
       const result = this.#response(body, error);
       if (size(result) > cap) return this.#exhausted();
+      if (options.fitsResult && !options.fitsResult(result)) {
+        const refusal = envelope({ status: "result_too_large", incomplete: true }, true);
+        this.#bytes += size(refusal);
+        return refusal;
+      }
+      if (body["status"] === "ok" && Array.isArray(body["candidates"])) {
+        const candidates: readonly unknown[] = body["candidates"];
+        for (const item of candidates) {
+          if (typeof item === "object" && item !== null && "id" in item && "revision" in item &&
+            typeof item.id === "string" && typeof item.revision === "number") this.#seen.set(item.id, item.revision);
+        }
+      }
       this.#bytes += size(result);
       return result;
     });
@@ -207,8 +224,9 @@ export class MemoryTools {
     return result;
   }
 
-  #fits(body: Body, cap: number): boolean {
-    return size(this.#response(body)) <= cap;
+  #fits(body: Body, cap: number, options: MemoryToolOptions): boolean {
+    const result = this.#response(body);
+    return size(result) <= cap && (options.fitsResult?.(result) ?? true);
   }
 
   #tooLarge(cap: number): never {
@@ -242,7 +260,7 @@ export class MemoryTools {
     return JSON.stringify({ terms: [...request.terms].sort(), match: request.match });
   }
 
-  async #search(request: SearchRequest, cap: number, epoch: number, signal?: AbortSignal): Promise<Body> {
+  async #search(request: SearchRequest, cap: number, epoch: number, signal: AbortSignal | undefined, options: MemoryToolOptions): Promise<Body> {
     const query = this.#query(request);
     let after: string | undefined;
     if (request.cursor !== undefined) {
@@ -263,8 +281,7 @@ export class MemoryTools {
     };
     const finish = (hasMore: boolean, stopReason: string): Body => {
       const body = result(hasMore, stopReason);
-      if (!this.#fits(body, cap)) this.#tooLarge(cap);
-      for (const item of candidates) this.#seen.set(item.id, item.revision);
+      if (!this.#fits(body, cap, options)) this.#tooLarge(cap);
       return body;
     };
     while (true) {
@@ -279,16 +296,16 @@ export class MemoryTools {
         candidates.push(candidate);
         after = row.memory.id;
         // Include a continuation even on the tentative final row, so returning a page never loses it.
-        if (!this.#fits(result(true, "output_limit"), cap)) {
+        if (!this.#fits(result(true, "output_limit"), cap, options)) {
           if (candidates.length > 1) {
             candidates.pop(); after = previous;
             return finish(true, "output_limit");
           }
           for (const width of [256, 64, 16, 0]) {
             candidate.preview = preview(row.memory, position, width);
-            if (this.#fits(result(true, "output_limit"), cap)) break;
+            if (this.#fits(result(true, "output_limit"), cap, options)) break;
           }
-          if (!this.#fits(result(true, "output_limit"), cap)) this.#tooLarge(cap);
+          if (!this.#fits(result(true, "output_limit"), cap, options)) this.#tooLarge(cap);
         }
         if (candidates.length >= request.limit) {
           const hasMore = index + 1 < batch.length || batch.length === 128;
@@ -302,7 +319,7 @@ export class MemoryTools {
     }
   }
 
-  #read(request: ReadRequest, cap: number): Body {
+  #read(request: ReadRequest, cap: number, options: MemoryToolOptions): Body {
     let offset = 0;
     if (request.cursor !== undefined) {
       const cursor = this.#decode(request.cursor, ["kind", "id", "revision", "offset"]);
@@ -331,7 +348,7 @@ export class MemoryTools {
       if (end < memory.content.length) result["nextCursor"] = this.#encode({ kind: "read", id: memory.id, revision: memory.revision, offset: end });
       return result;
     };
-    while (!this.#fits(body(), cap)) {
+    while (!this.#fits(body(), cap, options)) {
       let next = boundary(memory.content, offset + Math.floor((end - offset) / 2));
       if (next <= offset) {
         // A midpoint can split the first supplementary character; try that whole character.

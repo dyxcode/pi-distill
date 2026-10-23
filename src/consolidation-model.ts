@@ -324,9 +324,20 @@ function prepareConsolidationRequest(
 export function fitsConsolidationRequest(
   batch: SourceBatch,
   model: ExtensionContext["model"],
+  options: { readonly reserveRetrieval?: boolean } = {},
 ): boolean {
   const prepared = prepareConsolidationRequest(batch, model);
-  return prepared.initialInputBytes <= prepared.contextByteLimit;
+  let limit = prepared.contextByteLimit;
+  if (options.reserveRetrieval) {
+    const scaffold: ModelRequestContext = {
+      ...prepared.request,
+      messages: [{ role: "user", timestamp: prepared.request.messages[0]?.timestamp ?? 0,
+        content: JSON.stringify({ project: batch.cwd, sourceTime: batch.sourceTime, newEvidence: [], interpretationContext: [] }) }],
+    };
+    const available = Math.max(0, limit - Buffer.byteLength(serializeRequest(scaffold)));
+    limit -= Math.min(8 * 1024, Math.floor(available / 2));
+  }
+  return prepared.initialInputBytes <= limit;
 }
 
 function parseToolCall(value: unknown): ToolCall {
@@ -398,16 +409,16 @@ function responseText(message: AssistantMessage): string {
   return message.content.filter((block) => block.type === "text").map((block) => block.text).join("");
 }
 
-function addToolResult(messages: Message[], call: ToolCall, result: MemoryToolResult): void {
+function toolResultMessage(call: ToolCall, result: MemoryToolResult, timestamp: number): Message {
   const content = result.content.map((part) => ({ type: "text" as const, text: part.text }));
-  messages.push({
+  return {
     role: "toolResult",
     toolCallId: call.id,
     toolName: call.name,
     content,
     isError: result.isError === true,
-    timestamp: Date.now(),
-  });
+    timestamp,
+  };
 }
 
 function resultBody(result: MemoryToolResult): RecordValue {
@@ -731,51 +742,77 @@ export async function consolidateWithModel(
     if (toolCallCount + calls.length > MAX_TOOL_CALLS) {
       throw new ConsolidationError("The consolidation tool-call budget was exhausted.", "model_budget");
     }
-    for (const call of calls) {
+    for (const [callIndex, call] of calls.entries()) {
       toolCallCount += 1;
       if (call.name !== "memory_search" && call.name !== "memory_read") {
         throw new ConsolidationError("The model called an unavailable consolidation tool.");
       }
 
       const argumentsValue = call.arguments;
-      let result: MemoryToolResult;
-      if (call.name === "memory_search") {
-        result = await memoryTools.search(argumentsValue, signal);
-        const body = resultBody(result);
-        retrievalFailure ??= retrievalFailureReason(body, result.isError === true);
-      } else {
+      const timestamp = Date.now();
+      const pendingCalls = calls.slice(callIndex + 1);
+      const emptyResult = resultWithDetails({ content: [], details: {} }, {});
+      const pendingMessages = pendingCalls.map(pending => toolResultMessage(pending, emptyResult, timestamp));
+      const projectedBytes = (result: MemoryToolResult): number => Buffer.byteLength(serializeRequest({
+        ...modelRequest,
+        messages: [...messages, toolResultMessage(call, result, timestamp), ...pendingMessages],
+      }));
+      const baseBytes = projectedBytes(emptyResult);
+      // Share remaining space across this turn; searches also leave room for a later read.
+      const share = Math.floor(Math.max(0, contextByteLimit - baseBytes) / (pendingCalls.length + 1));
+      const pageLimit = baseBytes + Math.floor(share / (call.name === "memory_search" ? 2 : 1));
+      let projectResult = (result: MemoryToolResult): MemoryToolResult => result;
+      let protectedMemory = false;
+      if (call.name === "memory_read") {
         const id = argumentsValue["id"];
-        const expectedRevision = argumentsValue["expectedRevision"];
-        if (typeof id !== "string" || !positiveRevision(expectedRevision)) {
+        if (typeof id !== "string" || !positiveRevision(argumentsValue["expectedRevision"])) {
           throw new ConsolidationError("The model supplied invalid memory-read arguments.");
         }
-        result = await memoryTools.read(argumentsValue, signal);
-        const body = resultBody(result);
-        retrievalFailure ??= retrievalFailureReason(body, result.isError === true);
-        if (body.status === "ok" && body.id === id && body.revision === expectedRevision) {
-          if (body.hasMore === false && !Object.hasOwn(body, "nextCursor")) {
-            try {
-              const origin = store.memoryOrigin(id);
-              const alternativeBranch = isSiblingBranch(origin, validatedBatch);
-              const newerEvidence = origin?.sourceTime !== undefined && validatedBatch.sourceTime !== undefined &&
-                origin.sourceTime > validatedBatch.sourceTime;
-              if (alternativeBranch || newerEvidence) {
-                result = resultWithDetails(result, { ...body, alternativeBranch, newerEvidence });
-              } else {
-                fullyRead.set(id, expectedRevision);
-              }
-            } catch {
-              retrievalFailure ??= "transient";
-              result = resultWithDetails(result, { status: "origin_unavailable", incomplete: true }, true);
-            }
-          } else if (body.hasMore !== true || typeof body.nextCursor !== "string") {
-            retrievalFailure ??= "transient";
-          }
-        } else if (body.status === "ok") {
+        try {
+          const origin = store.memoryOrigin(id);
+          const alternativeBranch = isSiblingBranch(origin, validatedBatch);
+          const newerEvidence = origin?.sourceTime !== undefined && validatedBatch.sourceTime !== undefined &&
+            origin.sourceTime > validatedBatch.sourceTime;
+          protectedMemory = alternativeBranch || newerEvidence;
+          if (protectedMemory) projectResult = result => {
+            const body = resultBody(result);
+            return body.status === "ok" && body.hasMore === false
+              ? resultWithDetails(result, { ...body, alternativeBranch, newerEvidence }) : result;
+          };
+        } catch {
+          protectedMemory = true;
+          projectResult = result => {
+            const body = resultBody(result);
+            return body.status === "ok" && body.hasMore === false
+              ? resultWithDetails(result, { status: "origin_unavailable", incomplete: true }, true) : result;
+          };
+        }
+      }
+      const constraint = { fitsResult: (result: MemoryToolResult): boolean =>
+        projectedBytes(projectResult(result)) <= Math.min(pageLimit, contextByteLimit) };
+      const rawResult = call.name === "memory_search"
+        ? await memoryTools.search(argumentsValue, signal, constraint)
+        : await memoryTools.read(argumentsValue, signal, constraint);
+      const result = projectResult(rawResult);
+      // Control results can report that even a minimum useful page cannot fit.
+      // They are never dispatched or acknowledged outside the actual request allowance.
+      if (projectedBytes(result) > contextByteLimit) {
+        throw new ConsolidationError("Memory retrieval cannot fit the remaining request allowance.", "model_budget");
+      }
+      const body = resultBody(result);
+      retrievalFailure ??= retrievalFailureReason(body, result.isError === true);
+      if (call.name === "memory_read" && body.status === "ok") {
+        const id = argumentsValue["id"];
+        const revision = argumentsValue["expectedRevision"];
+        if (typeof id !== "string" || !positiveRevision(revision) || body.id !== id || body.revision !== revision) {
+          retrievalFailure ??= "transient";
+        } else if (body.hasMore === false && !Object.hasOwn(body, "nextCursor")) {
+          if (!protectedMemory) fullyRead.set(id, revision);
+        } else if (body.hasMore !== true || typeof body.nextCursor !== "string") {
           retrievalFailure ??= "transient";
         }
       }
-      addToolResult(messages, call, result);
+      messages.push(toolResultMessage(call, result, timestamp));
     }
   }
   throw new ConsolidationError("The model-call budget was exhausted before a complete change set was returned.", "model_budget");
