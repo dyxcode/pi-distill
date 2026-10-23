@@ -75,7 +75,7 @@ export async function assessSessionRetention(
   const sessions: SessionRetentionAssessment[] = [];
   let initial: ReturnType<ProgressReader["readConsolidationStatus"]> | undefined;
   try {
-    initial = store.readConsolidationStatus([]);
+    initial = store.readConsolidationStatus([], paths);
   } catch {
     // File dependencies can still be inspected, but processing will be unknown.
   }
@@ -90,7 +90,7 @@ export async function assessSessionRetention(
   const sourceKeys = [...new Set([...coverage.values()].flatMap(source => source.sourceKeys))];
   let progress: ReturnType<ProgressReader["readConsolidationStatus"]> | undefined;
   try {
-    progress = store.readConsolidationStatus(sourceKeys);
+    progress = store.readConsolidationStatus(sourceKeys, paths);
   } catch {
     // No persisted progress evidence means no completion claim.
   }

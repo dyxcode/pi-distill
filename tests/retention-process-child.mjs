@@ -7,9 +7,15 @@ if (mode === 'clean') {
  const {CleanupCoordinator}=await import('../src/cleanup.ts');
  process.send({ready:true});
  await new Promise(resolve=>process.once('message',resolve));
- const cleaner=new CleanupCoordinator({openStore:()=>new SQLiteMemoryStore(path)});
- cleaner.wake();await cleaner.whenIdle();cleaner.close();store.close();
- process.send({done:true},()=>process.disconnect());
+ const cleaner=new CleanupCoordinator({openStore:()=>new SQLiteMemoryStore(path),retryDelayMs:10});
+ cleaner.wake();await cleaner.whenIdle();
+ const deadline=Date.now()+1_500;
+ while(Date.now()<deadline&&store.getDeletion(task.sessionFile)?.state!=='complete') {
+  await new Promise(resolve=>setTimeout(resolve,5));
+ }
+ const completed=store.getDeletion(task.sessionFile)?.state==='complete';
+ cleaner.close();store.close();
+ process.send({done:true,completed},()=>process.disconnect());
 } else {
 const access=store.acquireSourceAccess();
 if (!access) throw new Error('Fixture source access unavailable');

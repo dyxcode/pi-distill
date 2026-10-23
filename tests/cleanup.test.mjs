@@ -1,14 +1,15 @@
 import {fork} from 'node:child_process';
 import {once} from 'node:events';
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { link, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import { test } from 'node:test';
 import { SessionManager } from '@earendil-works/pi-coding-agent';
 import { SQLiteMemoryStore } from '../src/memory-store.ts';
 import { loadSnapshot, planSources } from '../src/consolidation-source.ts';
 import { CleanupCoordinator } from '../src/cleanup.ts';
+import { readSessionHeader } from '../src/session-header.ts';
 
 async function fixture(t) {
   const root = await mkdtemp(join(tmpdir(), 'pi-distill-clean-'));
@@ -211,6 +212,7 @@ test('an exited empty session that never created a file does not block old-sourc
  const f=await fixture(t);await f.complete();await releaseFixture(f);f.store.enqueueCleanTask(f.input());
  const unused={sessionId:'empty',sessionFile:join(f.root,'never-written.jsonl'),cwd:f.root,leafId:'model-setting',ownerPid:process.pid,ownerId:'empty',processToken:'empty'};
  f.store.saveSessionUsage({...unused,state:'active'});f.store.saveSessionUsage({...unused,state:'closing'});f.store.saveSessionUsage({...unused,state:'released'});
+ f.store.reserveSessionSource({sessionId:unused.sessionId,sessionFile:unused.sessionFile,cwd:unused.cwd});
  const c=f.worker();c.wake();await c.whenIdle();await assert.rejects(readFile(f.file),{code:'ENOENT'});
 });
 
@@ -221,6 +223,135 @@ test('an uncaptured close boundary must be recovered before its processed source
  f.store.acknowledgeObservation(source.sessionId,source.leafId);c.wake();await c.whenIdle();await assert.rejects(readFile(f.file),{code:'ENOENT'});
 });
 
+function registerHeader(store, sessionFile, sessionId, cwd) {
+ const header=readSessionHeader(sessionFile);assert.equal(header.state,'known');assert.equal(header.sessionId,sessionId);
+ store.sources.register({sessionId,sessionFile,cwd});
+ store.sources.recordHeader({sessionFile,sessionId,fileVersion:header.fileVersion,...(header.parentSession===undefined?{}:{parentSession:header.parentSession})});
+}
+
+test('a malformed managed header leaves global topology unknown and blocks cleanup',async t=>{
+ const f=await fixture(t);await f.complete();await releaseFixture(f);
+ const malformed=join(f.root,'malformed-header.jsonl');await writeFile(malformed,'not a Pi session header\n');
+ f.store.sources.register({sessionId:'malformed',sessionFile:malformed,cwd:f.root});
+ f.store.enqueueCleanTask(f.input());const c=f.worker();c.wake();await c.whenIdle();
+ assert.ok(await readFile(f.file));assert.equal(f.task().waitReason,'dependencies');
+ assert.equal(f.store.sources.isTopologyComplete(),false);
+});
+
+test('a child with a valid header but damaged body still protects its parent',async t=>{
+ const f=await fixture(t);await f.complete();await releaseFixture(f);
+ registerHeader(f.store,f.file,f.manager.getSessionId(),f.root);
+ const child=join(f.root,'fork-child.jsonl');
+ const childId='damaged-child';
+ await writeFile(child,JSON.stringify({type:'session',id:childId,timestamp:'2026-10-23T00:00:00.000Z',cwd:f.root,parentSession:'session.jsonl'})+'\n{damaged body\n');
+ f.store.sources.register({sessionId:childId,sessionFile:child,cwd:f.root});
+ f.store.enqueueCleanTask(f.input());const c=f.worker();c.wake();await c.whenIdle();
+ assert.ok(await readFile(f.file));assert.equal(f.task().waitReason,'dependencies');
+ assert.deepEqual(f.store.sources.reverseDependencies(f.file),[child]);
+});
+
+test('a manager-reserved missing fork still protects its registered parent',async t=>{
+ const f=await fixture(t);await f.complete();await releaseFixture(f);
+ registerHeader(f.store,f.file,f.manager.getSessionId(),f.root);
+ const child=join(f.root,'reserved-fork.jsonl');
+ f.store.reserveSessionSource({sessionId:'reserved-fork',sessionFile:child,cwd:f.root,parentSession:'session.jsonl'});
+ f.store.enqueueCleanTask({sessionId:'reserved-fork',sessionFile:child,leafId:null,cwd:f.root,reason:'close',intentId:'reserved-close'});
+ f.store.enqueueCleanTask(f.input());const c=f.worker();c.wake();await c.whenIdle();
+ assert.ok(await readFile(f.file));assert.equal(f.task().waitReason,'dependencies');
+ assert.equal(f.store.sources.get(child).reserved,true);
+ assert.equal(f.store.sources.isTopologyComplete(),true);
+ assert.equal(f.store.listCleanTasks({limit:10}).items.find(task=>task.sessionFile===child).waitReason,'unavailable');
+ assert.deepEqual(f.store.sources.reverseDependencies(f.file),[child]);
+});
+
+test('a fork registered after dependency discovery invalidates the cleanup scope before assessment',async t=>{
+ const f=await fixture(t);await f.complete();await releaseFixture(f);
+ registerHeader(f.store,f.file,f.manager.getSessionId(),f.root);
+ f.store.enqueueCleanTask(f.input());
+ const child=join(f.root,'late-reserved-fork.jsonl');
+ const concurrentStore=new SQLiteMemoryStore(f.path);t.after(()=>concurrentStore.close());
+ let interleaved=false;
+ const c=new CleanupCoordinator({openStore:()=>{
+  const workerStore=new SQLiteMemoryStore(f.path);
+  const registry=workerStore.sources;
+  const hasDependents=registry.hasDependents.bind(registry);
+  registry.hasDependents=path=>{
+   const result=hasDependents(path);
+   if(path===f.file&&!result&&!interleaved){
+    interleaved=true;
+    concurrentStore.reserveSessionSource({sessionId:'late-reserved-fork',sessionFile:child,cwd:f.root,parentSession:basename(f.file)});
+   }
+   return result;
+  };
+  return workerStore;
+ },retryDelayMs:100_000});
+ t.after(()=>c.close());c.wake();await c.whenIdle();
+ assert.equal(interleaved,true);
+ assert.ok(await readFile(f.file));
+ assert.equal(f.task().waitReason,'dependencies');
+ assert.equal(concurrentStore.sources.get(child).reserved,true);
+ assert.equal(concurrentStore.sources.hasDependents(f.file),true);
+});
+
+test('cleanup assesses one source chain when more than 1024 unrelated headers are registered',async t=>{
+ const f=await fixture(t);await f.complete();await releaseFixture(f);
+ registerHeader(f.store,f.file,f.manager.getSessionId(),f.root);
+ for(let i=0;i<1025;i++) {
+  const sessionId=`unrelated-${i}`;const file=join(f.root,`${sessionId}.jsonl`);
+  await writeFile(file,JSON.stringify({type:'session',id:sessionId,timestamp:'2026-10-23T00:00:00.000Z',cwd:f.root})+'\n');
+  registerHeader(f.store,file,sessionId,f.root);
+ }
+ f.store.enqueueCleanTask(f.input());const c=f.worker();c.wake();await c.whenIdle();
+ await assert.rejects(readFile(f.file),{code:'ENOENT'});
+});
+
+test('hardlink aliases share active usage protection without reciprocal dependencies',async t=>{
+ const f=await fixture(t);await f.complete();await releaseFixture(f);
+ const alias=join(f.root,'session-alias.jsonl');await link(f.file,alias);
+ const sessionId=f.manager.getSessionId();registerHeader(f.store,alias,sessionId,f.root);
+ const owner={sessionId,sessionFile:alias,cwd:f.root,leafId:f.manager.getLeafId(),ownerId:'alias-owner',processToken:'alias-owner',ownerPid:process.pid};
+ f.store.saveSessionUsage({...owner,state:'active'});
+ const aliasTask={sessionId,sessionFile:alias,leafId:owner.leafId,cwd:f.root,reason:'close',intentId:'alias-clean'};
+ f.store.enqueueCleanTask(aliasTask);
+ f.store.enqueueCleanTask(f.input());
+ assert.deepEqual(f.store.sources.reverseDependencies(f.file),[]);
+ assert.deepEqual(f.store.sources.reverseDependencies(alias),[]);
+ const c=f.worker();c.wake();await c.whenIdle();
+ assert.ok(await readFile(f.file));assert.ok(await readFile(alias));
+ const waiting=f.store.listCleanTasks({limit:10}).items;
+ assert.equal(waiting.length,2);
+ assert.ok(waiting.every(task=>task.waitReason==='usage'));
+
+ f.store.saveSessionUsage({...owner,state:'closing'});f.store.saveSessionUsage({...owner,state:'released'});
+ c.wake();await c.whenIdle();
+ await assert.rejects(readFile(f.file),{code:'ENOENT'});
+ await assert.rejects(readFile(alias),{code:'ENOENT'});
+ assert.equal(f.store.getDeletion(f.file).state,'complete');
+ assert.equal(f.store.getDeletion(alias).state,'complete');
+});
+
+test('an active usage registered through a hardlink alias protects only the target clean task',async t=>{
+ const f=await fixture(t);await f.complete();await releaseFixture(f);
+ const alias=join(f.root,'session-alias.jsonl');await link(f.file,alias);
+ const sessionId=f.manager.getSessionId();registerHeader(f.store,alias,sessionId,f.root);
+ const owner={sessionId,sessionFile:alias,cwd:f.root,leafId:f.manager.getLeafId(),ownerId:'alias-owner',processToken:'alias-owner',ownerPid:process.pid};
+ f.store.saveSessionUsage({...owner,state:'active'});
+ f.store.enqueueCleanTask(f.input());
+ assert.deepEqual(f.store.sources.reverseDependencies(f.file),[]);
+ assert.deepEqual(f.store.sources.reverseDependencies(alias),[]);
+ const c=f.worker();c.wake();await c.whenIdle();
+ assert.ok(await readFile(f.file));assert.ok(await readFile(alias));
+ assert.equal(f.task().waitReason,'usage');
+ assert.equal(f.store.listCleanTasks({limit:10}).items.length,1);
+
+ f.store.saveSessionUsage({...owner,state:'closing'});f.store.saveSessionUsage({...owner,state:'released'});
+ c.wake();await c.whenIdle();
+ await assert.rejects(readFile(f.file),{code:'ENOENT'});
+ assert.ok(await readFile(alias));
+ assert.equal(f.store.getDeletion(f.file).state,'complete');
+ assert.equal(f.store.getDeletion(alias),undefined);
+});
+
 
 test('two actual Pi-side worker processes coordinate one deletion',async t=>{
  const f=await fixture(t);await f.complete();await releaseFixture(f);const task=f.store.enqueueCleanTask(f.input());
@@ -228,6 +359,9 @@ test('two actual Pi-side worker processes coordinate one deletion',async t=>{
  await Promise.all([once(a.child,'message'),once(b.child,'message')]);
  const doneA=once(a.child,'message'),doneB=once(b.child,'message');
  a.child.send({go:true});b.child.send({go:true});
- assert.deepEqual((await doneA)[0],{done:true});assert.deepEqual((await doneB)[0],{done:true});
- await assert.rejects(readFile(f.file),{code:'ENOENT'});assert.equal(f.store.getDeletion(f.file).state,'complete');
+ assert.deepEqual((await doneA)[0],{done:true,completed:true});
+ assert.deepEqual((await doneB)[0],{done:true,completed:true});
+ const fileState=await readFile(f.file).then(()=> 'present',error=>error.code);
+ assert.equal(fileState,'ENOENT',JSON.stringify({task:f.task(),deletion:f.store.getDeletion(f.file),stderrA:a.stderr(),stderrB:b.stderr()}));
+ assert.equal(f.store.getDeletion(f.file).state,'complete');
 });
