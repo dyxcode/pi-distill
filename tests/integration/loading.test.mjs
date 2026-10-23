@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
@@ -23,6 +24,9 @@ async function fixture(t) {
   const root = await realpath(temporaryRoot);
   const cwd = join(root, "unrelated-project");
   const agentDir = join(root, "personal-agent");
+  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = agentDir;
+  t.after(() => { if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = previousAgentDir; });
   await mkdir(cwd);
   await mkdir(agentDir);
   await writeFile(join(agentDir, "settings.json"), JSON.stringify({
@@ -111,4 +115,14 @@ test("removing registration unloads the package on reload and subsequent startup
   session.dispose();
   const restarted = await f.start();
   assert.equal(packageExtensions(restarted).length, 0);
+});
+
+test("real Pi normal startup and reload create neither diagnostic history nor memory storage", async t => {
+  const f=await fixture(t);f.pi("install",repoRoot);const session=await f.start();
+  const path=join(f.agentDir,'distill','diagnostics.sqlite');
+  assert.equal(existsSync(path),false);
+  assert.equal(existsSync(join(f.agentDir,'distill','memories.sqlite')),false);
+  await session.reload();
+  assert.equal(existsSync(path),false);
+  assert.equal(existsSync(join(f.agentDir,'distill','memories.sqlite')),false);
 });

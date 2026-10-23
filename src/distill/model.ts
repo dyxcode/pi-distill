@@ -1,3 +1,4 @@
+import type { DiagnosticSink } from '../diagnostics/types.ts';
 import type {
   AssistantMessage,
   JsonObject,
@@ -91,6 +92,7 @@ class ConsolidationError extends DistillFailure {
 }
 
 export interface ConsolidationModelOptions {
+  readonly diagnostics?: DiagnosticSink;
   readonly isSiblingOrigin?: (origin: MemoryOrigin | undefined) => boolean;
   /** Waits until the owning live Pi runtime can issue a background model request. */
   readonly waitUntilIdle?: (signal: AbortSignal) => Promise<void>;
@@ -653,7 +655,7 @@ export async function consolidateWithModel(
   const prepared = prepareConsolidationRequest(batch, context.model);
   const { model, validatedBatch, evidenceKeys, request: modelRequest, contextByteLimit } = prepared;
   const messages = modelRequest.messages;
-  const memoryTools = new MemoryTools(() => store);
+  const memoryTools = new MemoryTools(() => store, options.diagnostics);
   const fullyRead = new Map<string, number>();
   let retrievalFailure: DistillFailureReason | undefined;
   let cumulativeInputBytes = 0;

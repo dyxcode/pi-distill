@@ -68,13 +68,13 @@ function hasProtectedAncestor(path: string, markerName: string): boolean {
   }
 }
 
-/** Resolve and validate Pi's personal memory database without creating it. */
-export function resolveMemoryDatabasePath(agentDir: string): string {
+/** Resolve a fixed personal database basename without creating it. */
+function resolveDatabasePath(agentDir: string, basename: string): string {
   if (typeof agentDir !== "string" || !isAbsolute(agentDir)) {
     throw new TypeError("Pi's agent directory must be an absolute path.");
   }
 
-  const databasePath = canonicalPath(join(agentDir, "distill", "memories.sqlite"));
+  const databasePath = canonicalPath(join(agentDir, "distill", basename));
   if (
     inside(repositoryRoot, databasePath) ||
     hasProtectedAncestor(databasePath, ".git") ||
@@ -94,4 +94,12 @@ export function openMemoryStore(agentDir: string): SQLiteMemoryStore {
     throw new Error("Memory storage path changed during initialization.");
   }
   return new SQLiteMemoryStore(verifiedPath);
+}
+
+export function resolveMemoryDatabasePath(agentDir: string): string {
+  return resolveDatabasePath(agentDir, "memories.sqlite");
+}
+
+export function resolveDiagnosticsDatabasePath(agentDir: string): string {
+  return resolveDatabasePath(agentDir, "diagnostics.sqlite");
 }

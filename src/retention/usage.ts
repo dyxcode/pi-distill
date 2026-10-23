@@ -1,3 +1,4 @@
+import { diagnose, type DiagnosticSink } from '../diagnostics/types.ts';
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
@@ -54,6 +55,7 @@ function sharedProcessState(): UsageProcessState {
 }
 
 interface Options {
+  readonly diagnostics?: DiagnosticSink;
   readonly namespace: string;
   readonly openStore: () => SQLiteMemoryStore;
   readonly processState?: UsageProcessState;
@@ -139,7 +141,8 @@ export class SessionUsageCoordinator {
         const manager = previous.manager.deref();
         if (manager) this.state.managers.get(manager)?.delete(previous);
       }
-    } catch { this.state.uncertain.add(this.options.namespace); }
+      diagnose(this.options.diagnostics, {operation:"usage.start",outcome:"ok"});
+    } catch (error) { diagnose(this.options.diagnostics, {operation:"usage.start",outcome:"failed",error}); this.state.uncertain.add(this.options.namespace); }
   }
 
   observe(ctx: Context): void {
@@ -155,7 +158,8 @@ export class SessionUsageCoordinator {
       }
       const leafId = ctx.sessionManager.getLeafId();
       if (leafId !== binding.record.leafId) this.save(binding, { ...binding.record, leafId });
-    } catch { this.state.uncertain.add(this.options.namespace); }
+      diagnose(this.options.diagnostics, {operation:"usage.observe",outcome:"ok"});
+    } catch (error) { diagnose(this.options.diagnostics, {operation:"usage.observe",outcome:"failed",error}); this.state.uncertain.add(this.options.namespace); }
   }
 
   shutdown(event: Shutdown, ctx: Context): void {
@@ -166,9 +170,10 @@ export class SessionUsageCoordinator {
         this.save(binding, { ...binding.record, state: "closing" });
         binding.shutdown = event;
       }
-    } catch { this.state.uncertain.add(this.options.namespace); }
+      diagnose(this.options.diagnostics, {operation:"usage.stop",outcome:"ok"});
+    } catch (error) { diagnose(this.options.diagnostics, {operation:"usage.stop",outcome:"failed",error}); this.state.uncertain.add(this.options.namespace); }
     finally {
-      try { this.store?.close(); } catch { this.state.uncertain.add(this.options.namespace); }
+      try { this.store?.close(); } catch (error) { diagnose(this.options.diagnostics, {operation:"usage.stop",outcome:"failed",error}); this.state.uncertain.add(this.options.namespace); }
       this.store = undefined;
     }
   }

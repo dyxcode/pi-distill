@@ -1,5 +1,6 @@
+import { DatabaseSync } from "node:sqlite";
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync } from "node:fs";
+import { existsSync, mkdirSync, writeFileSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 
 const [mode, temporaryRoot, agentDir, cwd, extensionPath] = process.argv.slice(2);
@@ -225,6 +226,26 @@ if (mode === "budget") {
   };
   session.dispose();
   console.log(JSON.stringify(report));
+  process.exit(0);
+}
+
+if (mode === "diagnostics") {
+  mkdirSync(join(agentDir,'distill'),{recursive:true});
+  writeFileSync(storePath,'synthetic corrupt database');
+  await startSession([
+    makeToolCall('memory_search',{terms:['private synthetic words']}),
+    piAi.fauxAssistantMessage('Continue normally.'),
+    makeToolCall('memory_search',{terms:['private synthetic words']}),
+    piAi.fauxAssistantMessage('Continue normally.'),
+  ]);
+  const {results}=captureEvents();
+  await session.prompt('Synthetic failure test.');
+  unlinkSync(storePath);
+  await session.prompt('Synthetic recovery test.');
+  const db=new DatabaseSync(join(agentDir,'distill','diagnostics.sqlite'),{readOnly:true});
+  const records=db.prepare('SELECT payload FROM events ORDER BY sequence').all().map(row=>JSON.parse(row.payload));db.close();
+  console.log(JSON.stringify({statuses:results.map(detailStatus),records}));
+  session.dispose();
   process.exit(0);
 }
 

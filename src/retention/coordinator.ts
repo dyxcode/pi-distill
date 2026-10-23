@@ -1,3 +1,4 @@
+import { diagnose, type DiagnosticSink } from '../diagnostics/types.ts';
 import { randomUUID } from "node:crypto";
 import { closeSync, fsyncSync, lstatSync, openSync, unlinkSync } from "node:fs";
 import { dirname, resolve } from "node:path";
@@ -12,6 +13,7 @@ const cleanPageSize = 4;
 const maxSessionDepth = 128;
 
 interface Options {
+  readonly diagnostics?: DiagnosticSink;
   readonly openStore: () => SQLiteMemoryStore;
   readonly hasStore?: () => boolean;
   readonly retryDelayMs?: number;
@@ -83,12 +85,14 @@ export class CleanupCoordinator {
     const result: PassOutcome = { ready: false, contended: false, progressed: false };
     this.#working = new Promise<void>(resolveWork => {
       setImmediate(() => {
-        void this.#pass(force, result).catch(error => {
+        void this.#pass(force, result).then(() => {
+          if (!this.#closed) diagnose(this.#options.diagnostics, {operation:"cleanup.pass",outcome:"ok"});
+        }).catch(error => {
           // A failed pass is not proof of completion. Transient writers back off;
           // other storage/validation failures use normal polling. Durable cursors
           // and all eligibility checks remain authoritative.
           result.ready = false; result.contended = isContention(error);
-          if (!result.contended) this.#round = undefined;
+          if (!result.contended) { diagnose(this.#options.diagnostics, {operation:"cleanup.pass",outcome:"failed",error}); this.#round = undefined; }
         }).finally(resolveWork);
       });
     }).finally(() => {
@@ -227,6 +231,8 @@ export class CleanupCoordinator {
     this.#claim = { id: task.id, owner };
     let reason: WaitReason = "unavailable";
     let building = false;
+    let failed = false;
+    let stage: "cleanup.assess" | "cleanup.delete" = "cleanup.assess";
     const access = store.acquireSourceAccess();
     if (!access) {
       store.releaseCleanTask(task.id, owner);
@@ -238,6 +244,7 @@ export class CleanupCoordinator {
       const receipt = store.getDeletion(task.sessionFile);
       if (receipt?.state === "deleting" && receipt.sessionId === task.sessionId &&
         receipt.intentId === task.intentId && missing(task.sessionFile)) {
+        stage = "cleanup.delete";
         const recoveryScope = [task.sessionFile];
         const recoveryVersion = store.retentionVersion(recoveryScope);
         if (!this.#closed && store.finishDeletion(task.id, owner, access, recoveryVersion, () => {
@@ -246,9 +253,11 @@ export class CleanupCoordinator {
           return true;
         }, recoveryScope)) {
           this.#claim = undefined;
+          diagnose(this.#options.diagnostics, {operation:stage,outcome:"ok",task:task.id,source:task.sessionId});
           return "complete";
         }
       }
+      stage = "cleanup.assess";
       // Dependency discovery and topology completeness must share a stable
       // baseline. A fork can be reserved by another process after the
       // dependency query; the scoped token alone would then include that new
@@ -279,6 +288,7 @@ export class CleanupCoordinator {
             if (fileVersion) {
               // The same pre-assessment token fences the read, receipt, and unlink.
               if (store.prepareDeletion(task.id, owner, access, version, fileVersion, scope.paths)) {
+                stage = "cleanup.delete";
                 const done = store.finishDeletion(task.id, owner, access, version, () => {
                   for (const [path, expected] of report.fileVersions) {
                     if (fileVersionAt(path) !== expected) return false;
@@ -287,7 +297,12 @@ export class CleanupCoordinator {
                   syncParent(task.sessionFile);
                   return true;
                 }, scope.paths);
-                if (done) { this.#claim = undefined; return "complete"; }
+                if (done) {
+                  this.#claim = undefined;
+                  diagnose(this.#options.diagnostics, {operation:stage,outcome:"ok",task:task.id,source:task.sessionId});
+                  diagnose(this.#options.diagnostics, {operation:"cleanup.assess",outcome:"ok",task:task.id,source:task.sessionId});
+                  return "complete";
+                }
               }
               reason = "unavailable";
             }
@@ -301,13 +316,14 @@ export class CleanupCoordinator {
         return "contended";
       }
       if (error instanceof SourceWorkPending) { reason = "unprocessed"; building = true; }
-      else reason = "unavailable";
+      else { failed = true; reason = "unavailable"; diagnose(this.#options.diagnostics, {operation:stage,outcome:"failed",task:task.id,source:task.sessionId,error}); }
     }
     finally { store.releaseSourceAccess(access); }
     if (this.#closed) return "waiting";
     const now = Date.now();
     store.recordCleanAssessment(task.id, owner, now, reason, now + (this.#options.retryDelayMs ?? (building ? continuationMs : pollMs)));
     this.#claim = undefined;
+    if (!failed && !building) diagnose(this.#options.diagnostics, {operation:"cleanup.assess",outcome:"ok",task:task.id,source:task.sessionId});
     return building ? "building" : "waiting";
   }
 

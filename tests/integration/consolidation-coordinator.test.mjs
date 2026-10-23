@@ -7,6 +7,8 @@ import { buildSessionProjection, SessionManager } from '@earendil-works/pi-codin
 import { fauxAssistantMessage, fauxToolCall } from '@earendil-works/pi-ai';
 import { SQLiteMemoryStore } from '../../src/storage/store.ts';
 import { ConsolidationCoordinator } from '../../src/distill/coordinator.ts';
+import { DistillFailure } from '../../src/distill/failure.ts';
+import { SourceWorkPending } from '../../src/storage/source-view.ts';
 import { fitsConsolidationRequest } from '../../src/distill/model.ts';
 
 const stamp = '2026-10-21T00:00:00.000Z';
@@ -147,11 +149,12 @@ test('a transient source-read failure during startup recovery retries without re
  const f=await fixture(t,async()=>({creates:[],updates:[],deletes:[]}));
  const db=new SQLiteMemoryStore(f.path);db.observeSession({sessionId:'closed',sessionFile:join(f.root,'closed.jsonl'),cwd:f.root,leafId:'a',ownerPid:2147483647});db.close();
  const closed={...f.s,sessionId:'closed',sessionFile:join(f.root,'closed.jsonl')};
- let loads=0,calls=0,now=Date.now();
- const c=new ConsolidationCoordinator({openStore:()=>new SQLiteMemoryStore(f.path),loadSnapshot:async()=>{loads++;if(loads===1)throw new Error('transient read');return closed;},runModel:async()=>{calls++;return {creates:[],updates:[],deletes:[]};},retryDelayMs:10,now:()=>now});
+ let loads=0,calls=0,now=Date.now();const diagnostics=[];
+ const c=new ConsolidationCoordinator({diagnostics:{record:event=>diagnostics.push(event)},openStore:()=>new SQLiteMemoryStore(f.path),loadSnapshot:async()=>{loads++;if(loads===1)throw new Error('transient read');return closed;},runModel:async()=>{calls++;return {creates:[],updates:[],deletes:[]};},retryDelayMs:10,now:()=>now});
  await c.start(f.ctx);await c.whenIdle();assert.equal(calls,0);now+=30000;
  for(let i=0;i<30&&calls===0;i++)await new Promise(resolve=>setTimeout(resolve,10));
  await c.shutdown(f.ctx,'reload');assert.equal(calls,1);assert.ok(loads>=2);
+ const recovery=diagnostics.filter(event=>event.operation==='distill.recover');assert.deepEqual(recovery.map(event=>event.outcome),['failed','ok']);assert.equal(recovery[0].task,recovery[1].task);
 });
 test('a 10k-context selected model processes 5KiB of source without permanent oversized jobs',async t=>{
  const {consolidateWithModel}=await import('../../src/distill/model.ts');
@@ -227,4 +230,44 @@ test('context edits update their own branch while an unedited sibling cannot rew
  assert.equal(db.get(id).content,'Latest Cedar condition.');
  assert.deepEqual(flags,[false,true]);
  assert.equal(db.listConsolidationJobs().length,1);
+});
+
+test('diagnostics identify model and transaction failures',async t=>{
+  for(const mode of ['model','transaction']) {
+    const events=[];
+    const f=await fixture(t,async()=>{
+      if(mode==='model')throw new Error('private provider response');
+      return {creates:[{id:'duplicate',content:'Synthetic memory.',createdAt:stamp}],updates:[],deletes:[]};
+    },{diagnostics:{record:event=>events.push(event)}});
+    const db=new SQLiteMemoryStore(f.path);db.save({id:'duplicate',content:'Original memory.',createdAt:stamp});db.close();
+    f.c.beforeCompact(f.ctx);f.c.afterCompact(f.ctx,'record');await f.c.whenIdle();
+    const failures=events.filter(event=>event.outcome==='failed'||event.outcome==='blocked');
+    assert.ok(failures.some(event=>event.operation===`distill.${mode==='model'?'model':'commit'}`));
+    const check=new SQLiteMemoryStore(f.path);assert.equal(check.get('duplicate').content,'Original memory.');assert.ok(check.listConsolidationJobs().length>0);check.close();
+  }
+});
+
+test('diagnostic sink failure cannot prevent capture, consolidation or fast shutdown',async t=>{
+  const f=await fixture(t,async()=>({creates:[{id:'sink-safe',content:'Synthetic memory.',createdAt:stamp}],updates:[],deletes:[]}),{diagnostics:{record(){throw new Error('logger unavailable');}}});
+  f.c.beforeCompact(f.ctx);f.c.afterCompact(f.ctx,'record');await f.c.whenIdle();
+  await f.c.shutdown(f.ctx,'quit');
+  const db=new SQLiteMemoryStore(f.path);assert.ok(db.get('sink-safe'));db.close();
+});
+
+test('distill capacity boundaries are diagnostic issues, while ordinary continuation and cancellation are quiet',async t=>{
+  for(const mode of ['capacity','continuation','cancel']) {
+    const events=[];let started;
+    const ready=new Promise(resolve=>{started=resolve;});
+    const f=await fixture(t,async(_batch,_context,_store,signal)=>{
+      if(mode==='capacity')throw new DistillFailure('model_budget','Synthetic bounded request refusal.');
+      if(mode==='continuation')throw new SourceWorkPending();
+      started();await new Promise((_,reject)=>signal.addEventListener('abort',()=>reject(new Error('cancelled')),{once:true}));
+    },{diagnostics:{record:event=>events.push(event)}});
+    f.c.beforeCompact(f.ctx);f.c.afterCompact(f.ctx,'record');
+    if(mode==='cancel') {await ready;const start=performance.now();await f.c.shutdown(f.ctx,'quit');assert.ok(performance.now()-start<500);}
+    await f.c.whenIdle();
+    const issues=events.filter(event=>event.outcome!=='ok');
+    if(mode==='capacity') assert.ok(issues.some(event=>event.operation==='distill.model'&&event.outcome==='blocked'&&event.reason==='model_budget'));
+    else assert.deepEqual(issues,[]);
+  }
 });

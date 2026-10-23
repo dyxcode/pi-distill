@@ -1,3 +1,4 @@
+import { diagnose, type DiagnosticSink } from '../diagnostics/types.ts';
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { setImmediate as yieldToEventLoop } from "node:timers/promises";
 import type { Memory, MemoryReader } from './types.ts';
@@ -122,6 +123,7 @@ function preview(memory: Memory, match: number, width: number): Candidate["previ
 /** Read-only tools with run-scoped budgets, independent of the Pi renderer. */
 export class MemoryTools {
   readonly #openStore: () => MemoryReader;
+  readonly #diagnostics: DiagnosticSink | undefined;
   readonly #cursorKey = randomBytes(32);
   #store: MemoryReader | undefined;
   #queue: Promise<void> = Promise.resolve();
@@ -131,7 +133,8 @@ export class MemoryTools {
   #refused = false;
   #seen = new Map<string, number>();
 
-  constructor(openStore: () => MemoryReader) {
+  constructor(openStore: () => MemoryReader, diagnostics?: DiagnosticSink) {
+    this.#diagnostics = diagnostics;
     this.#openStore = openStore;
   }
 
@@ -150,15 +153,16 @@ export class MemoryTools {
   }
 
   search(input: unknown, signal?: AbortSignal, options: MemoryToolOptions = {}): Promise<MemoryToolResult> {
-    return this.#enqueue(async (cap, epoch) => this.#search(searchRequest(input), cap, epoch, signal, options), signal, options);
+    return this.#enqueue("memory.search", async (cap, epoch) => this.#search(searchRequest(input), cap, epoch, signal, options), signal, options);
   }
 
   read(input: unknown, signal?: AbortSignal, options: MemoryToolOptions = {}): Promise<MemoryToolResult> {
-    return this.#enqueue(async cap => this.#read(readRequest(input), cap, options), signal, options);
+    return this.#enqueue("memory.read", async cap => this.#read(readRequest(input), cap, options), signal, options);
   }
 
-  #enqueue(operation: (cap: number, epoch: number) => Promise<Body>, signal: AbortSignal | undefined, options: MemoryToolOptions): Promise<MemoryToolResult> {
+  #enqueue(kind: "memory.search" | "memory.read", operation: (cap: number, epoch: number) => Promise<Body>, signal: AbortSignal | undefined, options: MemoryToolOptions): Promise<MemoryToolResult> {
     const epoch = this.#epoch;
+    const started = performance.now();
     const pending = this.#queue.then(async () => {
       if (epoch !== this.#epoch) return envelope({ status: "cancelled", incomplete: true });
       if (this.#refused || this.#calls >= RUN_CALLS || this.#bytes >= RUN_BYTES - CONTROL_RESERVE) {
@@ -175,9 +179,15 @@ export class MemoryTools {
         if (caught instanceof BudgetExhausted) return this.#exhausted();
         if (caught instanceof InvalidInput) body = { status: "invalid_input", message: caught.message };
         else if (caught instanceof ResultTooLarge) body = { status: "result_too_large", incomplete: true };
-        else body = { status: "unavailable", incomplete: true, message: "Memory storage is unavailable. Continue without it." };
+        else {
+          diagnose(this.#diagnostics, {operation:kind,outcome:"failed",error:caught,durationMs:performance.now()-started});
+          body = { status: "unavailable", incomplete: true, message: "Memory storage is unavailable. Continue without it." };
+        }
       }
       if (epoch !== this.#epoch) return envelope({ status: "cancelled", incomplete: true });
+      if (["ok", "not_found", "stale"].includes(String(body["status"]))) {
+        diagnose(this.#diagnostics, {operation:kind,outcome:"ok",durationMs:performance.now()-started});
+      }
       const result = this.#response(body, error);
       if (size(result) > cap) return this.#exhausted();
       if (options.fitsResult && !options.fitsResult(result)) {

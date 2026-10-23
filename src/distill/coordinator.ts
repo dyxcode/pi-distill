@@ -1,3 +1,4 @@
+import { diagnose, type DiagnosticSink } from '../diagnostics/types.ts';
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
@@ -22,6 +23,7 @@ type ShutdownReason = "quit" | "reload" | "new" | "resume" | "fork";
 type RunModel = typeof consolidateWithModel;
 
 interface Options {
+  readonly diagnostics?: DiagnosticSink;
   readonly openStore: () => SQLiteMemoryStore;
   readonly hasStore?: () => boolean;
   readonly loadSnapshot?: typeof loadSnapshot;
@@ -106,7 +108,8 @@ export class ConsolidationCoordinator {
       }
       this.#recoveryNeeded = true;
       this.#kick();
-    } catch {
+    } catch (error) {
+      diagnose(this.#options.diagnostics, {operation:"distill.pass",outcome:"failed",error});
       this.#recoveryNeeded = true;
       this.#retry();
     }
@@ -121,7 +124,9 @@ export class ConsolidationCoordinator {
       const source = this.#sourceReference(ctx);
       if (!source) return;
       this.#database().observeSession({ ...source, ownerPid: process.pid });
-    } catch {
+      diagnose(this.#options.diagnostics, {operation:"capture.observe",outcome:"ok"});
+    } catch (error) {
+      diagnose(this.#options.diagnostics, {operation:"capture.observe",outcome:"failed",error});
       // Observation is best effort. A later host event can record a newer boundary.
     }
     this.#kick();
@@ -139,7 +144,8 @@ export class ConsolidationCoordinator {
       const id = randomUUID();
       this.#before = { id, source };
       this.#database().enqueueDistillTrigger(this.#triggerInput(source, "compact", id));
-    } catch {
+    } catch (error) {
+      diagnose(this.#options.diagnostics, {operation:"capture.compact",outcome:"failed",error});
       // afterCompact retries the bounded candidate write before confirming it.
     }
   }
@@ -158,8 +164,12 @@ export class ConsolidationCoordinator {
       try {
         const store = this.#database();
         store.enqueueDistillTrigger(this.#triggerInput(candidate.source, "compact", candidate.id));
-        if (store.confirmCompactionTrigger({ id: candidate.id, compactionRecordId })) this.#notifyProgress();
-      } catch {
+        if (store.confirmCompactionTrigger({ id: candidate.id, compactionRecordId })) {
+          diagnose(this.#options.diagnostics, {operation:"capture.compact",outcome:"ok"});
+          this.#notifyProgress();
+        }
+      } catch (error) {
+        diagnose(this.#options.diagnostics, {operation:"capture.compact",outcome:"failed",error});
         this.#recoveryNeeded = true;
       }
     }
@@ -174,7 +184,7 @@ export class ConsolidationCoordinator {
     this.#compactionBusy = false;
     if (candidate) {
       try { this.#store?.cancelCompactionTrigger(candidate.id); }
-      catch { this.#recoveryNeeded = true; }
+      catch (error) { diagnose(this.#options.diagnostics, {operation:"capture.compact",outcome:"failed",error}); this.#recoveryNeeded = true; }
     }
     this.#notifyIdleWaiters();
     this.#kick();
@@ -215,8 +225,10 @@ export class ConsolidationCoordinator {
           const id = closeTriggerId(source);
           store.enqueueDistillTrigger(this.#triggerInput(source, "close", id));
           store.acknowledgeObservation(source.sessionId, source.leafId);
+          diagnose(this.#options.diagnostics, {operation:"capture.close",outcome:"ok"});
         }
-      } catch {
+      } catch (error) {
+        diagnose(this.#options.diagnostics, {operation:"capture.close",outcome:"failed",error});
         // Persisted observations can recover a missed close after this process exits.
       }
     }
@@ -232,7 +244,7 @@ export class ConsolidationCoordinator {
           claimToken: this.#activeClaim.token,
           now: this.#now(),
         });
-      } catch { /* The database lease remains the crash-recovery fence. */ }
+      } catch (error) { diagnose(this.#options.diagnostics, {operation:"distill.release",outcome:"failed",error}); }
       this.#activeClaim = undefined;
     }
     this.#store?.close();
@@ -323,7 +335,8 @@ export class ConsolidationCoordinator {
     this.#controller = controller;
     const signal = controller.signal;
     this.#working = this.#runPass(context, signal)
-      .catch(() => { this.#recoveryNeeded = true; })
+      .then(() => { if (!signal.aborted && this.#canRun(context)) diagnose(this.#options.diagnostics, {operation:"distill.pass",outcome:"ok"}); })
+      .catch(error => { if (!controller.signal.aborted && !(error instanceof SourceWorkPending)) diagnose(this.#options.diagnostics, {operation:"distill.pass",outcome:"failed",error}); this.#recoveryNeeded = true; })
       .finally(() => {
         this.#working = undefined;
         this.#controller = undefined;
@@ -559,7 +572,9 @@ export class ConsolidationCoordinator {
         if (!compactionRecordId) throw new DistillFailure("source_invalid", "A persisted compaction record is not available yet.");
         store.confirmCompactionTrigger({ id: trigger.id, compactionRecordId });
         store.releaseDistillClaim({ claimToken: claim.claimToken, now: this.#now() });
+        diagnose(this.#options.diagnostics, {operation:"distill.recover",outcome:"ok",task:trigger.id,source:trigger.sessionId});
       } catch (error) {
+        if (!signal.aborted && !(error instanceof SourceWorkPending)) diagnose(this.#options.diagnostics, {operation:"distill.recover",outcome:"failed",task:trigger.id,source:trigger.sessionId,error});
         unresolved = true;
         this.#releaseClaim(store, claim.claimToken, error, retryContext, signal);
       } finally { this.#finishClaim(); }
@@ -639,7 +654,9 @@ export class ConsolidationCoordinator {
         } else {
           store.releaseDistillClaim({ claimToken: claim.claimToken, now: this.#now() });
         }
+        diagnose(this.#options.diagnostics, {operation:"distill.recover",outcome:"ok",task:id,source:source.sessionId});
       } catch (error) {
+        if (!signal.aborted && !(error instanceof SourceWorkPending)) diagnose(this.#options.diagnostics, {operation:"distill.recover",outcome:"failed",task:id,source:source.sessionId,error});
         unresolved = true;
         this.#releaseClaim(store, claim.claimToken, error, retryContext, signal);
       } finally { this.#finishClaim(); }
@@ -664,8 +681,10 @@ export class ConsolidationCoordinator {
       }
       const jobs = this.#prepareJobs(snapshot, trigger, store);
       store.prepareDistillTrigger({ id: trigger.id, claimToken, now: this.#now(), jobs });
+      diagnose(this.#options.diagnostics, {operation:"distill.prepare",outcome:"ok",task:trigger.id,source:trigger.sessionId});
       if (jobs.length === 0) this.#notifyProgress();
     } catch (error) {
+      if (!signal.aborted && !(error instanceof SourceWorkPending)) diagnose(this.#options.diagnostics, {operation:"distill.prepare",outcome:"failed",task:trigger.id,source:trigger.sessionId,error});
       this.#releaseClaim(store, claimToken, error, retryContext, signal);
       this.#recoveryNeeded = true;
     }
@@ -706,6 +725,7 @@ export class ConsolidationCoordinator {
     await view.unchanged(); signal.throwIfAborted();
     const complete = !reused && page.nextCursor === undefined && cursor === (page.items.at(-1)?.seq ?? after);
     store.prepareDistillPage({ id: trigger.id, claimToken: token, now: this.#now(), viewId: view.id, after, cursor, complete, jobs });
+    diagnose(this.#options.diagnostics, {operation:"distill.prepare",outcome:"ok",task:trigger.id,source:trigger.sessionId});
     if (!complete) this.#sourceWorkPending = true;
     if (complete && jobs.length === 0) this.#notifyProgress();
   }
@@ -766,11 +786,15 @@ export class ConsolidationCoordinator {
     store: SQLiteMemoryStore,
     retryContext: DistillRetryContext,
   ): Promise<void> {
+    const started = performance.now();
+    let stage: "distill.prepare" | "distill.model" | "distill.commit" = "distill.prepare";
     try {
       const processed = new Set(store.processedSources(job.sourceKeys));
       const sourceKeys = job.sourceKeys.filter(key => !processed.has(key));
       if (sourceKeys.length === 0) {
+        stage = "distill.commit";
         store.commitConsolidation({ jobId: job.id, owner: claimToken, now: this.#now(), sourceKeys, creates: [], updates: [], deletes: [] });
+        diagnose(this.#options.diagnostics, {operation:stage,outcome:"ok",task:job.id,source:job.sessionId});
         this.#notifyProgress();
         return;
       }
@@ -805,6 +829,8 @@ export class ConsolidationCoordinator {
       });
       // Durable work records the frozen range. Only the claiming model decides
       // the next request's prefix; committed keys remain the progress authority.
+      diagnose(this.#options.diagnostics, {operation:stage,outcome:"ok",task:job.id,source:job.sessionId});
+      stage = "distill.model";
       let batch: SourceBatch | undefined;
       for (let count = 1; count <= evidence.length; count++) {
         const candidate = makeBatch(evidence.slice(0, count));
@@ -828,6 +854,7 @@ export class ConsolidationCoordinator {
       const run = this.#options.runModel ?? consolidateWithModel;
       const changes = await abortable(
         run(batch, context, store, signal, {
+          ...(this.#options.diagnostics ? {diagnostics:this.#options.diagnostics} : {}),
           waitUntilIdle: requestSignal => this.#waitUntilIdle(requestSignal),
           ...(view ? { isSiblingOrigin: origin => view.isSibling(origin) } : {})
         }),
@@ -836,12 +863,21 @@ export class ConsolidationCoordinator {
       signal.throwIfAborted();
       await view?.unchanged();
       signal.throwIfAborted();
+      diagnose(this.#options.diagnostics, {operation:stage,outcome:"ok",task:job.id,source:job.sessionId});
+      stage = "distill.commit";
       store.commitConsolidation({
         ...changes, jobId: job.id, owner: claimToken, now: this.#now(),
         sourceKeys: batch.sourceKeys, evidence: sourceBoundary(snapshot, batch.evidence)
       });
+      diagnose(this.#options.diagnostics, {operation:stage,outcome:"ok",task:job.id,source:job.sessionId});
       this.#notifyProgress();
     } catch (error) {
+      if (!signal.aborted && !(error instanceof SourceWorkPending)) diagnose(this.#options.diagnostics, {
+        operation:stage,outcome:error instanceof DistillFailure && ["model_unavailable","model_budget"].includes(error.reason)?"blocked":"failed",
+        task:job.id,source:job.sessionId,error,durationMs:performance.now()-started,
+        ...(context.model ? {model:context.model.id} : {}),
+        ...(error instanceof DistillFailure ? {reason:error.reason,...(error.retryAfterMs===undefined?{}:{retryAfterMs:error.retryAfterMs})} : {}),
+      });
       if (!this.#closed) this.#releaseClaim(store, claimToken, error, retryContext, signal);
     }
   }
@@ -863,7 +899,8 @@ export class ConsolidationCoordinator {
           }
         }),
       });
-    } catch { /* Expiring the lease is the final recovery path. */ }
+      diagnose(this.#options.diagnostics, {operation:"distill.release",outcome:"ok"});
+    } catch (releaseError) { diagnose(this.#options.diagnostics, {operation:"distill.release",outcome:"failed",error:releaseError}); }
   }
 
   #notifyProgress(): void {

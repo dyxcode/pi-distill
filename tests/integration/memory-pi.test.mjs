@@ -80,3 +80,13 @@ test("agent_start resets adapter run budgets after an exhausted run", async (t) 
   assert.equal(result.secondRunStatus, "ok");
   assert.equal(result.providerCalls, 16);
 });
+
+test('real Pi automatically records a storage failure and subsequent recovery without prompt content',async t=>{
+  const result=await run('diagnostics',t);
+  assert.deepEqual(result.statuses,['unavailable','ok']);
+  const records=result.records.filter(event=>event.operation==='memory.search');
+  assert.deepEqual(records.map(event=>event.outcome),['failed','recovered']);
+  assert.equal(records[0].errorCode,'ERR_SQLITE_ERROR');
+  assert.equal(records[0].piVersion,'1.3.0');assert.equal(records[0].extensionVersion,'0.0.0');
+  assert.ok(!JSON.stringify(result.records).includes('private synthetic words'));
+});

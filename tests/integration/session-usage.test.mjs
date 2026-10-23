@@ -165,3 +165,12 @@ test('runtimes sharing the same manager cannot attribute overlapping reloads to 
   assert.ok(f.rows().filter(row => old.includes(row.ownerId)).every(row => row.state === 'closing'));
   assert.equal(f.rows().filter(row => row.state === 'active').length, 2);
 });
+
+test('usage storage failures produce diagnostics while preserving uncertain ownership',async t=>{
+  const f=await fixture(t);const events=[];
+  const c=f.coordinator({openStore:()=>{throw new Error('private path');},diagnostics:{record:event=>events.push(event)}});
+  c.start({reason:'startup'},f.context('missing'));
+  assert.ok(events.some(event=>event.operation==='usage.start'&&event.outcome==='failed'));
+  const broken=f.coordinator({openStore:()=>{throw new Error('private path');},diagnostics:{record(){throw new Error('broken logger');}}});
+  assert.doesNotThrow(()=>broken.start({reason:'startup'},f.context('missing')));
+});

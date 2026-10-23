@@ -574,3 +574,23 @@ test('two actual cleanup processes retry a released reservation without a second
   assert.ok(results.every(([result])=>result.done&&result.completed),a.stderr()+b.stderr());
   await assert.rejects(readFile(f.file),{code:'ENOENT'});
 });
+
+test('normal cleanup eligibility and deletion produce no issue diagnostics',async t=>{
+  const f=await fixture(t);await f.complete();f.store.enqueueCleanTask(f.input());
+  const events=[];const c=f.worker({diagnostics:{record(event){events.push(event);}}});
+  c.wake();await c.whenIdle();assert.ok(await readFile(f.file));
+  assert.ok(!events.some(event=>event.outcome!=='ok'));
+  assert.ok(!events.some(event=>event.operation==='cleanup.delete'&&event.outcome==='ok'));
+  await releaseFixture(f);events.length=0;c.wake();await c.whenIdle();
+  await assert.rejects(readFile(f.file),{code:'ENOENT'});
+  assert.ok(!events.some(event=>event.outcome!=='ok'));
+  const broken=f.worker({diagnostics:{record(){throw new Error('diagnostic fault');}}});broken.wake();await broken.whenIdle();
+  assert.equal(f.task(),undefined);
+});
+
+test('unexpected cleanup storage failures are reported without deleting sources',async t=>{
+  const f=await fixture(t);const events=[];const before=await readFile(f.file);
+  const c=f.worker({openStore:()=>{throw new Error('synthetic storage fault');},diagnostics:{record:event=>events.push(event)}});
+  c.wake();await c.whenIdle();assert.deepEqual(await readFile(f.file),before);
+  assert.ok(events.some(event=>event.operation==='cleanup.pass'&&event.outcome==='failed'));
+});
