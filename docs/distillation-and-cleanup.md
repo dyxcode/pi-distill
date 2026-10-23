@@ -127,9 +127,9 @@ Recovery covers data already persisted by Pi and the extension. Conversation con
 
 ## Implementation map
 
-- [Pi event integration](../src/index.ts): connects session events, usage tracking, and workers.
-- [Distillation coordinator](../src/consolidation.ts) and [model interaction](../src/consolidation-model.ts): prepare, claim, and process bounded evidence.
-- [Cleanup coordinator](../src/cleanup.ts) and [retention assessment](../src/session-retention.ts): check eligibility and remove source files.
-- [SQLite store](../src/memory-store.ts): persistent queues, atomic memory commits, claims, and deletion recovery.
+- [Pi event integration](../src/pi/lifecycle.ts): connects session events, usage tracking, and workers.
+- [Distillation coordinator](../src/distill/coordinator.ts) and [model interaction](../src/distill/model.ts): prepare, claim, and process bounded evidence.
+- [Cleanup coordinator](../src/retention/coordinator.ts) and [source coverage](../src/storage/coverage.ts): check eligibility and remove source files.
+- [SQLite store](../src/storage/store.ts): persistent queues, atomic memory commits, claims, and deletion recovery.
 
 Return to the [product overview](../README.md).

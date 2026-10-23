@@ -127,9 +127,9 @@ Cleanup 独立于模型可用性和前台模型活动运行。任务领取机制
 
 ## 实现入口
 
-- [Pi 事件集成](../../src/index.ts)：连接 session 事件、使用跟踪和 worker。
-- [Distill 协调器](../../src/consolidation.ts)与[模型交互](../../src/consolidation-model.ts)：准备、领取和处理有大小上限的证据批次。
-- [Cleanup 协调器](../../src/cleanup.ts)与[保留条件评估](../../src/session-retention.ts)：检查删除条件并移除源文件。
-- [SQLite 存储](../../src/memory-store.ts)：持久化队列、记忆原子提交、任务领取与删除恢复。
+- [Pi 事件集成](../../src/pi/lifecycle.ts)：连接 session 事件、使用跟踪和 worker。
+- [Distill 协调器](../../src/distill/coordinator.ts)与[模型交互](../../src/distill/model.ts)：准备、领取和处理有大小上限的证据批次。
+- [Cleanup 协调器](../../src/retention/coordinator.ts)与[源证据覆盖检查](../../src/storage/coverage.ts)：检查删除条件并移除源文件。
+- [SQLite 存储](../../src/storage/store.ts)：持久化队列、记忆原子提交、任务领取与删除恢复。
 
 返回[产品介绍](README.zh-CN.md)。

@@ -2,72 +2,69 @@
 
 English | [简体中文](docs/i18n/README.zh-CN.md)
 
-**Adaptive memory and context for Pi.**
+**Keep the knowledge. Start fresh.**
 
-pi-distill is an extension for [Pi](https://github.com/earendil-works/pi) that brings memory into everyday conversations.
+pi-distill gives [Pi](https://github.com/earendil-works/pi) memory across conversations. It distills useful knowledge from your chats, retrieves relevant memories for later work, and cleans up processed chat history.
+
+Use a session for whatever you are working on: several topics, several projects, or a quick question. Open a fresh session whenever you want. Decisions, preferences, lessons, and unfinished work can carry forward through memory.
+
+## Install
+
+Requires Node.js **22.19.0+** and Pi. Integration is verified with **Pi 1.3.0**.
+
+```sh
+pi install git:github.com/dyxcode/pi-distill@v0.1.0
+pi
+```
+
+Choose your configured model in Pi and start talking. In an already-open Pi, `/reload` loads the newly installed extension.
+
+For checkout installation, upgrades, and removal, see the [installation guide](docs/installation.md).
+
+## Everyday use
+
+Work with Pi as usual. For example, you might tell it:
+
+> For Cedar, keep logs for 14 days normally and 30 days during an incident investigation.
+
+After that conversation has been distilled, a fresh session can retrieve the policy when you work on Cedar again. If the policy changes, explain the change in conversation:
+
+> Cedar now keeps logs for 21 days normally. The incident rule stays the same.
+
+That correction becomes evidence for updating the memory. Memories keep the conditions that make a fact useful, and the model judges their relevance across projects and topics.
+
+Use `/new` to start another conversation, or exit Pi and run `pi` again. Several terminals can share the same personal memory store.
+
+**Fresh sessions are the intended workflow.** Automatic cleanup can overlap Pi's native access to old session files. Follow the [old-session operation checklist](docs/distillation-and-cleanup.md#operations-to-avoid-with-automatic-cleanup) when working with saved chats.
+
+## How memory works
+
+1. **Distill.** Ending a session or successfully compacting it records work for background processing. A running Pi uses its configured model to extract useful knowledge and create, update, or remove memories.
+2. **Recall.** During later conversations, Pi's model chooses keywords with `memory_search`, reads candidates with `memory_read`, and decides which memories apply. Search and read results appear in Pi's tool cards.
+3. **Clean up.** Once a managed chat is fully processed, no longer in use, and free of unresolved dependencies, cleanup deletes its source file. The distilled memories remain available.
+
+New knowledge becomes searchable after distillation saves it. Exit records pending work quickly; another running Pi can continue it, or processing resumes when you next start Pi.
+
+## Your data
+
+Memories and pending work live in local SQLite storage, normally under `~/.pi/agent/distill/`. A fresh session uses that shared store. Background processing also resumes from it after a restart.
+
+Distillation sends relevant conversation evidence and retrieved memories to **the model provider configured in Pi**. Search and cleanup run locally. Diagnostic records of failures, blocked work, and recovery stay on your machine; their contents and retention limits are described in the [local data guide](docs/installation.md#local-data).
 
 ## Product vision
 
-![Conversations become memories that supply context to future Pi sessions.](docs/assets/pi-distill-workflow.svg)
+Sessions are temporary workspaces; useful knowledge should remain available as your work moves between them. The aim is memory maintained through ordinary conversation, with its context and uncertainty intact.
 
-*Product vision, including the planned memory inspector.*
+![Product vision: conversations become memories that supply context to future Pi sessions.](docs/assets/pi-distill-workflow.svg)
 
-Open a fresh session and continue your work. pi-distill aims to make relevant memories available wherever the conversation goes.
+*Product vision. The memory inspector shown here is planned: it would explain which memories were used, where they came from, and why they were selected.*
 
-Sessions are temporary places to talk. You can move between topics and projects, close Pi, and start again without naming conversations or finding the session where a decision was made. You can work in several terminals at once, with each session drawing on the same personal memory store.
+## Read more
 
-The extension maintains memories through ordinary conversation. It brings back the knowledge relevant to the current request, including decisions, preferences, conditions, and unfinished work. You choose what to work on; pi-distill handles remembering and letting old chats go.
+- [Installation and local data](docs/installation.md) — setup, updates, removal, and diagnostics.
+- [Distillation and cleanup](docs/distillation-and-cleanup.md) — processing timing, multiple terminals, recovery, and session handling.
+- [Agentic memory search](docs/agentic-search.md) — keyword selection, literal matching, and reading evidence.
 
-pi-distill aims to:
+## License
 
-- **Remember useful knowledge:** distill decisions, lessons, preferences, and task state from conversations, including history that has been compacted.
-- **Bring back relevant context:** use the current message and recent conversation to bring back helpful memories.
-- **Keep memory current:** incorporate corrections, replace outdated conclusions, resolve duplicates, and distinguish completed, paused, and unresolved work.
-- **Make memory understandable:** explain which memories were used, why they were selected, and when they were extracted or updated. Let users inspect, correct, and forget them.
-- **Let chats go:** delete chat history while retaining distilled memories and the metadata needed to manage them.
-
-```text
-Conversations --> Distill --> Memories
-      |                         |
-      |                         v
-      |       New input --> Select context --> Pi responds
-      |                         |
-      |                         v
-      |                    Memory inspector
-      |                    - What was used?
-      |                    - Why was it selected?
-      v
-Delete chat history
-```
-
-### Keep the knowledge, let the chats go
-
-Useful knowledge lives on in memories after its original conversation is gone. Completed memory processing and the end of session use make old chats eligible for automatic cleanup. A fresh session continues from relevant memories, so continuity comes from what was learned rather than from reopening a particular chat.
-
-### Design principles
-
-- Store and manage memory locally.
-- Apply memories in the context of the current request.
-- Preserve conditions, uncertainty, and alternative conversation branches.
-
-## Available today
-
-### Automatic distillation and cleanup
-
-When a session ends or compaction succeeds, pi-distill records distillation work. A live Pi uses its model to process that evidence in the background, creating, correcting, or deleting memories as the conversation warrants. Exit saves pending work; after the last Pi process closes, it continues on the next startup.
-
-Cleanup independently performs local checks and deletes managed chat files once processing is complete, use has ended, and dependencies are resolved. Memories remain available. Knowledge from a just-closed conversation becomes searchable after distillation commits it. See [Distillation and cleanup](docs/distillation-and-cleanup.md) for queue timing and diagrams.
-
-### Agentic memory search
-
-Pi's current model chooses keywords and alternate expressions or languages through `memory_search`, then uses `memory_read` to inspect candidates and judge applicability. SQLite performs literal matching. Memories remain searchable across projects, with their original conditions and context.
-
-Search and read results appear in Pi's tool cards. Expanded results show search terms, matching previews, read content, and memory update times. See [Agentic memory search](docs/agentic-search.md) for tool contracts and retrieval behavior.
-
-### Local storage and recovery
-
-Memories and task queues persist in local SQLite. The extension supports normal Pi loading and reload, coordinates multiple Pi processes sharing the store, and recovers persisted pending work after restart. Distillation uses the claiming Pi's configured model and sends relevant evidence to that model provider.
-
-## Recommended use
-
-Start fresh with `pi` or `/new`, and let relevant memories carry your work forward. While automatic cleanup is running, leave old session files to the extension. The [operation checklist](docs/distillation-and-cleanup.md#operations-to-avoid-with-automatic-cleanup) lists Pi's old-session commands and UI actions to avoid, with reasons and current-session distinctions. See [Distillation and cleanup](docs/distillation-and-cleanup.md) for timing and diagrams.
+[MIT](LICENSE).

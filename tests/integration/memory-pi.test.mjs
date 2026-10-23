@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
@@ -87,6 +87,6 @@ test('real Pi automatically records a storage failure and subsequent recovery wi
   const records=result.records.filter(event=>event.operation==='memory.search');
   assert.deepEqual(records.map(event=>event.outcome),['failed','recovered']);
   assert.equal(records[0].errorCode,'ERR_SQLITE_ERROR');
-  assert.equal(records[0].piVersion,'1.3.0');assert.equal(records[0].extensionVersion,'0.0.0');
+  assert.equal(records[0].piVersion,'1.3.0');assert.equal(records[0].extensionVersion,JSON.parse(await readFile(join(repoRoot,'package.json'),'utf8')).version);
   assert.ok(!JSON.stringify(result.records).includes('private synthetic words'));
 });
