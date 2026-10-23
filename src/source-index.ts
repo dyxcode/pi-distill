@@ -48,7 +48,7 @@ function parsed(value: unknown): unknown {
   if (typeof value !== "string") return invalid("Invalid stored source index JSON.");
   try { return JSON.parse(value); } catch { return invalid("Invalid stored source index JSON."); }
 }
-function state(value: unknown): SourceIndexState {
+export function parseIndexState(value: unknown): SourceIndexState {
   if (!object(value) || !string(value["path"]) || !isAbsolute(value["path"]) || value["path"].includes("\0") ||
     !string(value["generation"]) || !string(value["version"]) || !/^\d+:\d+:\d+:\d+:\d+$/.test(value["version"]) ||
     !integer(value["offset"]) || !integer(value["entries"]) || typeof value["complete"] !== "boolean" || typeof value["waitingForTail"] !== "boolean") return invalid("Invalid stored source index state.");
@@ -85,14 +85,14 @@ export class SourceIndex {
   current(path: string): SourceIndexState | undefined {
     const row = this.database.prepare("SELECT progress FROM source_index_files WHERE path = ?").get(path);
     if (!row) return undefined;
-    const result = state(parsed(row["progress"]));
+    const result = parseIndexState(parsed(row["progress"]));
     if (result.path !== path) return invalid("Indexed source path differs from its key.");
     return result;
   }
   begin(path: string, version: string): SourceIndexState {
     const current = this.current(path);
     if (current?.version === version) return current;
-    const next = state({ path, version, generation: randomUUID(), offset: 0, entries: 0, header: null, complete: false, waitingForTail: false });
+    const next = parseIndexState({ path, version, generation: randomUUID(), offset: 0, entries: 0, header: null, complete: false, waitingForTail: false });
     this.database.prepare("INSERT INTO source_index_files VALUES (?, ?, ?) ON CONFLICT(path) DO UPDATE SET generation=excluded.generation, progress=excluded.progress")
       .run(path, next.generation, JSON.stringify(next));
     return next;
@@ -110,7 +110,7 @@ export class SourceIndex {
       .all(generation, after, limit).map(row => entryMetadata(parsed(row["metadata"])));
   }
   commitPage(previous: SourceIndexState, rows: readonly IndexedEntry[], next: SourceIndexState): void {
-    state(previous); state(next);
+    parseIndexState(previous); parseIndexState(next);
     if (rows.length > PAGE_ENTRIES || next.generation !== previous.generation || next.path !== previous.path || next.version !== previous.version ||
       next.entries !== previous.entries + rows.length || next.offset < previous.offset) return invalid("Invalid source page progress.");
     this.database.exec("SAVEPOINT source_index_page");

@@ -91,6 +91,7 @@ class ConsolidationError extends DistillFailure {
 }
 
 export interface ConsolidationModelOptions {
+  readonly isSiblingOrigin?: (origin: MemoryOrigin | undefined) => boolean;
   /** Waits until the owning live Pi runtime can issue a background model request. */
   readonly waitUntilIdle?: (signal: AbortSignal) => Promise<void>;
 }
@@ -222,10 +223,10 @@ function validateBatch(batch: SourceBatch): ValidatedBatch {
   }
   const hasLineageKeys = Object.hasOwn(batch, "lineageKeys");
   const hasLineageSessions = Object.hasOwn(batch, "lineageSessionIds");
-  if (hasLineageKeys !== hasLineageSessions) {
+  if (hasLineageKeys && !hasLineageSessions) {
     throw new ConsolidationError("Source lineage keys and session IDs must be supplied together.", "source_invalid");
   }
-  if (!hasLineageKeys) return { evidenceKeys, ...timing };
+  if (!hasLineageSessions) return { evidenceKeys, ...timing };
 
   const parseUniqueTextList = (value: unknown, field: string): Set<string> => {
     if (!Array.isArray(value)) throw new ConsolidationError(`${field} must be an array.`, "source_invalid");
@@ -240,7 +241,7 @@ function validateBatch(batch: SourceBatch): ValidatedBatch {
   return {
     evidenceKeys,
     ...timing,
-    lineageKeys: parseUniqueTextList(batch.lineageKeys, "Source lineage key"),
+    ...(hasLineageKeys ? { lineageKeys: parseUniqueTextList(batch.lineageKeys, "Source lineage key") } : {}),
     lineageSessionIds: parseUniqueTextList(batch.lineageSessionIds, "Source lineage session ID"),
     ...(batch.lineageAnchors === undefined ? {} : {
       lineageAnchors: parseUniqueTextList(batch.lineageAnchors, "Source lineage entry anchor"),
@@ -770,7 +771,7 @@ export async function consolidateWithModel(
         }
         try {
           const origin = store.memoryOrigin(id);
-          const alternativeBranch = isSiblingBranch(origin, validatedBatch);
+          const alternativeBranch = options.isSiblingOrigin?.(origin) ?? isSiblingBranch(origin, validatedBatch);
           const newerEvidence = origin?.sourceTime !== undefined && validatedBatch.sourceTime !== undefined &&
             origin.sourceTime > validatedBatch.sourceTime;
           protectedMemory = alternativeBranch || newerEvidence;

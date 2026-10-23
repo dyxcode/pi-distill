@@ -237,8 +237,9 @@ try{
       const file=session.sessionManager.getSessionFile();
       const snap=file?await loadSnapshot(file):undefined;
       const db=new SQLiteMemoryStore(join(agentDir,'distill','memories.sqlite'));
-      const jobs=db.listConsolidationJobs();db.close();
-      console.error(JSON.stringify({extractionCalls,providerCalls:faux.state.callCount,sourcePending:snap?.pending,reason:snap?.pendingReason,batches:snap?planSources(snap,new Set()).length:0,jobs:jobs.map(j=>({id:j.id,sourceKeys:j.sourceKeys}))}));
+      const jobs=db.listConsolidationJobs();
+      const failures=jobs.map(j=>db.readDistillFailure("job",j.id));db.close();
+      console.error(JSON.stringify({failures,extractionCalls,providerCalls:faux.state.callCount,sourcePending:snap?.pending,reason:snap?.pendingReason,batches:snap?planSources(snap,new Set()).length:0,jobs:jobs.map(j=>({id:j.id,sourceKeys:j.sourceKeys}))}));
     }
     if(!['late-reply'].includes(mode)){
       assert.ok(found,`automatic ${mode} must persist memory without a remember command`);

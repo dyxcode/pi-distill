@@ -95,7 +95,7 @@ test('v8 upgrade preserves memories and pending work while starting with a rebui
  old.save({id:'kept',content:'Preserved condition.',createdAt:header.timestamp});
  const job={id:'pending',sessionId:header.id,sessionFile:f.path,leafId:'e0',cwd:header.cwd,sourceKeys:['existing-key']};
  old.enqueueConsolidation(job);old.close();
- const raw=new DatabaseSync(f.db);raw.exec('DROP TABLE source_index_entries; DROP TABLE source_index_files; PRAGMA user_version=8');raw.close();
+ const raw=new DatabaseSync(f.db);raw.exec('DROP TABLE source_view_parts; DROP TABLE source_view_edits; DROP TABLE source_view_entries; DROP TABLE source_preparation; DROP TABLE source_views; DROP TABLE source_index_entries; DROP TABLE source_index_files; PRAGMA user_version=8');raw.close();
  const upgraded=f.open();assert.equal(upgraded.get('kept').content,'Preserved condition.');assert.deepEqual(upgraded.listConsolidationJobs(),[job]);
  assert.equal(upgraded.sourceIndex.current(f.path),undefined);assert.equal((await finish(f,upgraded)).entries,1);
 });

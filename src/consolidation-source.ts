@@ -1,3 +1,4 @@
+import type { PagedSourceView } from "./source-view.ts";
 import { createHash } from "node:crypto";
 import { closeSync, openSync, readSync } from "node:fs";
 import { lstat, open } from "node:fs/promises";
@@ -41,6 +42,7 @@ export interface ReadonlySessionManager {
 }
 
 export interface SourceSnapshot {
+  readonly indexed?: PagedSourceView;
   readonly sessionId: string;
   readonly sessionFile: string | null;
   readonly cwd: string;
@@ -388,7 +390,7 @@ function projectionContentByEntry(projection: SessionProjection | undefined): Re
   return result;
 }
 
-function sourcePartsForEntry(
+export function sourcePartsForEntry(
   entry: SessionEntry,
   effective: EffectiveContent | undefined,
   projected: ProjectionContent | undefined,
@@ -417,7 +419,7 @@ function sourcePartsForEntry(
   return parts;
 }
 
-function sourceContentForEntry(
+export function sourceContentForEntry(
   entry: SessionEntry,
   effective: EffectiveContent | undefined,
   projected: ProjectionContent | undefined,
@@ -516,38 +518,24 @@ function lineageFingerprints(
   let conversationFingerprint = hash("pi-distill-source-root-v1");
   for (const entry of entries) {
     const origin = originFor(snapshot, entry);
-    const sourceContent = sourceContentForEntry(entry, effectiveContents.get(entry.id), projected.get(entry.id));
-    const eventFingerprint = entry.type === "context_edit"
-      ? hash(stableJson(entry.replacement))
-      : sourceContent && sourceContent.segments.length > 0
-        ? hash(JSON.stringify([sourceContent.role, sourceContent.segments]))
-        : "";
-    const identity = hash(JSON.stringify([
-      "pi-distill-entry-lineage-v1",
-      origin.sessionId,
-      origin.entryId,
-      conversationFingerprint,
-      entry.type,
-      entry.timestamp,
-      eventFingerprint,
-    ]));
-    result.set(entry.id, identity);
-
-    // Branch identity follows conversational evidence and explicit context
-    // edits. Pi system/tool schema entries and other state metadata therefore
-    // cannot churn source keys for later user-facing messages.
-    if ((sourceContent && sourceContent.segments.length > 0) || entry.type === "context_edit") {
-      conversationFingerprint = hash(JSON.stringify([
-        "pi-distill-conversation-branch-v1",
-        conversationFingerprint,
-        origin.sessionId,
-        origin.entryId,
-        identity,
-        eventFingerprint,
-      ]));
-    }
+    const step = sourceEntryIdentity(entry, origin, conversationFingerprint, effectiveContents.get(entry.id), projected.get(entry.id));
+    result.set(entry.id, step.identity);
+    conversationFingerprint = step.nextFingerprint;
   }
   return result;
+}
+
+export function sourceEntryIdentity(entry: SessionEntry, origin: SourceOrigin, conversationFingerprint: string,
+  effective?: EffectiveContent, projected?: ProjectionContent): { identity: string; nextFingerprint: string } {
+  const content = sourceContentForEntry(entry, effective, projected);
+  const event = entry.type === "context_edit" ? hash(stableJson(entry.replacement))
+    : content && content.segments.length > 0 ? hash(JSON.stringify([content.role, content.segments])) : "";
+  const identity = hash(JSON.stringify(["pi-distill-entry-lineage-v1", origin.sessionId, origin.entryId,
+    conversationFingerprint, entry.type, entry.timestamp, event]));
+  const nextFingerprint = (content && content.segments.length > 0) || entry.type === "context_edit"
+    ? hash(JSON.stringify(["pi-distill-conversation-branch-v1", conversationFingerprint, origin.sessionId, origin.entryId, identity, event]))
+    : conversationFingerprint;
+  return { identity, nextFingerprint };
 }
 
 function hash(value: string): string {
@@ -584,7 +572,7 @@ function isContent(value: unknown): boolean {
   return value.every((block) => isTextContentBlock(block) || isThinkingContentBlock(block) || isImageContentBlock(block) || isToolCallBlock(block));
 }
 
-function isContextEditableContent(role: string, value: unknown): boolean {
+export function isContextEditableContent(role: string, value: unknown): boolean {
   switch (role) {
     case "user":
       return isUserContent(value);

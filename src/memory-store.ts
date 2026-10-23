@@ -1,3 +1,4 @@
+import { SourceViews, SOURCE_VIEW_SCHEMAS } from "./source-view.ts";
 import { SourceIndex, SOURCE_INDEX_SCHEMAS } from "./source-index.ts";
 import { dirname, isAbsolute } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
@@ -228,7 +229,7 @@ const storeSchemasV7 = [...storeSchemas, ...[metadataGcSchema, ...storeIndexesV7
   return {name:match[2],sql};
 })];
 const storeSchemasV8 = [...storeSchemasV7, { name: "distill_failures", sql: distillFailuresSchema }];
-const latestSchemaVersion = 9;
+const latestSchemaVersion = 10;
 
 export interface SessionDeletion {
   readonly sessionFile: string;
@@ -837,7 +838,7 @@ function parsePersistedDistillTrigger(value: unknown, jobIds: readonly string[])
     (trigger.reason === "close" && (status === "candidate" || parsedCompactionId !== null)) ||
     (trigger.reason === "compact" && ((status === "candidate") !== (parsedCompactionId === null)))
   ) throw new TypeError("Stored compaction trigger confirmation state is inconsistent.");
-  if ((status === "candidate" || status === "pending") && jobIds.length !== 0) {
+  if (status === "candidate" && jobIds.length !== 0) {
     throw new TypeError("Unprepared distill trigger has associated batches.");
   }
   if (status === "prepared" && jobIds.length === 0) {
@@ -1238,6 +1239,8 @@ export class SQLiteMemoryStore {
   readonly #database: DatabaseSync;
   #sources: SourceRegistry | undefined;
   #sourceIndex: SourceIndex | undefined;
+  #sourceViews: SourceViews | undefined;
+  get sourceViews(): SourceViews { return this.#sourceViews ??= new SourceViews(this.#database, this.sourceIndex); }
   get sourceIndex(): SourceIndex { return this.#sourceIndex ??= new SourceIndex(this.#database); }
   get sources(): SourceRegistry { return this.#sources ??= new SourceRegistry(this.#database); }
   readonly #textDecoder: TextDecoder;
@@ -1677,6 +1680,72 @@ export class SQLiteMemoryStore {
         };
       }
       return undefined;
+    });
+  }
+
+  readSourcePreparation(triggerId: string, viewId: string): number {
+    validateText(triggerId, "trigger ID"); validateText(viewId, "source view ID");
+    const row = this.#database.prepare("SELECT cursor FROM source_preparation WHERE trigger_id=? AND view_id=?").get(triggerId, viewId);
+    if (!row) return 0;
+    const cursor = row["cursor"];
+    if (typeof cursor !== "number" || !Number.isSafeInteger(cursor) || cursor < 0) throw new TypeError("Invalid preparation cursor.");
+    return cursor;
+  }
+
+  pendingTriggerJob(triggerId: string): ConsolidationJob | undefined {
+    validateText(triggerId, "trigger ID");
+    const row = this.#database.prepare("SELECT jobs.id FROM consolidation_jobs jobs JOIN distill_trigger_jobs links ON links.job_id=jobs.id WHERE links.trigger_id=? AND jobs.status='pending' LIMIT 1").get(triggerId);
+    if (!row) return undefined;
+    const id = row["id"]; validateText(id, "pending job ID");
+    const job = this.#database.prepare(`SELECT ${jobColumns} FROM consolidation_jobs WHERE id=?`).get(id);
+    return job ? parsePersistedJobRow(this.#decodeRow(job)).job : undefined;
+  }
+
+  pendingJobForSource(key: string): ConsolidationJob | undefined {
+    validateText(key, "source key");
+    const row = this.#database.prepare(`SELECT ${jobColumns} FROM consolidation_jobs WHERE status='pending' AND EXISTS (SELECT 1 FROM json_each(job_json, '$.sourceKeys') WHERE value=?) LIMIT 1`).get(key);
+    return row ? parsePersistedJobRow(this.#decodeRow(row)).job : undefined;
+  }
+
+  /** Backpressure keeps one outstanding prepared page while the frozen source range stays open. */
+  prepareDistillPage(input: PrepareDistillTriggerInput & {
+    readonly viewId: string; readonly after: number; readonly cursor: number; readonly complete: boolean;
+  }): void {
+    const raw = fields(input, ["id", "claimToken", "now", "jobs", "viewId", "after", "cursor", "complete"]);
+    const request = parsePrepareDistillTriggerInput({ id: raw.id, claimToken: raw.claimToken, now: raw.now, jobs: raw.jobs });
+    const { viewId, after, cursor, complete } = raw;
+    validateText(viewId, "source view ID");
+    if (!/^[a-f0-9]{64}$/.test(viewId) || typeof after !== "number" || !Number.isSafeInteger(after) || after < 0 ||
+      typeof cursor !== "number" || !Number.isSafeInteger(cursor) || cursor < after || typeof complete !== "boolean" || request.jobs.length > 1) {
+      throw new TypeError("Invalid bounded source preparation page.");
+    }
+    this.#transaction(() => {
+      this.#assertCurrentDistillLease("trigger", request.id, request.claimToken, request.now);
+      const rawTrigger = this.#database.prepare(`SELECT ${triggerColumns} FROM distill_triggers WHERE id=?`).get(request.id);
+      if (!rawTrigger) throw new ConsolidationConflictError(request.id, "is missing");
+      const current = this.#readDistillTrigger(this.#decodeRow(rawTrigger));
+      if (current.status !== "pending" || this.pendingTriggerJob(request.id) || this.readSourcePreparation(request.id, viewId) !== after) {
+        throw new ConsolidationConflictError(request.id, "has changed preparation progress or outstanding work");
+      }
+      // Completed jobs retain their independent durable evidence; old page links are disposable.
+      if (request.jobs.length > 0 || !complete) this.#database.prepare("DELETE FROM distill_trigger_jobs WHERE trigger_id=?").run(request.id);
+      for (const job of request.jobs) {
+        if (job.sessionId !== current.trigger.sessionId || job.sessionFile !== current.trigger.sessionFile || job.leafId !== current.trigger.leafId || job.cwd !== current.trigger.cwd) {
+          throw new ConsolidationConflictError(job.id, "does not belong to the frozen trigger");
+        }
+        this.#enqueueConsolidationInTransaction(job);
+        const link = createHash("sha256").update(JSON.stringify([request.id, job.id])).digest("hex");
+        this.#database.prepare("INSERT OR IGNORE INTO distill_trigger_jobs VALUES (?, ?, ?, 0)").run(link, request.id, job.id);
+      }
+      this.#database.prepare("INSERT INTO source_preparation VALUES (?, ?, ?) ON CONFLICT(trigger_id) DO UPDATE SET view_id=excluded.view_id, cursor=excluded.cursor")
+        .run(request.id, viewId, cursor);
+      const hasJobs = this.#database.prepare("SELECT 1 FROM distill_trigger_jobs WHERE trigger_id=? LIMIT 1").get(request.id) !== undefined;
+      const status = complete ? (hasJobs ? "prepared" : "complete") : "pending";
+      this.#database.prepare("UPDATE distill_triggers SET status=?, retry_category=NULL, retry_at=NULL WHERE id=?").run(status, request.id);
+      this.#clearDistillFailure("trigger", request.id);
+      this.#clearDistillLease();
+      if (status === "prepared") this.#completeReadyTriggers([request.id]);
+      else if (status === "complete") this.#enqueueCleanTaskInTransaction({ sessionId: current.trigger.sessionId, sessionFile: current.trigger.sessionFile, leafId: current.trigger.leafId, cwd: current.trigger.cwd, reason: current.trigger.reason, intentId: current.trigger.id });
     });
   }
 
@@ -3304,7 +3373,7 @@ export class SQLiteMemoryStore {
 
   #initializeSchema(): void {
     const version = this.#database.prepare("PRAGMA user_version").get()?.["user_version"];
-    if (version !== 0 && version !== 1 && version !== 2 && version !== 3 && version !== 4 && version !== 5 && version !== 6 && version !== 7 && version !== 8 && version !== latestSchemaVersion) {
+    if (version !== 0 && version !== 1 && version !== 2 && version !== 3 && version !== 4 && version !== 5 && version !== 6 && version !== 7 && version !== 8 && version !== 9 && version !== latestSchemaVersion) {
       throw new Error("Unsupported memory database schema version: " + String(version) + ".");
     }
     if (version === latestSchemaVersion) {
@@ -3401,8 +3470,12 @@ export class SQLiteMemoryStore {
     }
     if (version <= 6) this.#migrateV6ToV7();
     if (version < 8) this.#migrateV7ToV8();
-    for (const schema of SOURCE_INDEX_SCHEMAS) this.#database.exec(schema.sql);
-    this.#database.exec("PRAGMA user_version = 9");
+    if (version < 9) {
+      for (const schema of SOURCE_INDEX_SCHEMAS) this.#database.exec(schema.sql);
+      this.#database.exec("PRAGMA user_version = 9");
+    }
+    for (const schema of SOURCE_VIEW_SCHEMAS) this.#database.exec(schema.sql);
+    this.#database.exec("PRAGMA user_version = 10");
     this.#validateLatestSchema();
     this.#validateAllRows();
     this.#sourceAccess();
@@ -3704,7 +3777,7 @@ export class SQLiteMemoryStore {
       ] });
     }
     const additional = typeof schemaVersion === "number" && schemaVersion >= 6
-      ? [...SOURCE_REGISTRY_SCHEMAS, ...(schemaVersion >= 9 ? SOURCE_INDEX_SCHEMAS : []), ...(usesV8Metadata ? storeSchemasV8 : usesV7Metadata ? storeSchemasV7 : storeSchemas)]
+      ? [...SOURCE_REGISTRY_SCHEMAS, ...(schemaVersion >= 9 ? SOURCE_INDEX_SCHEMAS : []), ...(schemaVersion >= 10 ? SOURCE_VIEW_SCHEMAS : []), ...(usesV8Metadata ? storeSchemasV8 : usesV7Metadata ? storeSchemasV7 : storeSchemas)]
       : [];
     const extraSchemas = new Map(additional.map(schema => [schema.name, schema.sql]));
     if (objects.length !== schemas.size + extraSchemas.size) throw new Error("Unsupported memory database schema.");

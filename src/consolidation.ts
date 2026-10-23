@@ -1,4 +1,5 @@
-import { scanSourcePage } from "./source-index.ts";
+import { readIndexedEntry } from "./source-index.ts";
+import { SourceWorkPending, type PagedSourceView } from "./source-view.ts";
 import { withSourceAccess } from "./source-access.ts";
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
@@ -83,6 +84,7 @@ export class ConsolidationCoordinator {
   #resolveDeferredKick: (() => void) | undefined;
   #idleRetryMs = INITIAL_IDLE_RETRY_MS;
   #closed = false;
+  #sourceWorkPending = false;
   #foregroundBusy = false;
   #compactionBusy = false;
   #recoveryNeeded = false;
@@ -266,17 +268,45 @@ export class ConsolidationCoordinator {
   }
 
   async #load(path: string, leaf?: string | null): Promise<SourceSnapshot> {
-    if (!this.#options.loadSnapshot) {
-      let indexed;
-      do {
-        if (this.#controller) await this.#waitUntilIdle(this.#controller.signal);
-        indexed = await withSourceAccess(this.#options.openStore,
-          () => scanSourcePage(path, this.#database().sourceIndex, this.#controller?.signal), this.#controller?.signal);
-        if (indexed.waitingForTail) throw new DistillFailure("source_invalid", "Source has an incomplete trailing record.");
-      } while (!indexed.complete);
+    if (this.#options.loadSnapshot) return withSourceAccess(this.#options.openStore,
+      () => this.#options.loadSnapshot!(path, leaf), this.#controller?.signal);
+    // A small source can finish its four phases in one pass; larger sources
+    // persist their cursor and yield to the host between bounded passes.
+    for (let page = 0; page < 4; page++) {
+      if (this.#controller) await this.#waitUntilIdle(this.#controller.signal);
+      const result = await withSourceAccess(this.#options.openStore,
+        () => this.#database().sourceViews.advance(path, leaf, this.#controller?.signal), this.#controller?.signal);
+      if (result.ready) {
+        const view = result.view, header = view.source.header;
+        if (!header) throw new DistillFailure("source_invalid", "Source header is unavailable.");
+        return { sessionId: header.id, sessionFile: resolve(path), cwd: header.cwd,
+          leafId: view.state.leafId, entries: [], indexed: view };
+      }
     }
-    return withSourceAccess(this.#options.openStore,
-      () => (this.#options.loadSnapshot ?? loadSnapshot)(path, leaf), this.#controller?.signal);
+    throw new SourceWorkPending();
+  }
+
+  async #compaction(trigger: DistillTrigger, signal: AbortSignal): Promise<string | undefined> {
+    if (this.#options.loadCompactionRecord) return withSourceAccess(this.#options.openStore,
+      () => this.#options.loadCompactionRecord!(trigger.sessionFile, trigger.sessionId, trigger.cwd, trigger.leafId), signal);
+    const snapshot = await this.#load(trigger.sessionFile, trigger.leafId);
+    assertSnapshotMatches(snapshot, trigger);
+    const view = snapshot.indexed;
+    if (!view) return withSourceAccess(this.#options.openStore,
+      () => findCompactionRecord(trigger.sessionFile, trigger.sessionId, trigger.cwd, trigger.leafId), signal);
+    return withSourceAccess(this.#options.openStore, async () => {
+      const source = view.source;
+      const row = view.owner.database.prepare("SELECT metadata FROM source_index_entries WHERE generation=? AND json_extract(metadata,'$.type')='compaction' AND json_extract(metadata,'$.parentId') IS ? ORDER BY seq LIMIT 1")
+        .get(source.generation, trigger.leafId);
+      if (!row || typeof row["metadata"] !== "string") return undefined;
+      const value: unknown = JSON.parse(row["metadata"]);
+      if (typeof value !== "object" || value === null || !("id" in value) || typeof value.id !== "string") throw new DistillFailure("source_invalid", "Invalid compaction metadata.");
+      const metadata = view.owner.index.entry(source.generation, value.id);
+      if (!metadata) return undefined;
+      const entry = await readIndexedEntry(source.path, source, metadata);
+      await view.unchanged();
+      return entry.type === "compaction" && entry.parentId === trigger.leafId ? entry.id : undefined;
+    }, signal);
   }
 
   #kick(): void {
@@ -416,7 +446,7 @@ export class ConsolidationCoordinator {
     this.#timer = setTimeout(() => {
       this.#timer = undefined;
       this.#kick();
-    }, this.#options.retryDelayMs ?? 30_000);
+    }, this.#options.retryDelayMs ?? (this.#sourceWorkPending ? 100 : 30_000));
     this.#timer.unref();
   }
 
@@ -448,6 +478,7 @@ export class ConsolidationCoordinator {
   }
 
   async #runPass(context: Context, signal: AbortSignal): Promise<void> {
+    this.#sourceWorkPending = false;
     if (this.#recoveryNeeded) {
       await this.#recover(signal);
       if (!this.#recoveryNeeded && !signal.aborted) this.observe(context);
@@ -502,8 +533,7 @@ export class ConsolidationCoordinator {
       if (!claim) { unresolved = true; continue; }
       this.#startClaim(store, claim.claimToken);
       try {
-        const compactionRecordId = await withSourceAccess(this.#options.openStore, () =>
-          (this.#options.loadCompactionRecord ?? findCompactionRecord)(trigger.sessionFile, trigger.sessionId, trigger.cwd, trigger.leafId), signal);
+        const compactionRecordId = await this.#compaction(trigger, signal);
         signal.throwIfAborted();
         if (!compactionRecordId) throw new DistillFailure("source_invalid", "A persisted compaction record is not available yet.");
         store.confirmCompactionTrigger({ id: trigger.id, compactionRecordId });
@@ -569,7 +599,7 @@ export class ConsolidationCoordinator {
       try {
         const latest = await this.#load(source.sessionFile);
         signal.throwIfAborted();
-        if (!isValidSourceSnapshot(latest) || latest.sessionId !== source.sessionId || latest.cwd !== source.cwd) {
+        if (!validSnapshot(latest) || latest.sessionId !== source.sessionId || latest.cwd !== source.cwd) {
           throw new DistillFailure("source_invalid", "Crash recovery source identity or coverage is unavailable.");
         }
         if (latest.leafId !== source.leafId) {
@@ -621,7 +651,11 @@ export class ConsolidationCoordinator {
         const trigger = claim.trigger;
         const snapshot = await this.#load(trigger.sessionFile, trigger.leafId);
         assertSnapshotMatches(snapshot, trigger);
-        if (!isValidSourceSnapshot(snapshot)) throw new DistillFailure("source_invalid", "The frozen source boundary failed validation or exceeds its bounded preparation budget.");
+        if (!validSnapshot(snapshot)) throw new DistillFailure("source_invalid", "The frozen source boundary failed validation or exceeds its bounded preparation budget.");
+        if (snapshot.indexed) {
+          await this.#prepareIndexed(snapshot.indexed, trigger, claim.claimToken, store, signal);
+          return true;
+        }
         const jobs = this.#prepareJobs(snapshot, trigger, store);
         store.prepareDistillTrigger({
           id: trigger.id,
@@ -640,6 +674,45 @@ export class ConsolidationCoordinator {
       }
     }
     return false;
+  }
+
+  async #prepareIndexed(view: PagedSourceView, trigger: DistillTrigger, token: string, store: SQLiteMemoryStore, signal: AbortSignal): Promise<void> {
+    if (store.pendingTriggerJob(trigger.id)) {
+      store.releaseDistillClaim({ claimToken: token, now: this.#now() });
+      this.#sourceWorkPending = true;
+      return;
+    }
+    const after = store.readSourcePreparation(trigger.id, view.id);
+    const page = await view.page(after);
+    const processed = new Set(store.processedSources(page.items.map(item => item.part.key)));
+    const evidence: SourcePart[] = [];
+    let cursor = after;
+    let reused: ConsolidationJob | undefined;
+    for (const item of page.items) {
+      signal.throwIfAborted();
+      if (processed.has(item.part.key)) { cursor = item.seq; continue; }
+      const pending = store.pendingJobForSource(item.part.key);
+      if (pending) {
+        if (pending.sessionId !== trigger.sessionId || pending.sessionFile !== trigger.sessionFile || pending.cwd !== trigger.cwd || pending.leafId !== trigger.leafId) {
+          throw new PendingSourceOverlapError("A queued batch overlaps a different frozen source boundary.");
+        }
+        if (evidence.length === 0) reused = pending;
+        break;
+      }
+      if (evidence.length > 0 && Buffer.byteLength(JSON.stringify([...evidence, item.part])) > SOURCE_EVIDENCE_BYTES) break;
+      evidence.push(item.part); cursor = item.seq;
+    }
+    const keys = evidence.map(part => part.key);
+    const jobs: ConsolidationJob[] = reused ? [reused] : evidence.length === 0 ? [] : [{
+      id: createHash("sha256").update(JSON.stringify([trigger.sessionId, trigger.leafId, keys])).digest("hex"),
+      sessionId: trigger.sessionId, sessionFile: trigger.sessionFile, cwd: trigger.cwd, leafId: trigger.leafId,
+      sourceKeys: keys, lineageSessionIds: view.lineageSessionIds, ...view.boundary(evidence),
+    }];
+    await view.unchanged(); signal.throwIfAborted();
+    const complete = !reused && page.nextCursor === undefined && cursor === (page.items.at(-1)?.seq ?? after);
+    store.prepareDistillPage({ id: trigger.id, claimToken: token, now: this.#now(), viewId: view.id, after, cursor, complete, jobs });
+    if (!complete) this.#sourceWorkPending = true;
+    if (complete && jobs.length === 0) this.#notifyProgress();
   }
 
   #prepareJobs(snapshot: SourceSnapshot, trigger: DistillTrigger, store: SQLiteMemoryStore): ConsolidationJob[] {
@@ -710,17 +783,20 @@ export class ConsolidationCoordinator {
       if (typeof sourceFile !== "string" || sourceFile.length === 0) throw new DistillFailure("source_invalid", "A durable source file is unavailable.");
       const snapshot = await this.#load(sourceFile, job.leafId);
       assertSnapshotMatches(snapshot, job);
-      if (!isValidSourceSnapshot(snapshot)) throw new DistillFailure("source_invalid", "The frozen source boundary failed validation or exceeds its bounded preparation budget.");
-      const all = planSources(snapshot, new Set());
-      const parts = new Map(all.flatMap(batch => batch.evidence).map(part => [part.key, part]));
-      const evidence = sourceKeys.map(key => {
+      if (!validSnapshot(snapshot)) throw new DistillFailure("source_invalid", "The frozen source boundary failed validation or exceeds its bounded preparation budget.");
+      const view = snapshot.indexed;
+      const currentParts = view ? [] : planSources(snapshot, new Set()).flatMap(batch => batch.evidence);
+      const parts = new Map(currentParts.map(part => [part.key, part]));
+      const evidence = view ? await view.readKeys(sourceKeys) : sourceKeys.map(key => {
         const part = parts.get(key);
         if (!part) throw new DistillFailure("source_invalid", "A frozen source reference changed after preparation.");
         return part;
       });
-      const currentParts = [...parts.values()];
-      const firstIndex = currentParts.findIndex(part => part.key === sourceKeys[0]);
-      const lineage = {
+      const firstPosition = view?.position(sourceKeys[0] ?? "");
+      const preceding = view && firstPosition !== undefined
+        ? (await view.page(Math.max(0, firstPosition - 129), Math.min(128, Math.max(1, firstPosition - 1)))).items.filter(item => item.seq < firstPosition).map(item => item.part)
+        : currentParts.slice(0, Math.max(0, currentParts.findIndex(part => part.key === sourceKeys[0])));
+      const lineage = view ? { lineageSessionIds: view.lineageSessionIds } : {
         lineageKeys: [...parts.keys()],
         lineageAnchors: snapshot.entries.flatMap(entry =>
           typeof entry === "object" && entry !== null && "id" in entry && typeof entry.id === "string"
@@ -745,7 +821,7 @@ export class ConsolidationCoordinator {
         if (fitsConsolidationRequest(first, context.model)) batch = first;
       }
       if (!batch) throw new DistillFailure("model_unavailable", "The selected model cannot fit one source part and the required consolidation request.");
-      for (const part of currentParts.slice(0, Math.max(0, firstIndex)).reverse()) {
+      for (const part of preceding.reverse()) {
         const interpretation = [part, ...batch.context];
         if (Buffer.byteLength(JSON.stringify(interpretation)) > CONTEXT_BYTES) break;
         const candidate: SourceBatch = { ...batch, context: interpretation };
@@ -756,9 +832,12 @@ export class ConsolidationCoordinator {
       signal.throwIfAborted();
       const run = this.#options.runModel ?? consolidateWithModel;
       const changes = await abortable(
-        run(batch, context, store, signal, { waitUntilIdle: requestSignal => this.#waitUntilIdle(requestSignal) }),
+        run(batch, context, store, signal, { waitUntilIdle: requestSignal => this.#waitUntilIdle(requestSignal),
+          ...(view ? { isSiblingOrigin: origin => view.isSibling(origin) } : {}) }),
         signal,
       );
+      signal.throwIfAborted();
+      await view?.unchanged();
       signal.throwIfAborted();
       store.commitConsolidation({ ...changes, jobId: job.id, owner: claimToken, now: this.#now(),
         sourceKeys: batch.sourceKeys, evidence: sourceBoundary(snapshot, batch.evidence) });
@@ -770,11 +849,12 @@ export class ConsolidationCoordinator {
 
   #releaseClaim(store: SQLiteMemoryStore, claimToken: string, error: unknown,
     context: DistillRetryContext, signal: AbortSignal): void {
+    if (error instanceof SourceWorkPending) this.#sourceWorkPending = true;
     try {
       store.releaseDistillClaim({
         claimToken,
         now: this.#now(),
-        ...(signal.aborted ? {} : { failure: {
+        ...(signal.aborted || error instanceof SourceWorkPending ? {} : { failure: {
           reason: error instanceof DistillFailure ? error.reason
             : error instanceof MemoryConflictError || error instanceof ConsolidationConflictError || error instanceof PendingSourceOverlapError
               ? "conflict" as const : "transient" as const,
@@ -816,6 +896,7 @@ function assertSnapshotMatches(snapshot: SourceSnapshot, reference: Pick<Distill
 }
 
 function triggerLineageSessionIds(snapshot: SourceSnapshot): string[] {
+  if (snapshot.indexed) return snapshot.indexed.lineageSessionIds;
   return [...new Set([
     snapshot.sessionId,
     ...Array.from(snapshot.ancestry?.origins.values() ?? [], origin => origin.sessionId),
@@ -833,6 +914,7 @@ function sourceBoundary(snapshot: SourceSnapshot, evidence: readonly SourcePart[
   sourceTime?: string;
   branchAnchor?: string;
 } {
+  if (snapshot.indexed) return snapshot.indexed.boundary(evidence);
   const ids = new Set(evidence.map(part => part.entryId));
   const times: string[] = [];
   let boundary: string | undefined;
@@ -873,4 +955,8 @@ function abortable<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
       error => { cleanup(); reject(error); },
     );
   });
+}
+
+function validSnapshot(snapshot: SourceSnapshot): boolean {
+  return snapshot.indexed !== undefined ? !snapshot.pending && snapshot.indexed.state.phase === "ready" : isValidSourceSnapshot(snapshot);
 }

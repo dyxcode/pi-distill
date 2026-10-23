@@ -518,13 +518,13 @@ test("opening a v7 database preserves memories and pending distillation work dur
   store.close();
 
   const raw = new DatabaseSync(f.path);
-  raw.exec("DROP TABLE source_index_entries; DROP TABLE source_index_files; DROP TABLE distill_failures; PRAGMA user_version = 7");
+  raw.exec("DROP TABLE source_view_parts; DROP TABLE source_view_edits; DROP TABLE source_view_entries; DROP TABLE source_preparation; DROP TABLE source_views; DROP TABLE source_index_entries; DROP TABLE source_index_files; DROP TABLE distill_failures; PRAGMA user_version = 7");
   raw.close();
 
   const migrated = f.open();
   const check = new DatabaseSync(f.path);
   try {
-    assert.equal(check.prepare("PRAGMA user_version").get().user_version, 9);
+    assert.equal(check.prepare("PRAGMA user_version").get().user_version, 10);
   } finally {
     check.close();
   }
