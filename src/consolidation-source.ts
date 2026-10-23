@@ -639,7 +639,7 @@ function consumeRawByteBudget(budget: AggregateBudget, byteCount: number): boole
   return true;
 }
 
-function boundedJsonBytes(value: unknown, limit: number): number | undefined {
+export function boundedJsonBytes(value: unknown, limit: number): number | undefined {
   if (!Number.isSafeInteger(limit) || limit < 0) return undefined;
   const active = new WeakSet<object>();
   const count = (current: unknown, remaining: number, depth: number, inArray: boolean): number | undefined => {
@@ -815,7 +815,7 @@ function applyContextEdits(entries: readonly SessionEntry[]): ReadonlyMap<string
   return result;
 }
 
-function validateSessionHeader(value: unknown): asserts value is SessionHeader {
+export function validateSessionHeader(value: unknown): asserts value is SessionHeader {
   if (!isRecord(value) || value.type !== "session") throw invalidSource("Session JSONL must start with a session header.");
   if (!validNonEmptyString(value.id, MAX_SESSION_ID_LENGTH)) throw invalidSource("Session header has an invalid id.");
   if (typeof value.timestamp !== "string" || value.timestamp.length === 0) throw invalidSource("Session header has an invalid timestamp.");
@@ -878,7 +878,7 @@ function parseSessionText(text: string, budget: AggregateBudget): ParsedSession 
   return { header: headerValue, entries, pending };
 }
 
-function validateEntryShape(value: unknown, lineNumber: number): asserts value is SessionEntry {
+export function validateEntryShape(value: unknown, lineNumber: number): asserts value is SessionEntry {
   const fail = (): never => {
     throw invalidSource(`Session JSONL record at line ${lineNumber} has an invalid ${isRecord(value) ? String(value.type) : "entry"} shape.`);
   };
@@ -1141,7 +1141,7 @@ function entryMaps(entries: readonly SessionEntry[], sessionId: string): Session
   return { header: { type: "session", id: sessionId, cwd: "", timestamp: "" }, entries, entriesById, signatures, origins, pending: false };
 }
 
-function stableJson(value: unknown): string {
+export function stableJson(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map((item) => stableJson(item)).join(",")}]`;
   if (isRecord(value)) {
     const keys = Object.keys(value).sort();

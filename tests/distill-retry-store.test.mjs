@@ -509,7 +509,7 @@ test("cancelling a failed unconfirmed candidate also removes its failure metadat
   assert.equal(store.readDistillTrigger(source.id), undefined);
 });
 
-test("opening a v7 database preserves memories and pending distillation work during the v8 migration", async t => {
+test("opening a v7 database preserves memories and pending distillation work during migration to the current schema", async t => {
   const f = await fixture(t);
   const store = f.open();
   const source = trigger("v7-pending");
@@ -518,13 +518,13 @@ test("opening a v7 database preserves memories and pending distillation work dur
   store.close();
 
   const raw = new DatabaseSync(f.path);
-  raw.exec("DROP TABLE distill_failures; PRAGMA user_version = 7");
+  raw.exec("DROP TABLE source_index_entries; DROP TABLE source_index_files; DROP TABLE distill_failures; PRAGMA user_version = 7");
   raw.close();
 
   const migrated = f.open();
   const check = new DatabaseSync(f.path);
   try {
-    assert.equal(check.prepare("PRAGMA user_version").get().user_version, 8);
+    assert.equal(check.prepare("PRAGMA user_version").get().user_version, 9);
   } finally {
     check.close();
   }

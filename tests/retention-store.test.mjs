@@ -59,7 +59,7 @@ test('v5 migration preserves pending work and memories while rebuilding source d
   DROP TABLE memory_origins; CREATE TABLE memory_origins (memory_id TEXT PRIMARY KEY NOT NULL, job_id TEXT NOT NULL, revision INTEGER NOT NULL) STRICT;
   DROP TABLE consolidation_progress; CREATE TABLE consolidation_progress (source_key TEXT PRIMARY KEY NOT NULL, job_id TEXT NOT NULL, processed_at INTEGER NOT NULL) STRICT;
   DROP TABLE session_deletions; CREATE TABLE session_deletions (session_file TEXT PRIMARY KEY NOT NULL, session_id TEXT NOT NULL, intent_id TEXT NOT NULL, file_version TEXT NOT NULL, state TEXT NOT NULL CHECK (state IN ('deleting', 'complete'))) STRICT;
-  DROP TABLE memory_evidence; DROP TABLE metadata_gc_state; DROP TABLE distill_failures;
+  DROP TABLE memory_evidence; DROP TABLE metadata_gc_state; DROP TABLE source_index_entries; DROP TABLE source_index_files; DROP TABLE distill_failures;
   DROP INDEX clean_source; DROP INDEX jobs_source_status; DROP INDEX observations_source;
   DROP INDEX triggers_source_status; DROP INDEX trigger_links_job; DROP INDEX usages_source;
   DROP INDEX managed_sources_header; DROP INDEX managed_sources_page; DROP INDEX managed_sources_parent;
@@ -97,7 +97,7 @@ test('v6 migration binds a completed deletion receipt to its existing source gen
   DROP TABLE memory_origins; CREATE TABLE memory_origins (memory_id TEXT PRIMARY KEY NOT NULL, job_id TEXT NOT NULL, revision INTEGER NOT NULL) STRICT;
   DROP TABLE consolidation_progress; CREATE TABLE consolidation_progress (source_key TEXT PRIMARY KEY NOT NULL, job_id TEXT NOT NULL, processed_at INTEGER NOT NULL) STRICT;
   DROP TABLE session_deletions; CREATE TABLE session_deletions (session_file TEXT PRIMARY KEY NOT NULL, session_id TEXT NOT NULL, intent_id TEXT NOT NULL, file_version TEXT NOT NULL, state TEXT NOT NULL CHECK (state IN ('deleting', 'complete'))) STRICT;
-  DROP TABLE memory_evidence; DROP TABLE metadata_gc_state; DROP TABLE distill_failures;
+  DROP TABLE memory_evidence; DROP TABLE metadata_gc_state; DROP TABLE source_index_entries; DROP TABLE source_index_files; DROP TABLE distill_failures;
   PRAGMA user_version = 6;
  `);
  const insert=raw.prepare('INSERT INTO session_deletions VALUES (?, ?, ?, ?, ?)');

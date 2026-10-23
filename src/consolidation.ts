@@ -1,3 +1,4 @@
+import { scanSourcePage } from "./source-index.ts";
 import { withSourceAccess } from "./source-access.ts";
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
@@ -264,8 +265,18 @@ export class ConsolidationCoordinator {
     return { ...source, id, reason };
   }
 
-  #load(path: string, leaf?: string | null): Promise<SourceSnapshot> {
-    return withSourceAccess(this.#options.openStore, () => (this.#options.loadSnapshot ?? loadSnapshot)(path, leaf), this.#controller?.signal);
+  async #load(path: string, leaf?: string | null): Promise<SourceSnapshot> {
+    if (!this.#options.loadSnapshot) {
+      let indexed;
+      do {
+        if (this.#controller) await this.#waitUntilIdle(this.#controller.signal);
+        indexed = await withSourceAccess(this.#options.openStore,
+          () => scanSourcePage(path, this.#database().sourceIndex, this.#controller?.signal), this.#controller?.signal);
+        if (indexed.waitingForTail) throw new DistillFailure("source_invalid", "Source has an incomplete trailing record.");
+      } while (!indexed.complete);
+    }
+    return withSourceAccess(this.#options.openStore,
+      () => (this.#options.loadSnapshot ?? loadSnapshot)(path, leaf), this.#controller?.signal);
   }
 
   #kick(): void {

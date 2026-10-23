@@ -140,7 +140,7 @@ function oldV6Schema(path) {
       ) STRICT;
       DROP TABLE memory_evidence;
       DROP TABLE metadata_gc_state;
-      DROP TABLE distill_failures;
+      DROP TABLE source_index_entries; DROP TABLE source_index_files; DROP TABLE distill_failures;
       DELETE FROM managed_sources WHERE row_id > 128;
       UPDATE source_registry_state SET backfill_complete = 0 WHERE singleton = 1;
       UPDATE source_registry_cursors SET cursor_row = NULL;
@@ -197,7 +197,7 @@ test(`v${legacyVersion} legacy source backfill resumes in bounded passes across 
   store = f.open();
   const version = new DatabaseSync(f.path);
   try {
-    assert.equal(version.prepare("PRAGMA user_version").get().user_version, 8);
+    assert.equal(version.prepare("PRAGMA user_version").get().user_version, 9);
   } finally {
     version.close();
   }

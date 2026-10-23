@@ -1,3 +1,4 @@
+import { SourceIndex, SOURCE_INDEX_SCHEMAS } from "./source-index.ts";
 import { dirname, isAbsolute } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { DatabaseSync, type StatementSync } from "node:sqlite";
@@ -227,7 +228,7 @@ const storeSchemasV7 = [...storeSchemas, ...[metadataGcSchema, ...storeIndexesV7
   return {name:match[2],sql};
 })];
 const storeSchemasV8 = [...storeSchemasV7, { name: "distill_failures", sql: distillFailuresSchema }];
-const latestSchemaVersion = 8;
+const latestSchemaVersion = 9;
 
 export interface SessionDeletion {
   readonly sessionFile: string;
@@ -1236,6 +1237,8 @@ function parseSearchRequest(value: unknown): MemorySearchRequest {
 export class SQLiteMemoryStore {
   readonly #database: DatabaseSync;
   #sources: SourceRegistry | undefined;
+  #sourceIndex: SourceIndex | undefined;
+  get sourceIndex(): SourceIndex { return this.#sourceIndex ??= new SourceIndex(this.#database); }
   get sources(): SourceRegistry { return this.#sources ??= new SourceRegistry(this.#database); }
   readonly #textDecoder: TextDecoder;
   readonly #select: StatementSync;
@@ -3301,7 +3304,7 @@ export class SQLiteMemoryStore {
 
   #initializeSchema(): void {
     const version = this.#database.prepare("PRAGMA user_version").get()?.["user_version"];
-    if (version !== 0 && version !== 1 && version !== 2 && version !== 3 && version !== 4 && version !== 5 && version !== 6 && version !== 7 && version !== latestSchemaVersion) {
+    if (version !== 0 && version !== 1 && version !== 2 && version !== 3 && version !== 4 && version !== 5 && version !== 6 && version !== 7 && version !== 8 && version !== latestSchemaVersion) {
       throw new Error("Unsupported memory database schema version: " + String(version) + ".");
     }
     if (version === latestSchemaVersion) {
@@ -3397,7 +3400,9 @@ export class SQLiteMemoryStore {
       initializeSourceRegistry(this.#database);
     }
     if (version <= 6) this.#migrateV6ToV7();
-    this.#migrateV7ToV8();
+    if (version < 8) this.#migrateV7ToV8();
+    for (const schema of SOURCE_INDEX_SCHEMAS) this.#database.exec(schema.sql);
+    this.#database.exec("PRAGMA user_version = 9");
     this.#validateLatestSchema();
     this.#validateAllRows();
     this.#sourceAccess();
@@ -3540,7 +3545,7 @@ export class SQLiteMemoryStore {
     ).all().map((row) => this.#decodeRow(row));
     const schemaVersion = this.#database.prepare("PRAGMA user_version").get()?.["user_version"];
     const usesV7Metadata = typeof schemaVersion === "number" && schemaVersion >= 7;
-    const usesV8Metadata = schemaVersion === 8;
+    const usesV8Metadata = typeof schemaVersion === "number" && schemaVersion >= 8;
     const schemas = new Map<string, { readonly sql: string; readonly columns: readonly SchemaColumn[] }>([
       ["memories", {
         sql: currentSchema,
@@ -3699,7 +3704,7 @@ export class SQLiteMemoryStore {
       ] });
     }
     const additional = typeof schemaVersion === "number" && schemaVersion >= 6
-      ? [...SOURCE_REGISTRY_SCHEMAS, ...(usesV8Metadata ? storeSchemasV8 : usesV7Metadata ? storeSchemasV7 : storeSchemas)]
+      ? [...SOURCE_REGISTRY_SCHEMAS, ...(schemaVersion >= 9 ? SOURCE_INDEX_SCHEMAS : []), ...(usesV8Metadata ? storeSchemasV8 : usesV7Metadata ? storeSchemasV7 : storeSchemas)]
       : [];
     const extraSchemas = new Map(additional.map(schema => [schema.name, schema.sql]));
     if (objects.length !== schemas.size + extraSchemas.size) throw new Error("Unsupported memory database schema.");
@@ -3822,7 +3827,7 @@ export class SQLiteMemoryStore {
             }
           }
         }
-        if (schemaVersion === 8) {
+        if (typeof schemaVersion === "number" && schemaVersion >= 8) {
           for (const raw of this.#database.prepare(`SELECT ${distillFailureColumns} FROM distill_failures`).iterate()) {
             const failure = this.#parseDistillFailureRow(raw);
             const status = failure.kind === "job"

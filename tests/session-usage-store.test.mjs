@@ -389,7 +389,7 @@ test("schema v2 migration preserves memories, jobs, progress, origins and observ
 
   const verify = database(f.path);
   try {
-    assert.equal(verify.prepare("PRAGMA user_version").get()["user_version"], 8);
+    assert.equal(verify.prepare("PRAGMA user_version").get()["user_version"], 9);
     assert.deepEqual(verify.prepare("SELECT name FROM sqlite_schema WHERE name = 'session_usages'").all()
       .map(row => row["name"]), ["session_usages"]);
   } finally {
@@ -481,6 +481,7 @@ function restoreV2Schema(db, legacy = {}) {
     insertProgress.run(progress.sourceKey, progress.jobId, progress.processedAt);
   }
   db.exec(`
+    DROP TABLE source_index_entries; DROP TABLE source_index_files;
     DROP TABLE source_access;
     DROP TABLE session_deletions;
     DROP TABLE session_usages;

@@ -316,7 +316,7 @@ test("legacy consolidation completion enqueues cleanup and v3 migration preserve
 
   const store = f.open();
   const version = new DatabaseSync(f.path);
-  assert.equal(version.prepare("PRAGMA user_version").get().user_version, 8);
+  assert.equal(version.prepare("PRAGMA user_version").get().user_version, 9);
   version.close();
   assert.equal(store.get("legacy-memory").content, "Preserved memory");
   assert.deepEqual(store.memoryOrigin("legacy-memory").sourceKeys, completed.sourceKeys);
