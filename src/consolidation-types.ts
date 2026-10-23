@@ -41,9 +41,16 @@ export interface ConsolidationChanges {
   readonly deletes: readonly MemoryForget[];
 }
 
+/** Source boundary attached to one successfully committed evidence prefix. */
+export interface ConsolidationEvidenceBoundary {
+  readonly sourceTime?: string;
+  readonly branchAnchor?: string;
+}
+
 export interface ConsolidationCommit extends ConsolidationChanges {
   readonly jobId: string;
   readonly owner: string;
   readonly now: number;
   readonly sourceKeys?: readonly string[];
+  readonly evidence?: ConsolidationEvidenceBoundary;
 }

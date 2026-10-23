@@ -7,6 +7,7 @@ import { buildSessionProjection, SessionManager } from '@earendil-works/pi-codin
 import { fauxAssistantMessage, fauxToolCall } from '@earendil-works/pi-ai';
 import { SQLiteMemoryStore } from '../src/memory-store.ts';
 import { ConsolidationCoordinator } from '../src/consolidation.ts';
+import { fitsConsolidationRequest } from '../src/consolidation-model.ts';
 
 const stamp = '2026-10-21T00:00:00.000Z';
 function snapshot(root, suffix = '') {
@@ -16,7 +17,7 @@ function snapshot(root, suffix = '') {
   ] };
 }
 function context(s) {
-  return { model: { id: 'synthetic' }, modelRegistry: {}, sessionManager: {
+  return { model: { id: 'synthetic', contextWindow: 128_000, maxTokens: 4_096 }, modelRegistry: {}, sessionManager: {
     getSessionId: () => s.sessionId, getSessionFile: () => s.sessionFile, getCwd: () => s.cwd,
     getLeafId: () => s.leafId, getEntries: () => s.entries, getHeader: () => ({type:'session',id:s.sessionId,cwd:s.cwd,timestamp:stamp}),
     getBranch: () => s.entries, buildSessionProjection: () => buildSessionProjection(s.entries,s.leafId),
@@ -123,8 +124,10 @@ test('a provider that ignores cancellation cannot write after immediate shutdown
 });
 test('large conversation content is processed in bounded pieces without marking omitted text complete',async t=>{
  const seen=new Map();
- const f=await fixture(t,async batch=>{
-   assert.ok(Buffer.byteLength(JSON.stringify(batch.evidence))+Buffer.byteLength(JSON.stringify(batch.context))<25000);
+ const f=await fixture(t,async (batch,ctx)=>{
+   assert.equal(fitsConsolidationRequest(batch,ctx.model),true);
+   assert.ok(Buffer.byteLength(JSON.stringify(batch.evidence))<=24*1024);
+   assert.ok(Buffer.byteLength(JSON.stringify(batch.context))<=8*1024);
    for(const part of batch.evidence)seen.set(part.key,part.text);
    return {creates:[],updates:[],deletes:[]};
  });

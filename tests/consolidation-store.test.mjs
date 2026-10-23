@@ -412,11 +412,16 @@ test("source subset fencing lets a later batch process only entries that remain"
   const alreadyProcessed = job("fully-covered", { sourceKeys: ["shared"] });
   secondStore.enqueueConsolidation(alreadyProcessed);
   secondStore.claimConsolidation(alreadyProcessed.id, "worker-c", 100, 50);
-  assert.equal(secondStore.commitConsolidation(commit(alreadyProcessed.id, "worker-c", {
+  const droppedMutation = commit(alreadyProcessed.id, "worker-c", {
     sourceKeys: [],
     creates: [memory("first-memory")],
-  })), false);
+  });
+  assert.throws(() => secondStore.commitConsolidation(droppedMutation), ConsolidationConflictError);
   assert.equal(secondStore.get("first-memory"), undefined);
+  assert.deepEqual(secondStore.listConsolidationJobs(), [alreadyProcessed]);
+  assert.equal(secondStore.commitConsolidation(commit(alreadyProcessed.id, "worker-c", {
+    sourceKeys: [],
+  })), false);
   assert.deepEqual(secondStore.listConsolidationJobs(), []);
 });
 
@@ -484,7 +489,7 @@ test("a failed SQLite COMMIT rolls back memory writes, progress, and job complet
   }
 });
 
-test("v6 migration preserves a current origin and deletion receipt for an already cleaned source", async (t) => {
+test("v6 migration preserves shared current origins and the deletion receipt for an already cleaned source", async (t) => {
   const f = await fixture(t);
   const store = f.open();
   const source = job("deleted-origin-source", {
@@ -497,9 +502,10 @@ test("v6 migration preserves a current origin and deletion receipt for an alread
     branchAnchor: "b".repeat(64),
   });
   const created = memory("origin-survives-v6-migration");
+  const shared = memory("shared-origin-survives-v6-migration");
   store.enqueueConsolidation(source);
   assert.equal(store.claimConsolidation(source.id, "origin-worker", 100, 100), true);
-  assert.equal(store.commitConsolidation(commit(source.id, "origin-worker", { creates: [created] })), true);
+  assert.equal(store.commitConsolidation(commit(source.id, "origin-worker", { creates: [created, shared] })), true);
 
   const expectedMemory = { ...created, revision: 1, updatedAt: created.createdAt };
   const expectedOrigin = {
@@ -540,7 +546,7 @@ test("v6 migration preserves a current origin and deletion receipt for an alread
   try {
     legacy.exec("PRAGMA foreign_keys = OFF");
     const origins = legacy.prepare(
-      "SELECT memory_id, evidence_id, revision FROM memory_origins ORDER BY rowid",
+      "SELECT memory_id, revision FROM memory_origins ORDER BY rowid",
     ).all();
     const progress = legacy.prepare(
       "SELECT source_key, processed_at FROM consolidation_progress ORDER BY source_key",
@@ -549,7 +555,8 @@ test("v6 migration preserves a current origin and deletion receipt for an alread
       "SELECT session_file, session_id, intent_id, file_version, state FROM session_deletions ORDER BY rowid",
     ).all();
     assert.deepEqual(origins.map(row => ({ ...row })), [
-      { memory_id: created.id, evidence_id: source.id, revision: 1 },
+      { memory_id: created.id, revision: 1 },
+      { memory_id: shared.id, revision: 1 },
     ]);
     assert.deepEqual(progress.map(row => row.source_key), source.sourceKeys);
     expectedProgress = progress.map(row => ({ source_key: row.source_key, processed_at: row.processed_at }));
@@ -583,7 +590,7 @@ test("v6 migration preserves a current origin and deletion receipt for an alread
       DROP TABLE distill_failures;
     `);
     const insertOrigin = legacy.prepare("INSERT INTO memory_origins VALUES (?, ?, ?)");
-    for (const origin of origins) insertOrigin.run(origin.memory_id, origin.evidence_id, origin.revision);
+    for (const origin of origins) insertOrigin.run(origin.memory_id, source.id, origin.revision);
     const insertProgress = legacy.prepare("INSERT INTO consolidation_progress VALUES (?, ?, ?)");
     for (const row of progress) insertProgress.run(row.source_key, source.id, row.processed_at);
     const insertReceipt = legacy.prepare("INSERT INTO session_deletions VALUES (?, ?, ?, ?, ?)");
@@ -598,6 +605,8 @@ test("v6 migration preserves a current origin and deletion receipt for an alread
   const upgraded = f.open();
   assert.deepEqual(upgraded.get(created.id), expectedMemory);
   assert.deepEqual(upgraded.memoryOrigin(created.id), expectedOrigin);
+  assert.deepEqual(upgraded.get(shared.id), { ...shared, revision: 1, updatedAt: shared.createdAt });
+  assert.deepEqual(upgraded.memoryOrigin(shared.id), expectedOrigin);
   assert.equal(upgraded.getDeletion(source.sessionFile)?.state, "complete");
   assert.equal(upgraded.getDeletion(source.sessionFile)?.sourceGeneration, expectedGeneration);
   assert.equal(upgraded.sources.get(source.sessionFile, source.sessionId)?.generation, expectedGeneration);
@@ -608,16 +617,17 @@ test("v6 migration preserves a current origin and deletion receipt for an alread
   try {
     assert.equal(migrated.prepare("PRAGMA user_version").get().user_version, 8);
     assert.deepEqual(migrated.prepare(
-      "SELECT memory_id, evidence_id, revision FROM memory_origins",
+      "SELECT o.memory_id AS memory_id, e.session_id AS session_id, e.source_keys AS source_keys " +
+      "FROM memory_origins AS o JOIN memory_evidence AS e ON e.evidence_id = o.evidence_id ORDER BY o.rowid",
     ).all().map(row => ({ ...row })), [
-      { memory_id: created.id, evidence_id: source.id, revision: 1 },
+      { memory_id: created.id, session_id: source.sessionId, source_keys: JSON.stringify(source.sourceKeys) },
+      { memory_id: shared.id, session_id: source.sessionId, source_keys: JSON.stringify(source.sourceKeys) },
     ]);
     const evidence = migrated.prepare(
-      "SELECT evidence_id, session_id, session_file, source_generation, cwd, leaf_id, source_keys, " +
-      "lineage_session_ids, source_time, branch_anchor FROM memory_evidence WHERE evidence_id = ?",
-    ).get(source.id);
+      "SELECT session_id, session_file, source_generation, cwd, leaf_id, source_keys, " +
+      "lineage_session_ids, source_time, branch_anchor FROM memory_evidence WHERE source_keys = ?",
+    ).get(JSON.stringify(source.sourceKeys));
     assert.deepEqual({ ...evidence }, {
-      evidence_id: source.id,
       session_id: source.sessionId,
       session_file: source.sessionFile,
       source_generation: expectedGeneration,

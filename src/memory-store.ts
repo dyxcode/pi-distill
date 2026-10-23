@@ -4,6 +4,7 @@ import { DatabaseSync, type StatementSync } from "node:sqlite";
 import { SourceRegistry, initializeSourceRegistry, SOURCE_REGISTRY_SCHEMAS } from "./source-registry.ts";
 import type {
   ConsolidationCommit,
+  ConsolidationEvidenceBoundary,
   ConsolidationJob,
   SessionObservation,
 } from "./consolidation-types.js";
@@ -672,7 +673,7 @@ function validateNow(value: unknown, field: string): asserts value is number {
 
 function parseConsolidationCommit(value: unknown): ConsolidationCommit {
   const required = ["jobId", "owner", "now", "creates", "updates", "deletes"];
-  const allowed = [...required, "sourceKeys"];
+  const allowed = [...required, "sourceKeys", "evidence"];
   if (
     !isRecord(value) ||
     Reflect.ownKeys(value).some((key) => typeof key !== "string" || !allowed.includes(key)) ||
@@ -717,9 +718,26 @@ function parseConsolidationCommit(value: unknown): ConsolidationCommit {
     updates: readonly MemoryUpdate[];
     deletes: readonly MemoryForget[];
     sourceKeys?: readonly string[];
+    evidence?: ConsolidationEvidenceBoundary;
   } = { jobId, owner, now, creates: parsedCreates, updates: parsedUpdates, deletes: parsedDeletes };
   if (Object.hasOwn(value, "sourceKeys")) {
     parsed.sourceKeys = parseSourceKeys(value["sourceKeys"], "consolidation commit source keys", true);
+  }
+  if (Object.hasOwn(value, "evidence")) {
+    const evidence = value["evidence"];
+    if (!isRecord(evidence) || Reflect.ownKeys(evidence).some(
+      key => typeof key !== "string" || !["sourceTime", "branchAnchor"].includes(key),
+    )) throw new TypeError("Consolidation evidence must contain only sourceTime and branchAnchor.");
+    const parsedEvidence: { sourceTime?: string; branchAnchor?: string } = {};
+    if (Object.hasOwn(evidence, "sourceTime")) {
+      validateTimestamp(evidence["sourceTime"], "consolidation evidence source time");
+      parsedEvidence.sourceTime = evidence["sourceTime"];
+    }
+    if (Object.hasOwn(evidence, "branchAnchor")) {
+      validateText(evidence["branchAnchor"], "consolidation evidence branch anchor");
+      parsedEvidence.branchAnchor = evidence["branchAnchor"];
+    }
+    parsed.evidence = parsedEvidence;
   }
   return parsed;
 }
@@ -2121,13 +2139,14 @@ export class SQLiteMemoryStore {
       }
       const remaining = current.job.sourceKeys.filter((key) => !processed.has(key));
       const requestedSources = request.sourceKeys ?? remaining;
-      if (
-        requestedSources.length !== remaining.length ||
-        requestedSources.some((key, index) => key !== remaining[index])
-      ) {
-        throw new ConsolidationConflictError(request.jobId, "source set changed after the batch was prepared");
-      }
       if (remaining.length === 0) {
+        if (requestedSources.length !== 0) {
+          throw new ConsolidationConflictError(request.jobId, "source set changed after the batch was prepared");
+        }
+        if (request.creates.length > 0 || request.updates.length > 0 || request.deletes.length > 0 ||
+          request.evidence !== undefined) {
+          throw new ConsolidationConflictError(request.jobId, "has no remaining source keys for memory changes");
+        }
         const completion = this.#database.prepare(
           "UPDATE consolidation_jobs SET status = 'complete', lease_owner = NULL, lease_until = NULL, " +
           "retry_category = NULL, retry_at = NULL " +
@@ -2140,10 +2159,22 @@ export class SQLiteMemoryStore {
         this.#finishConsolidationJob(current.job, request.owner);
         return false;
       }
-
-      if (request.creates.length > 0 || request.updates.length > 0) {
-        this.#persistMemoryEvidence(current.job);
+      if (
+        requestedSources.length === 0 ||
+        requestedSources.length > remaining.length ||
+        requestedSources.some((key, index) => key !== remaining[index])
+      ) {
+        throw new ConsolidationConflictError(request.jobId, "source set changed after the batch was prepared");
       }
+      if (requestedSources.length < remaining.length && request.evidence === undefined) {
+        throw new ConsolidationConflictError(request.jobId, "partial source progress requires an evidence boundary");
+      }
+
+      const evidence = this.#persistMemoryEvidence(
+        current.job,
+        requestedSources,
+        request.evidence ?? current.job,
+      );
 
       for (const record of request.creates) {
         const existing = this.get(record.id);
@@ -2155,7 +2186,7 @@ export class SQLiteMemoryStore {
         } else {
           revision = existing.revision;
         }
-        this.#upsertOrigin.run(record.id, request.jobId, revision);
+        this.#upsertOrigin.run(record.id, evidence.evidenceId, revision);
       }
       for (const update of request.updates) {
         const existing = this.get(update.id);
@@ -2166,13 +2197,13 @@ export class SQLiteMemoryStore {
             existing.content === update.content &&
             existing.updatedAt === update.updatedAt
           ) {
-            this.#upsertOrigin.run(update.id, request.jobId, existing.revision);
+            this.#upsertOrigin.run(update.id, evidence.evidenceId, existing.revision);
             continue;
           }
           throw new MemoryConflictError(update.id);
         }
         if (existing.content === update.content) {
-          this.#upsertOrigin.run(update.id, request.jobId, existing.revision);
+          this.#upsertOrigin.run(update.id, evidence.evidenceId, existing.revision);
           continue;
         }
         if (existing.revision === Number.MAX_SAFE_INTEGER) {
@@ -2185,7 +2216,7 @@ export class SQLiteMemoryStore {
           update.updatedAt,
           existing.id,
         );
-        this.#upsertOrigin.run(update.id, request.jobId, revision);
+        this.#upsertOrigin.run(update.id, evidence.evidenceId, revision);
       }
       for (const removal of request.deletes) {
         const existing = this.get(removal.id);
@@ -2203,17 +2234,24 @@ export class SQLiteMemoryStore {
       const insertProgress = this.#database.prepare(
         "INSERT INTO consolidation_progress (source_key, processed_at) VALUES (?, ?)",
       );
-      for (const key of remaining) insertProgress.run(key, request.now);
-      const completion = this.#database.prepare(
-        "UPDATE consolidation_jobs SET status = 'complete', lease_owner = NULL, lease_until = NULL, " +
-        "retry_category = NULL, retry_at = NULL " +
-        "WHERE id = ? AND status = 'pending'",
-      ).run(request.jobId);
-      if (completion.changes !== 1) {
-        throw new ConsolidationConflictError(request.jobId, "changed before completion");
+      for (const key of requestedSources) insertProgress.run(key, request.now);
+      const finalPrefix = requestedSources.length === remaining.length;
+      const jobUpdate = finalPrefix
+        ? this.#database.prepare(
+          "UPDATE consolidation_jobs SET status = 'complete', lease_owner = NULL, lease_until = NULL, " +
+          "retry_category = NULL, retry_at = NULL " +
+          "WHERE id = ? AND status = 'pending' AND lease_owner = ? AND lease_until > ?",
+        ).run(request.jobId, request.owner, request.now)
+        : this.#database.prepare(
+          "UPDATE consolidation_jobs SET lease_owner = NULL, lease_until = NULL, retry_category = NULL, retry_at = NULL " +
+          "WHERE id = ? AND status = 'pending' AND lease_owner = ? AND lease_until > ?",
+        ).run(request.jobId, request.owner, request.now);
+      if (jobUpdate.changes !== 1) {
+        throw new ConsolidationConflictError(request.jobId, "changed before prefix progress was committed");
       }
       this.#clearDistillFailure("job", request.jobId);
-      this.#finishConsolidationJob(current.job, request.owner);
+      if (finalPrefix) this.#finishConsolidationJob(current.job, request.owner);
+      else this.#clearDistillLease();
       return true;
     });
   }
@@ -2393,7 +2431,12 @@ export class SQLiteMemoryStore {
     }
   }
 
-  #persistMemoryEvidence(job: ConsolidationJob, allowDeletedSource = false): void {
+  #persistMemoryEvidence(
+    job: ConsolidationJob,
+    sourceKeys: readonly string[] = job.sourceKeys,
+    boundary: ConsolidationEvidenceBoundary = job,
+    allowDeletedSource = false,
+  ): MemoryEvidence {
     if (job.sessionFile !== null && !allowDeletedSource) {
       this.#assertSourceEnqueueAllowed(job.sessionId, job.sessionFile, job.cwd);
     }
@@ -2411,27 +2454,35 @@ export class SQLiteMemoryStore {
       throw new ConsolidationConflictError(job.id, "belongs to a deleted source generation");
     }
     const evidence: MemoryEvidence = {
-      evidenceId: job.id,
+      evidenceId: createHash("sha256").update(JSON.stringify([
+        job.id,
+        source?.generation ?? null,
+        sourceKeys,
+        boundary.sourceTime ?? null,
+        boundary.branchAnchor ?? null,
+      ])).digest("hex"),
       sessionId: job.sessionId,
       sessionFile: job.sessionFile,
       sourceGeneration: source?.generation ?? null,
       cwd: job.cwd,
       leafId: job.leafId,
-      sourceKeys: job.sourceKeys,
+      sourceKeys: [...sourceKeys],
       ...(job.lineageSessionIds === undefined ? {} : { lineageSessionIds: job.lineageSessionIds }),
-      ...(job.sourceTime === undefined ? {} : { sourceTime: job.sourceTime }),
-      ...(job.branchAnchor === undefined ? {} : { branchAnchor: job.branchAnchor }),
+      ...(boundary.sourceTime === undefined ? {} : { sourceTime: boundary.sourceTime }),
+      ...(boundary.branchAnchor === undefined ? {} : { branchAnchor: boundary.branchAnchor }),
     };
     if ((evidence.sessionFile === null) !== (evidence.sourceGeneration === null)) {
       throw new ConsolidationConflictError(job.id, "has no stable source generation for memory provenance");
     }
-    const raw = this.#database.prepare(`SELECT ${evidenceColumns} FROM memory_evidence WHERE evidence_id = ?`).get(job.id);
+    const raw = this.#database.prepare(
+      `SELECT ${evidenceColumns} FROM memory_evidence WHERE evidence_id = ?`,
+    ).get(evidence.evidenceId);
     if (raw !== undefined) {
       const stored = parseEvidenceRow(this.#decodeRow(raw));
       if (JSON.stringify(stored) !== JSON.stringify(evidence)) {
         throw new ConsolidationConflictError(job.id, "already has different immutable memory provenance");
       }
-      return;
+      return stored;
     }
     this.#database.prepare(
       "INSERT INTO memory_evidence " +
@@ -2449,6 +2500,7 @@ export class SQLiteMemoryStore {
       evidence.sourceTime ?? null,
       evidence.branchAnchor ?? null,
     );
+    return evidence;
   }
 
   /** The live Pi manager supplies the header before a new file has been written. */
@@ -3382,8 +3434,8 @@ export class SQLiteMemoryStore {
       originsToMigrate.push({memoryId:origin.memoryId, job:job.job, revision:origin.revision});
     }
     for (const origin of originsToMigrate) {
-      this.#persistMemoryEvidence(origin.job, true);
-      insertOrigin.run(origin.memoryId, origin.job.id, origin.revision);
+      const evidence = this.#persistMemoryEvidence(origin.job, origin.job.sourceKeys, origin.job, true);
+      insertOrigin.run(origin.memoryId, evidence.evidenceId, origin.revision);
     }
 
     const progressRows = this.#database.prepare(

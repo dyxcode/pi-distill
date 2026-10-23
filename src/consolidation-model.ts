@@ -95,6 +95,15 @@ export interface ConsolidationModelOptions {
   readonly waitUntilIdle?: (signal: AbortSignal) => Promise<void>;
 }
 
+interface PreparedConsolidationRequest {
+  readonly model: NonNullable<ExtensionContext["model"]>;
+  readonly validatedBatch: ValidatedBatch;
+  readonly evidenceKeys: Set<string>;
+  readonly request: ModelRequestContext;
+  readonly initialInputBytes: number;
+  readonly contextByteLimit: number;
+}
+
 function isRecord(value: unknown): value is RecordValue {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -237,6 +246,87 @@ function validateBatch(batch: SourceBatch): ValidatedBatch {
       lineageAnchors: parseUniqueTextList(batch.lineageAnchors, "Source lineage entry anchor"),
     }),
   };
+}
+
+function validateConsolidationModel(
+  model: ExtensionContext["model"],
+): NonNullable<ExtensionContext["model"]> {
+  if (typeof model !== "object" || model === null) {
+    throw new ConsolidationError("No Pi chat model is selected for consolidation.", "model_unavailable");
+  }
+  if (!Number.isSafeInteger(model.contextWindow) || model.contextWindow <= CONTEXT_OUTPUT_RESERVE) {
+    throw new ConsolidationError("The selected model context window is too small for consolidation.", "model_unavailable");
+  }
+  if (!Number.isSafeInteger(model.maxTokens) || model.maxTokens < 1) {
+    throw new ConsolidationError("The selected model has an invalid output limit.", "model_unavailable");
+  }
+  return model;
+}
+
+function serializeRequest(request: ModelRequestContext): string {
+  try {
+    return JSON.stringify(request);
+  } catch {
+    throw new ConsolidationError("The model input could not be serialized.", "source_invalid");
+  }
+}
+
+function prepareConsolidationRequest(
+  batch: SourceBatch,
+  selectedModel: ExtensionContext["model"],
+): PreparedConsolidationRequest {
+  const model = validateConsolidationModel(selectedModel);
+  if (!isRecord(batch)) {
+    throw new ConsolidationError("Source batch must be an object.", "source_invalid");
+  }
+  const validatedBatch = validateBatch(batch);
+
+  // Model citations are request-local; durable source identities stay on batch.
+  const reservedKeys = new Set([...batch.evidence, ...batch.context].map(part => part.key));
+  let reference = 0;
+  const evidence = batch.evidence.map(part => {
+    if (part.key.length <= 16) return part;
+    let key: string;
+    do { key = `e${++reference}`; } while (reservedKeys.has(key));
+    reservedKeys.add(key);
+    return { ...part, key };
+  });
+  const evidenceKeys = new Set(evidence.map(part => part.key));
+  let sourceMessage: string;
+  try {
+    sourceMessage = JSON.stringify({
+      project: batch.cwd,
+      sourceTime: batch.sourceTime,
+      newEvidence: evidence,
+      interpretationContext: batch.context,
+    });
+  } catch {
+    throw new ConsolidationError("The source batch could not be serialized.", "source_invalid");
+  }
+  const timestamp = validatedBatch.sourceTime === undefined ? 0 : Date.parse(validatedBatch.sourceTime);
+  const messages: Message[] = [{ role: "user", content: sourceMessage, timestamp }];
+  const request: ModelRequestContext = { systemPrompt, messages, tools };
+  const initialInputBytes = Buffer.byteLength(serializeRequest(request), "utf8");
+  return {
+    model,
+    validatedBatch,
+    evidenceKeys,
+    request,
+    initialInputBytes,
+    contextByteLimit: Math.min(MAX_INPUT_BYTES, model.contextWindow - CONTEXT_OUTPUT_RESERVE),
+  };
+}
+
+/**
+ * Check whether one validated initial consolidation request fits the selected model's bounded input allowance.
+ * This uses the same request construction and serialized-byte limit as execution and never contacts the provider.
+ */
+export function fitsConsolidationRequest(
+  batch: SourceBatch,
+  model: ExtensionContext["model"],
+): boolean {
+  const prepared = prepareConsolidationRequest(batch, model);
+  return prepared.initialInputBytes <= prepared.contextByteLimit;
 }
 
 function parseToolCall(value: unknown): ToolCall {
@@ -546,38 +636,9 @@ export async function consolidateWithModel(
   signal: AbortSignal,
   options: ConsolidationModelOptions = {},
 ): Promise<ConsolidationChanges> {
-  const model = context.model;
-  if (model === undefined) {
-    throw new ConsolidationError("No Pi chat model is selected for consolidation.", "model_unavailable");
-  }
-  if (!Number.isSafeInteger(model.contextWindow) || model.contextWindow <= CONTEXT_OUTPUT_RESERVE) {
-    throw new ConsolidationError("The selected model context window is too small for consolidation.", "model_unavailable");
-  }
-  if (!Number.isSafeInteger(model.maxTokens) || model.maxTokens < 1) {
-    throw new ConsolidationError("The selected model has an invalid output limit.", "model_unavailable");
-  }
-
-  const validatedBatch = validateBatch(batch);
-  // Model citations are request-local; durable source identities stay on batch.
-  const reservedKeys = new Set([...batch.evidence, ...batch.context].map(part => part.key));
-  let reference = 0;
-  const evidence = batch.evidence.map(part => {
-    if (part.key.length <= 16) return part;
-    let key: string;
-    do { key = `e${++reference}`; } while (reservedKeys.has(key));
-    reservedKeys.add(key);
-    return { ...part, key };
-  });
-  const evidenceKeys = new Set(evidence.map(part => part.key));
-  const sourceMessage = JSON.stringify({
-    project: batch.cwd,
-    sourceTime: batch.sourceTime,
-    newEvidence: evidence,
-    interpretationContext: batch.context,
-  });
-  const messages: Message[] = [{ role: "user", content: sourceMessage, timestamp: Date.now() }];
-  const modelRequest: ModelRequestContext = { systemPrompt, messages, tools };
-  const contextByteLimit = Math.min(MAX_INPUT_BYTES, model.contextWindow - CONTEXT_OUTPUT_RESERVE);
+  const prepared = prepareConsolidationRequest(batch, context.model);
+  const { model, validatedBatch, evidenceKeys, request: modelRequest, contextByteLimit } = prepared;
+  const messages = modelRequest.messages;
   const memoryTools = new MemoryTools(() => store);
   const fullyRead = new Map<string, number>();
   let retrievalFailure: DistillFailureReason | undefined;
@@ -590,12 +651,7 @@ export async function consolidateWithModel(
   for (let modelCall = 0; modelCall < MAX_MODEL_CALLS; modelCall += 1) {
     await options.waitUntilIdle?.(signal);
     if (signal.aborted) throw callerAbortReason(signal);
-    let serializedRequest: string;
-    try {
-      serializedRequest = JSON.stringify({ systemPrompt, messages, tools });
-    } catch {
-      throw new ConsolidationError("The model input could not be serialized.", "source_invalid");
-    }
+    const serializedRequest = serializeRequest(modelRequest);
     const requestBytes = Buffer.byteLength(serializedRequest, "utf8");
     if (requestBytes > contextByteLimit) {
       const reason = modelCall === 0 ? "model_unavailable" : "model_budget";

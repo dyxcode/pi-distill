@@ -109,11 +109,12 @@ function hasManagedSource(path, sessionFile, sessionId) {
   }
 }
 
-function hasEvidence(path, evidenceId) {
+function hasEvidenceForSource(path, sessionId, sourceKeys) {
   const database = new DatabaseSync(path);
   try {
-    return database.prepare("SELECT 1 AS present FROM memory_evidence WHERE evidence_id = ?")
-      .get(evidenceId) !== undefined;
+    return database.prepare(
+      "SELECT 1 AS present FROM memory_evidence WHERE session_id = ? AND source_keys = ? LIMIT 1",
+    ).get(sessionId, JSON.stringify(sourceKeys)) !== undefined;
   } finally {
     database.close();
   }
@@ -274,8 +275,14 @@ test("metadata collection reclaims deleted-source jobs without losing memory fac
   assert.equal(hasTriggerLink(f.path, completedTriggerId), true);
   assert.equal(hasObservation(f.path, completed.sessionId), true);
   assert.equal(hasUsage(f.path, completedUsageId), true);
-  assert.deepEqual(collectAtMost(store, f.path, 128), { removed: 0, hasMore: false },
-    "completed work and captured/released source metadata remain until the matching deletion receipt");
+  const preDeletionCollection = collectAtMost(store, f.path, 128);
+  assert.equal(hasJob(f.path, completed.id), true,
+    "orphan evidence groups can be collected without reclaiming pending source work");
+  assert.equal(hasJob(f.path, secondCompleted.id), true);
+  assert.deepEqual(store.memoryOrigin(created.id), expectedOrigin,
+    "evidence referenced by a current memory origin remains durable before deletion");
+  assert.equal(preDeletionCollection.removed <= 1, true,
+    "only the completed no-memory job's unreferenced evidence group is eligible here");
 
   deleteSource(store, completedFile, "delete-completed");
   deleteSource(store, secondFile, "delete-second-completed");
@@ -304,7 +311,7 @@ test("metadata collection reclaims deleted-source jobs without losing memory fac
   assert.equal(hasJob(f.path, pending.id), true);
   assert.deepEqual(store.listConsolidationJobs(), [pending]);
   assert.deepEqual(store.memoryOrigin(created.id), expectedOrigin);
-  assert.equal(hasEvidence(f.path, completed.id), true,
+  assert.equal(hasEvidenceForSource(f.path, completed.sessionId, completed.sourceKeys), true,
     "evidence referenced by a current memory origin survives operational metadata collection");
   assert.deepEqual(store.processedSources(completed.sourceKeys), processedBefore);
   assert.equal(store.getDeletion(completedFile)?.state, "complete",
@@ -378,7 +385,7 @@ test("embedded-NUL trigger and job identities survive reopen and bounded metadat
   assert.equal(hasJob(f.path, source.id), false);
   assert.equal(hasManagedSource(f.path, sessionFile, source.sessionId), false,
     "phase 6 decodes the full embedded-NUL session ID when reclaiming the source generation");
-  assert.equal(hasEvidence(f.path, source.id), true,
+  assert.equal(hasEvidenceForSource(f.path, source.sessionId, source.sourceKeys), true,
     "phase 7 preserves evidence referenced by the current memory origin");
   assert.deepEqual(store.memoryOrigin(created.id), origin);
   assert.deepEqual(store.processedSources(source.sourceKeys), source.sourceKeys);
@@ -589,14 +596,14 @@ test("unreferenced memory evidence is collected after its current memory is forg
   const created = memory("forgotten-origin-memory");
   completeJob(store, source, created);
   assert.ok(store.memoryOrigin(created.id));
-  assert.equal(hasEvidence(f.path, source.id), true);
+  assert.equal(hasEvidenceForSource(f.path, source.sessionId, source.sourceKeys), true);
   const processedBefore = store.processedSources(source.sourceKeys);
   assert.deepEqual(processedBefore, source.sourceKeys);
 
   store.forget({ id: created.id, expectedRevision: 1 });
   assert.equal(store.get(created.id), undefined);
   assert.equal(store.memoryOrigin(created.id), undefined);
-  assert.equal(hasEvidence(f.path, source.id), true,
+  assert.equal(hasEvidenceForSource(f.path, source.sessionId, source.sourceKeys), true,
     "forgetting the last memory origin leaves evidence for bounded metadata collection");
   deleteSource(store, sessionFile, "forgotten-origin-delete");
 
@@ -605,9 +612,91 @@ test("unreferenced memory evidence is collected after its current memory is forg
     page = collectAtMost(store, f.path, 1);
   }
   assert.equal(page.hasMore, false);
-  assert.equal(hasEvidence(f.path, source.id), false);
+  assert.equal(hasEvidenceForSource(f.path, source.sessionId, source.sourceKeys), false);
   assert.equal(hasJob(f.path, source.id), false);
   assert.deepEqual(store.processedSources(source.sourceKeys), processedBefore,
     "collecting orphaned provenance does not allow processed source evidence to replay");
   assert.equal(store.getDeletion(sessionFile)?.state, "complete");
+});
+
+test("metadata collection retains only prefix evidence groups referenced by current memories", async t => {
+  const f = await fixture(t);
+  const store = f.open();
+  const sessionFile = join(f.root, "prefix-evidence.jsonl");
+  const source = job("prefix-evidence-job", "prefix-evidence-session", sessionFile,
+    ["prefix-evidence:a", "prefix-evidence:b"], {
+      sourceTime: "2026-10-22T07:30:00.000Z",
+      branchAnchor: "f".repeat(64),
+    });
+  const firstTime = "2026-10-22T07:00:00.000Z";
+  const secondTime = "2026-10-22T07:15:00.000Z";
+  const firstMemory = memory("prefix-evidence-memory-a");
+  const secondMemory = memory("prefix-evidence-memory-b");
+  store.enqueueConsolidation(source);
+  assert.equal(store.claimConsolidation(source.id, "prefix-worker-a", 100, 100), true);
+  assert.equal(store.commitConsolidation({
+    jobId: source.id,
+    owner: "prefix-worker-a",
+    now: 101,
+    sourceKeys: ["prefix-evidence:a"],
+    evidence: { sourceTime: firstTime, branchAnchor: "a".repeat(64) },
+    creates: [firstMemory],
+    updates: [],
+    deletes: [],
+  }), true);
+  assert.equal(store.claimConsolidation(source.id, "prefix-worker-b", 102, 100), true);
+  assert.equal(store.commitConsolidation({
+    jobId: source.id,
+    owner: "prefix-worker-b",
+    now: 103,
+    sourceKeys: ["prefix-evidence:b"],
+    evidence: { sourceTime: secondTime, branchAnchor: "b".repeat(64) },
+    creates: [secondMemory],
+    updates: [],
+    deletes: [],
+  }), true);
+
+  const firstOrigin = {
+    sessionId: source.sessionId,
+    sourceKeys: ["prefix-evidence:a"],
+    sourceTime: firstTime,
+    branchAnchor: "a".repeat(64),
+  };
+  const secondOrigin = {
+    sessionId: source.sessionId,
+    sourceKeys: ["prefix-evidence:b"],
+    sourceTime: secondTime,
+    branchAnchor: "b".repeat(64),
+  };
+  assert.deepEqual(store.memoryOrigin(firstMemory.id), firstOrigin);
+  assert.deepEqual(store.memoryOrigin(secondMemory.id), secondOrigin);
+  deleteSource(store, sessionFile, "prefix-evidence-delete");
+
+  let page = collectAtMost(store, f.path, 1);
+  for (let attempt = 0; page.hasMore && attempt < 64; attempt += 1) {
+    page = collectAtMost(store, f.path, 1);
+  }
+  assert.equal(page.hasMore, false);
+  assert.equal(hasEvidenceForSource(f.path, source.sessionId, firstOrigin.sourceKeys), true);
+  assert.equal(hasEvidenceForSource(f.path, source.sessionId, secondOrigin.sourceKeys), true);
+  assert.deepEqual(store.memoryOrigin(firstMemory.id), firstOrigin);
+  assert.deepEqual(store.memoryOrigin(secondMemory.id), secondOrigin);
+
+  store.forget({ id: firstMemory.id, expectedRevision: 1 });
+  let firstOrphan = collectAtMost(store, f.path, 128);
+  for (let attempt = 0; firstOrphan.hasMore && attempt < 8; attempt += 1) {
+    firstOrphan = collectAtMost(store, f.path, 128);
+  }
+  assert.equal(firstOrphan.hasMore, false);
+  assert.equal(hasEvidenceForSource(f.path, source.sessionId, firstOrigin.sourceKeys), false);
+  assert.equal(hasEvidenceForSource(f.path, source.sessionId, secondOrigin.sourceKeys), true);
+  assert.deepEqual(store.memoryOrigin(secondMemory.id), secondOrigin);
+
+  store.forget({ id: secondMemory.id, expectedRevision: 1 });
+  let secondOrphan = collectAtMost(store, f.path, 128);
+  for (let attempt = 0; secondOrphan.hasMore && attempt < 8; attempt += 1) {
+    secondOrphan = collectAtMost(store, f.path, 128);
+  }
+  assert.equal(secondOrphan.hasMore, false);
+  assert.equal(hasEvidenceForSource(f.path, source.sessionId, secondOrigin.sourceKeys), false);
 });

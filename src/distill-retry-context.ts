@@ -4,7 +4,7 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { DistillRetryContext } from "./distill-retry.js";
 import { readSessionHeader } from "./session-header.ts";
 
-const POLICY_VERSION = "distill-retry-context-v1";
+const POLICY_VERSION = "distill-retry-context-v2";
 const MAX_ANCESTRY_DEPTH = 128;
 const MAX_MODEL_TEXT_LENGTH = 4_096;
 const MAX_BASE_URL_LENGTH = 16_384;

@@ -16,7 +16,7 @@ import {
   planSources,
   type SourceSnapshot,
 } from "./consolidation-source.ts";
-import { consolidateWithModel } from "./consolidation-model.ts";
+import { consolidateWithModel, fitsConsolidationRequest } from "./consolidation-model.ts";
 
 type Context = Pick<ExtensionContext, "model" | "modelRegistry" | "sessionManager"> &
   Partial<Pick<ExtensionContext, "isIdle" | "hasPendingMessages">>;
@@ -61,7 +61,6 @@ const PENDING_SCAN_PAGE_SIZE = 32;
 const MAX_MODEL_BATCHES_PER_PASS = 2;
 const SOURCE_EVIDENCE_BYTES = 24 * 1024;
 const CONTEXT_BYTES = 8 * 1024;
-const MODEL_INPUT_RESERVE_BYTES = 16 * 1024;
 const DEFAULT_CLAIM_LEASE_MS = 60_000;
 const INITIAL_IDLE_RETRY_MS = 100;
 const MAX_IDLE_RETRY_MS = 5_000;
@@ -651,8 +650,6 @@ export class ConsolidationCoordinator {
     }
     for (const job of queued) for (const key of job.sourceKeys) processed.add(key);
 
-    const inputCap = Math.min(64 * 1024, (this.#context?.model?.contextWindow ?? 128_000) - 4_096);
-    const evidenceCap = Math.max(2 * 1024, Math.min(SOURCE_EVIDENCE_BYTES, inputCap - MODEL_INPUT_RESERVE_BYTES));
     const jobs: ConsolidationJob[] = [...queued];
     for (const planned of planSources(snapshot, processed)) {
       let evidence: SourcePart[] = [];
@@ -674,7 +671,7 @@ export class ConsolidationCoordinator {
         evidence = [];
       };
       for (const part of planned.evidence) {
-        if (evidence.length > 0 && Buffer.byteLength(JSON.stringify([...evidence, part])) > evidenceCap) append();
+        if (evidence.length > 0 && Buffer.byteLength(JSON.stringify([...evidence, part])) > SOURCE_EVIDENCE_BYTES) append();
         evidence.push(part);
       }
       append();
@@ -712,24 +709,34 @@ export class ConsolidationCoordinator {
       });
       const currentParts = [...parts.values()];
       const firstIndex = currentParts.findIndex(part => part.key === sourceKeys[0]);
-      const inputCap = Math.min(64 * 1024, (context.model?.contextWindow ?? 128_000) - 4_096);
-      const contextCap = Math.max(0, Math.min(CONTEXT_BYTES,
-        inputCap - Buffer.byteLength(JSON.stringify(evidence)) - 8 * 1024));
-      const interpretation: SourcePart[] = [];
-      for (const part of currentParts.slice(0, Math.max(0, firstIndex)).reverse()) {
-        if (Buffer.byteLength(JSON.stringify([part, ...interpretation])) <= contextCap) interpretation.unshift(part);
-      }
-      const batch: SourceBatch = {
-        ...job,
-        sourceKeys,
-        evidence,
-        context: interpretation,
+      const lineage = {
         lineageKeys: [...parts.keys()],
         lineageAnchors: snapshot.entries.flatMap(entry =>
           typeof entry === "object" && entry !== null && "id" in entry && typeof entry.id === "string"
             ? [anchor(snapshot, entry.id)] : []),
         lineageSessionIds: triggerLineageSessionIds(snapshot),
       };
+      const makeBatch = (selected: SourcePart[]): SourceBatch => ({
+        id: job.id, sessionId: job.sessionId, sessionFile: job.sessionFile, leafId: job.leafId, cwd: job.cwd,
+        sourceKeys: selected.map(part => part.key), evidence: selected, context: [],
+        ...lineage, ...sourceBoundary(snapshot, selected),
+      });
+      // Durable work records the frozen range. Only the claiming model decides
+      // the next request's prefix; committed keys remain the progress authority.
+      let batch: SourceBatch | undefined;
+      for (let count = 1; count <= evidence.length; count++) {
+        const candidate = makeBatch(evidence.slice(0, count));
+        if (!fitsConsolidationRequest(candidate, context.model)) break;
+        batch = candidate;
+      }
+      if (!batch) throw new DistillFailure("model_unavailable", "The selected model cannot fit one source part and the required consolidation request.");
+      for (const part of currentParts.slice(0, Math.max(0, firstIndex)).reverse()) {
+        const interpretation = [part, ...batch.context];
+        if (Buffer.byteLength(JSON.stringify(interpretation)) > CONTEXT_BYTES) break;
+        const candidate: SourceBatch = { ...batch, context: interpretation };
+        if (!fitsConsolidationRequest(candidate, context.model)) break;
+        batch = candidate;
+      }
       await this.#waitUntilIdle(signal);
       signal.throwIfAborted();
       const run = this.#options.runModel ?? consolidateWithModel;
@@ -738,7 +745,8 @@ export class ConsolidationCoordinator {
         signal,
       );
       signal.throwIfAborted();
-      store.commitConsolidation({ ...changes, jobId: job.id, owner: claimToken, now: this.#now(), sourceKeys });
+      store.commitConsolidation({ ...changes, jobId: job.id, owner: claimToken, now: this.#now(),
+        sourceKeys: batch.sourceKeys, evidence: sourceBoundary(snapshot, batch.evidence) });
       this.#notifyProgress();
     } catch (error) {
       if (!this.#closed) this.#releaseClaim(store, claimToken, error, retryContext, signal);
