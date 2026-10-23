@@ -1,10 +1,9 @@
-import { withSourceAccess } from "./source-access.ts";
+import { existsSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { resolve } from "node:path";
 import type { ExtensionContext, SessionShutdownEvent, SessionStartEvent } from "@earendil-works/pi-coding-agent";
 import type { SQLiteMemoryStore } from "./memory-store.ts";
 import type { SessionUsage } from "./session-usage-types.ts";
-import { assessSessionRetention, type SessionRetentionReport } from "./session-retention.ts";
 
 type Context = Pick<ExtensionContext, "cwd" | "sessionManager">;
 type Start = Pick<SessionStartEvent, "reason" | "previousSessionFile">;
@@ -20,22 +19,19 @@ export interface UsageProcessState {
   readonly version: 1;
   readonly pid: number;
   readonly token: string;
-  startupClaimed: boolean;
   readonly managers: WeakMap<object, Set<Binding>>;
   readonly owners: Map<string, Binding>;
   readonly uncertain: Set<string>;
 }
 
-/** A process incarnation and latch shared by every extension reload/runtime. */
+/** Process-local owner state shared by every extension reload/runtime. */
 export function createUsageProcessState(): UsageProcessState {
-  return { version: 1, pid: process.pid, token: randomUUID(), startupClaimed: false,
-    managers: new WeakMap(), owners: new Map(), uncertain: new Set() };
+  return { version: 1, pid: process.pid, token: randomUUID(), managers: new WeakMap(), owners: new Map(), uncertain: new Set() };
 }
 
 function isProcessState(value: unknown): value is UsageProcessState {
   return typeof value === "object" && value !== null && "version" in value && value.version === 1 &&
     "pid" in value && value.pid === process.pid && "token" in value && typeof value.token === "string" &&
-    "startupClaimed" in value && typeof value.startupClaimed === "boolean" &&
     "managers" in value && value.managers instanceof WeakMap && "owners" in value && value.owners instanceof Map &&
     "uncertain" in value && value.uncertain instanceof Set;
 }
@@ -53,22 +49,14 @@ interface Options {
   readonly namespace: string;
   readonly openStore: () => SQLiteMemoryStore;
   readonly processState?: UsageProcessState;
-  readonly assess?: typeof assessSessionRetention;
 }
 
-export interface StartupRetentionReport extends SessionRetentionReport {
-  readonly discoveryScope: "known-session-files";
-  /** A saturated batch is incomplete discovery, even if every supplied file resolves. */
-  readonly candidateLimitReached: boolean;
-}
-
-/** Tracks one extension runtime; no source mutation or cleanup permission is issued. */
+/** Tracks attributed Pi use and observed session boundaries for one runtime. */
 export class SessionUsageCoordinator {
   private readonly state: UsageProcessState;
   private readonly options: Options;
   private binding: Binding | undefined;
   private store: SQLiteMemoryStore | undefined;
-  private work: Promise<StartupRetentionReport | undefined> = Promise.resolve(undefined);
 
   constructor(options: Options) {
     this.options = options;
@@ -99,6 +87,12 @@ export class SessionUsageCoordinator {
     bindings.add(binding);
     this.state.managers.set(ctx.sessionManager, bindings);
     this.binding = binding;
+    if (!existsSync(sessionFile)) {
+      const header = ctx.sessionManager.getHeader();
+      this.withStore(store => store.reserveSessionSource({sessionId:binding.record.sessionId,
+        sessionFile:binding.record.sessionFile, cwd:binding.record.cwd,
+        ...(header?.parentSession === undefined ? {} : {parentSession:header.parentSession})}));
+    }
     return binding;
   }
 
@@ -132,15 +126,7 @@ export class SessionUsageCoordinator {
         const manager = previous.manager.deref();
         if (manager) this.state.managers.get(manager)?.delete(previous);
       }
-    } catch {
-      this.state.uncertain.add(this.options.namespace);
-    }
-    if (event.reason === "startup" && !this.state.startupClaimed) {
-      this.state.startupClaimed = true;
-      this.work = new Promise(resolveWork => {
-        setImmediate(() => { void this.assess().then(resolveWork, () => resolveWork(undefined)); });
-      });
-    }
+    } catch { this.state.uncertain.add(this.options.namespace); }
   }
 
   observe(ctx: Context): void {
@@ -173,21 +159,4 @@ export class SessionUsageCoordinator {
       this.store = undefined;
     }
   }
-
-  private async assess(): Promise<StartupRetentionReport | undefined> {
-    if (this.state.uncertain.has(this.options.namespace)) return undefined;
-    let store: SQLiteMemoryStore | undefined;
-    try {
-      store = this.options.openStore();
-      const files = store.listKnownSessionFiles();
-      const reader = store;
-      const report = await withSourceAccess(this.options.openStore, () =>
-        (this.options.assess ?? assessSessionRetention)(files, reader, { processToken: this.state.token }));
-      return { ...report, discoveryScope: "known-session-files", candidateLimitReached: files.length === 1024 };
-    } catch { return undefined; }
-    finally { store?.close(); }
-  }
-
-  /** The bounded startup pass, if this runtime claimed it; failures are unavailable. */
-  settled(): Promise<StartupRetentionReport | undefined> { return this.work; }
 }

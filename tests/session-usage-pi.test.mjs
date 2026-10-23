@@ -7,7 +7,6 @@ import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { SQLiteMemoryStore } from "../src/memory-store.ts";
-import { assessSessionRetention } from "../src/session-retention.ts";
 
 const testDir = dirname(fileURLToPath(import.meta.url));
 const repoDir = dirname(testDir);
@@ -37,12 +36,6 @@ function listUsages(root) {
   } finally {
     store.close();
   }
-}
-
-function assess(root, file, processToken, probeProcess) {
-  const store = openStore(root);
-  return assessSessionRetention([file], store, { processToken, probeProcess })
-    .finally(() => store.close());
 }
 
 function launchWorker(root, sessionFile) {
@@ -117,9 +110,10 @@ function launchWorker(root, sessionFile) {
   return { child, exited, next, send, stderr: () => stderr };
 }
 
-test("actual Pi session_start registers a not-yet-created file and assesses its live owner", () => {
+test("actual Pi session_start registers an active owner for a not-yet-created file", () => {
   const report = runChild("initial");
   assert.equal(report.fileExistsAtStart, false);
+  assert.equal(report.ownerState, "active");
 });
 
 test("actual Pi reload replaces its owner on the same process token", () => {
@@ -153,7 +147,7 @@ test("Pi quit marks its session usage closing before disposal", () => {
   assert.equal(report.owner, "closing");
 });
 
-test("a Pi factory failure leaves the outgoing usage closing and assessment unknown", () => {
+test("a Pi factory failure leaves the outgoing usage closing", () => {
   const report = runChild("factory-failure");
   assert.equal(report.owner, "closing");
 });
@@ -172,7 +166,7 @@ test("concurrent reloads with one shared SessionManager keep both outgoing owner
   assert.deepEqual(report.replacementOwners, ["active", "active"]);
 });
 
-test("separate Pi processes release independently; a killed owner remains unknown", async t => {
+test("separate Pi processes release independently; a killed owner's usage remains active", async t => {
   const root = await mkdtemp(join(tmpdir(), "pi-distill-session-usage-processes-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const cwd = join(root, "project");
@@ -209,15 +203,11 @@ test("separate Pi processes release independently; a killed owner remains unknow
   const secondOwner = initial.find(row => row.ownerPid === secondReady.pid);
   assert.ok(firstOwner);
   assert.ok(secondOwner);
-  first.send("assess");
-  second.send("assess");
-  const [firstAssessment, secondAssessment] = await Promise.all([first.next("assessment"), second.next("assessment")]);
-  assert.equal(firstAssessment.assessmentUsage, "active");
-  assert.equal(secondAssessment.assessmentUsage, "active");
-  assert.equal(firstAssessment.missingLivenessUsage, "unknown");
-  assert.equal(secondAssessment.missingLivenessUsage, "unknown");
-  assert.equal((await assess(root, sessionFile, firstOwner.processToken, () => "alive")).sessions[0].usage, "unknown");
-  assert.equal((await assess(root, sessionFile, secondOwner.processToken, () => "alive")).sessions[0].usage, "unknown");
+  first.send("ping");
+  second.send("ping");
+  const [firstPong, secondPong] = await Promise.all([first.next("pong"), second.next("pong")]);
+  assert.equal(firstPong.type, "pong");
+  assert.equal(secondPong.type, "pong");
 
   first.send("new");
   const replacement = await first.next("newDone");
@@ -225,14 +215,9 @@ test("separate Pi processes release independently; a killed owner remains unknow
   const afterFirstSwitch = listUsages(root);
   assert.equal(afterFirstSwitch.find(row => row.ownerId === firstOwner.ownerId)?.state, "released");
   assert.equal(afterFirstSwitch.find(row => row.ownerId === secondOwner.ownerId)?.state, "active");
-  // Another process still owns the same path, so the shared assessment remains unknown.
-  assert.equal((await assess(root, sessionFile, firstOwner.processToken, () => "alive")).sessions[0].usage, "unknown");
-  assert.equal((await assess(root, sessionFile, secondOwner.processToken, () => "alive")).sessions[0].usage, "unknown");
-
   assert.equal(second.child.kill("SIGSTOP"), true);
   await new Promise(resolve => setTimeout(resolve, 100));
   assert.equal(listUsages(root).find(row => row.ownerId === secondOwner.ownerId)?.state, "active");
-  assert.equal((await assess(root, sessionFile, secondOwner.processToken, () => "alive")).sessions[0].usage, "unknown");
   assert.equal(second.child.kill("SIGCONT"), true);
   second.send("ping");
   assert.equal((await second.next("pong")).type, "pong");
@@ -241,10 +226,6 @@ test("separate Pi processes release independently; a killed owner remains unknow
   const killed = await second.exited;
   assert.equal(killed.signal, "SIGKILL", second.stderr());
   assert.equal(listUsages(root).find(row => row.ownerId === secondOwner.ownerId)?.state, "active");
-  assert.equal(
-    (await assess(root, sessionFile, secondOwner.processToken, pid => pid === secondOwner.ownerPid ? "dead" : "unknown")).sessions[0].usage,
-    "unknown",
-  );
 
   first.send("dispose");
   await first.next("disposed");

@@ -23,10 +23,9 @@ await Promise.all([
   mkdir(cwd, { recursive: true }),
 ]);
 
-const [pi, { SQLiteMemoryStore }, { assessSessionRetention }] = await Promise.all([
+const [pi, { SQLiteMemoryStore }] = await Promise.all([
   import("@earendil-works/pi-coding-agent"),
   import("../src/memory-store.ts"),
-  import("../src/session-retention.ts"),
 ]);
 
 const storePath = join(agentDir, "distill", "memories.sqlite");
@@ -52,30 +51,6 @@ function findUsage(ownerId) {
   const row = readUsages().find(usage => usage.ownerId === ownerId);
   assert.ok(row, `missing usage owner ${ownerId}`);
   return row;
-}
-
-async function assess(file, processToken, probeProcess = pid => pid === process.pid ? "alive" : "unknown") {
-  const store = new SQLiteMemoryStore(storePath);
-  try {
-    return await assessSessionRetention([file], store, {
-      processToken,
-      probeProcess,
-    });
-  } finally {
-    store.close();
-  }
-}
-
-async function assertReleasedUsage(file, token) {
-  let result;
-  for (let attempt = 0; attempt < 10; attempt++) {
-    result = (await assess(file, token)).sessions[0];
-    // Background preparation may change coverage during this read. Retry that
-    // invalidated snapshot; the next stable read must identify released usage.
-    if (result.reason !== "checkpoint-changed") break;
-    await new Promise(resolveWait => setTimeout(resolveWait, 10));
-  }
-  assert.equal(result.usage, "released", JSON.stringify(result));
 }
 
 async function createRuntime(sessionManager) {
@@ -141,13 +116,7 @@ async function runWorker() {
     } catch {
       continue;
     }
-    if (request?.command === "assess") {
-      const assessmentUsage = (await assess(current.sessionFile, current.usage.processToken)).sessions[0].usage;
-      const missingLivenessUsage = (await assess(current.sessionFile, current.usage.processToken, () => "unknown")).sessions[0].usage;
-      assert.equal(assessmentUsage, "active");
-      assert.equal(missingLivenessUsage, "unknown");
-      process.stdout.write(JSON.stringify({ type: "assessment", assessmentUsage, missingLivenessUsage }) + "\n");
-    } else if (request?.command === "new") {
+    if (request?.command === "new") {
       const result = await runtime.newSession();
       process.stdout.write(JSON.stringify({ type: "newDone", result, sessionFile: runtime.session.sessionManager.getSessionFile() }) + "\n");
     } else if (request?.command === "ping") {
@@ -173,8 +142,12 @@ if (mode === "worker") {
     if (mode === "initial") {
       assert.equal(existsSync(initial.sessionFile), false, "Pi should not create a transcript file before the first message");
       assert.equal(initial.usage.ownerPid, process.pid);
-      assert.equal((await assess(initial.sessionFile, initial.usage.processToken)).sessions[0].usage, "unknown");
-      console.log(JSON.stringify({ mode, registered: true, fileExistsAtStart: false, passed: true }));
+      const store = new SQLiteMemoryStore(storePath);
+      try {
+        const source = store.sources.get(initial.sessionFile, initial.manager.getSessionId());
+        assert.ok(source?.reserved, JSON.stringify(source));
+      } finally { store.close(); }
+      console.log(JSON.stringify({ mode, registered: true, fileExistsAtStart: false, ownerState: initial.usage.state, passed: true }));
     } else if (mode === "reload") {
       await runtime.session.reload();
       const rows = readUsages().filter(row => row.sessionFile === initial.sessionFile && row.processToken === initial.usage.processToken);
@@ -193,7 +166,6 @@ if (mode === "worker") {
       assert.equal(newResult.cancelled, false);
       const afterNew = activeSession(runtime);
       assert.equal(findUsage(initial.usage.ownerId).state, "released");
-      await assertReleasedUsage(initial.sessionFile, initial.usage.processToken);
       assert.notEqual(afterNew.usage.ownerId, initial.usage.ownerId);
       assert.equal(afterNew.usage.processToken, initial.usage.processToken);
 
@@ -211,7 +183,6 @@ if (mode === "worker") {
       assert.equal(forkResult.cancelled, false);
       const afterFork = activeSession(runtime);
       assert.equal(findUsage(afterResume.usage.ownerId).state, "released");
-      await assertReleasedUsage(target.sessionFile, initial.usage.processToken);
       assert.notEqual(afterFork.sessionFile, target.sessionFile);
       assert.equal(afterFork.usage.processToken, initial.usage.processToken);
       console.log(JSON.stringify({ mode, new: "released", resume: "released", fork: "released", passed: true }));
@@ -245,13 +216,11 @@ if (mode === "worker") {
       await runtime.dispose();
       runtime = undefined;
       assert.equal(findUsage(initial.usage.ownerId).state, "closing");
-      assert.equal((await assess(initial.sessionFile, initial.usage.processToken)).sessions[0].usage, "unknown");
       console.log(JSON.stringify({ mode, owner: "closing", passed: true }));
     } else if (mode === "factory-failure") {
       failNextFactory = true;
       await assert.rejects(runtime.newSession(), /Synthetic session runtime factory failure/u);
       assert.equal(findUsage(initial.usage.ownerId).state, "closing");
-      assert.equal((await assess(initial.sessionFile, initial.usage.processToken)).sessions[0].usage, "unknown");
       console.log(JSON.stringify({ mode, owner: "closing", passed: true }));
       runtime = undefined;
     } else if (mode === "same-process-shared") {

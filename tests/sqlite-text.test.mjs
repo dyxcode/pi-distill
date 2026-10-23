@@ -188,7 +188,8 @@ test("a NUL cannot hide invalid timestamp or filesystem-path suffixes during val
     db.prepare("UPDATE session_observations SET session_file = ?").run(join(f.root, "session.jsonl") + "\0invalid");
     assert.throws(() => store.observedSessions(), TypeError);
     store.close();
-    assert.throws(() => f.open(), TypeError);
+    const reopened = f.open();
+    assert.throws(() => reopened.observedSessions(), TypeError);
   } finally {
     db.close();
   }

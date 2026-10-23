@@ -165,7 +165,7 @@ test("new owners can only be created active and malformed usage inputs are rejec
   assert.deepEqual(store.listSessionUsages(), []);
 });
 
-test("stored usage rows are validated on reads and on reopen", async (t) => {
+test("stored usage rows are validated when read without rejecting unrelated rows on reopen", async (t) => {
   const f = await fixture(t);
   const store = f.open();
   store.saveSessionUsage(usage(f.root, "owner-stored"));
@@ -178,7 +178,8 @@ test("stored usage rows are validated on reads and on reopen", async (t) => {
     raw.close();
   }
   store.close();
-  assert.throws(() => f.open(), TypeError);
+  const reopened = f.open();
+  assert.throws(() => reopened.listSessionUsages(), TypeError);
 });
 
 test("consolidation status reads usages and observations from one read snapshot", async (t) => {
@@ -276,13 +277,19 @@ test("known session file results stay bounded and malformed stored job paths fai
   raw.prepare("UPDATE consolidation_jobs SET job_json = ? WHERE id = ?")
     .run(JSON.stringify({ ...malformed, sessionFile: "relative/session.jsonl" }), malformed.id);
   raw.close();
-  assert.throws(() => store.listKnownSessionFiles(1), TypeError);
+  assert.deepEqual(store.listKnownSessionFiles(1), [first.sessionFile]);
+  assert.throws(() => store.listConsolidationJobs(), TypeError);
 });
 
-test("session discovery limits SQL results and status snapshots fail closed above 16,384 metadata rows", async (t) => {
+test("source discovery pages beyond the old global metadata ceiling while status snapshots remain bounded", async (t) => {
   const f = await fixture(t);
   const store = f.open();
   const raw = database(f.path);
+  const insertSource = raw.prepare(
+    "INSERT INTO managed_sources " +
+    "(generation, session_file, session_id, cwd, file_version, physical_identity, header_state, reserved, parent_path, deleted) " +
+    "VALUES (?, ?, ?, ?, NULL, NULL, 'unknown', 0, NULL, 0)",
+  );
   const insert = raw.prepare(
     "INSERT INTO session_usages " +
     "(owner_id, process_token, session_id, session_file, cwd, leaf_id, owner_pid, state) " +
@@ -295,6 +302,7 @@ test("session discovery limits SQL results and status snapshots fail closed abov
       const suffix = String(index).padStart(5, "0");
       const sessionFile = join(f.root, "session-" + suffix + ".jsonl");
       expectedPaths.push(sessionFile);
+      insertSource.run("generation-" + suffix, sessionFile, "registered-" + suffix, f.root);
       insert.run("owner-" + suffix, "process-shared", "session-shared", sessionFile,
         f.root, "leaf-shared", process.pid);
     }
@@ -307,11 +315,7 @@ test("session discovery limits SQL results and status snapshots fail closed abov
   assert.deepEqual(store.listKnownSessionFiles(17), expectedPaths.sort().slice(0, 17));
   assert.equal(store.readConsolidationStatus([]).usages.length, 16_384);
 
-  const complete = job("over-discovery-limit");
-  store.enqueueConsolidation(complete);
-  store.claimConsolidation(complete.id, "worker", 100, 100);
-  store.commitConsolidation(commit(complete.id, "worker"));
-  assert.throws(() => store.listKnownSessionFiles(1), RangeError);
+  assert.deepEqual(store.listKnownSessionFiles(1), [expectedPaths[0]]);
   assert.equal(store.readConsolidationStatus([]).usages.length, 16_384);
 
   const extra = database(f.path);
@@ -326,7 +330,7 @@ test("session discovery limits SQL results and status snapshots fail closed abov
     extra.close();
   }
   assert.throws(() => store.readConsolidationStatus([]), RangeError);
-  assert.throws(() => store.listKnownSessionFiles(1), RangeError);
+  assert.deepEqual(store.listKnownSessionFiles(1), [expectedPaths[0]]);
 });
 
 test("schema v2 migration preserves memories, jobs, progress, origins and observations", async (t) => {
@@ -380,7 +384,7 @@ test("schema v2 migration preserves memories, jobs, progress, origins and observ
 
   const verify = database(f.path);
   try {
-    assert.equal(verify.prepare("PRAGMA user_version").get()["user_version"], 5);
+    assert.equal(verify.prepare("PRAGMA user_version").get()["user_version"], 6);
     assert.deepEqual(verify.prepare("SELECT name FROM sqlite_schema WHERE name = 'session_usages'").all()
       .map(row => row["name"]), ["session_usages"]);
   } finally {
@@ -446,6 +450,7 @@ test("v2 migration rejects an unexpected schema object without changing existing
 
 // Reconstruct the historical fixture rather than relabeling current schema as v2.
 function restoreV2Schema(db) {
+  dropV6Objects(db);
   db.exec(`
     DROP TABLE source_access;
     DROP TABLE session_deletions;
@@ -459,5 +464,26 @@ function restoreV2Schema(db) {
     INSERT INTO consolidation_jobs SELECT id, job_json, status, lease_owner, lease_until FROM jobs_current;
     DROP TABLE jobs_current;
     PRAGMA user_version = 2;
+  `);
+}
+
+function dropV6Objects(db) {
+  db.exec(`
+    DROP INDEX IF EXISTS clean_source;
+    DROP INDEX IF EXISTS jobs_source_status;
+    DROP INDEX IF EXISTS observations_source;
+    DROP INDEX IF EXISTS triggers_source_status;
+    DROP INDEX IF EXISTS trigger_links_job;
+    DROP INDEX IF EXISTS usages_source;
+    DROP INDEX IF EXISTS managed_sources_header;
+    DROP INDEX IF EXISTS managed_sources_page;
+    DROP INDEX IF EXISTS managed_sources_parent;
+    DROP INDEX IF EXISTS managed_sources_path_session;
+    DROP INDEX IF EXISTS managed_sources_physical;
+    DROP INDEX IF EXISTS managed_sources_session_id;
+    DROP TABLE IF EXISTS source_backfill;
+    DROP TABLE IF EXISTS managed_sources;
+    DROP TABLE IF EXISTS source_registry_cursors;
+    DROP TABLE IF EXISTS source_registry_state;
   `);
 }

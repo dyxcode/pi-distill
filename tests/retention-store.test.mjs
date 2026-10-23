@@ -10,7 +10,7 @@ async function fixture(t){
  const a=new SQLiteMemoryStore(path),b=new SQLiteMemoryStore(path);
  t.after(async()=>{a.close();b.close();await rm(root,{recursive:true,force:true});});
  const task=a.enqueueCleanTask({sessionId:'session',sessionFile:join(root,'s.jsonl'),leafId:null,cwd:root,reason:'close',intentId:'range'});
- return {a,b,task};
+ return {a,b,task,path};
 }
 test('source access excludes another reader or cleaner until its actual release',async t=>{
  const {a,b}=await fixture(t);const access=a.acquireSourceAccess();assert.ok(access);
@@ -49,15 +49,24 @@ test('metadata changes after intent prevent any filesystem mutation',async t=>{
  assert.equal(called,false);a.releaseSourceAccess(access);
 });
 
-test('v4 migration preserves pending work and memories',async t=>{
- const {a,b,task}=await fixture(t);a.save({id:'keep',content:'Keep this memory.',createdAt:'2026-10-23T00:00:00.000Z'});
+test('v5 migration preserves pending work and memories while rebuilding source discovery',async t=>{
+ const {a,b,task,path}=await fixture(t);a.save({id:'keep',content:'Keep this memory.',createdAt:'2026-10-23T00:00:00.000Z'});
  const {DatabaseSync}=await import('node:sqlite');
- // Construct the exact prior schema by removing only the new metadata tables.
- const path=a.listKnownSessionFiles()[0].replace(/s.jsonl$/,'memory.sqlite');a.close();b.close();
- const raw=new DatabaseSync(path);raw.exec('DROP TABLE source_access; DROP TABLE session_deletions; PRAGMA user_version = 4');raw.close();
+ a.close();b.close();
+ const raw=new DatabaseSync(path);raw.exec(`
+  DROP INDEX clean_source; DROP INDEX jobs_source_status; DROP INDEX observations_source;
+  DROP INDEX triggers_source_status; DROP INDEX trigger_links_job; DROP INDEX usages_source;
+  DROP INDEX managed_sources_header; DROP INDEX managed_sources_page; DROP INDEX managed_sources_parent;
+  DROP INDEX managed_sources_path_session; DROP INDEX managed_sources_physical; DROP INDEX managed_sources_session_id;
+  DROP TABLE source_backfill; DROP TABLE managed_sources;
+  DROP TABLE source_registry_cursors; DROP TABLE source_registry_state;
+  PRAGMA user_version = 5;
+ `);raw.close();
  const upgraded=new SQLiteMemoryStore(path);try {
   assert.equal(upgraded.get('keep').content,'Keep this memory.');
   assert.equal(upgraded.listCleanTasks({limit:10}).items[0].id,task.id);
+  assert.equal(upgraded.sources.get(task.sessionFile,task.sessionId).headerState,'unknown');
+  assert.deepEqual(upgraded.listKnownSessionFiles(),[task.sessionFile]);
   const access=upgraded.acquireSourceAccess();assert.ok(access);upgraded.releaseSourceAccess(access);
  } finally {upgraded.close();}
 });

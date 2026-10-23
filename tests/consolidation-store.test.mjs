@@ -484,7 +484,7 @@ test("a failed SQLite COMMIT rolls back memory writes, progress, and job complet
   }
 });
 
-test("schema v0 and v1 migrations preserve every current memory field and create only metadata tables", async (t) => {
+test("schema v0 and v1 migrations preserve memory fields and create the v6 metadata registry", async (t) => {
   for (const version of [0, 1]) {
     const f = await fixture(t);
     const records = [memory("v" + version + "-a"), memory("v" + version + "-b", {
@@ -521,22 +521,38 @@ test("schema v0 and v1 migrations preserve every current memory field and create
     }
     const check = database(f.path);
     try {
-      assert.equal(check.prepare("PRAGMA user_version").get()["user_version"], 5);
+      assert.equal(check.prepare("PRAGMA user_version").get()["user_version"], 6);
       const names = check.prepare("SELECT name FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*' ORDER BY name")
         .all().map((row) => row["name"]);
       assert.deepEqual(names, [
+        "clean_source",
         "clean_tasks",
         "consolidation_jobs",
         "consolidation_progress",
         "distill_lease",
         "distill_trigger_jobs",
         "distill_triggers",
+        "jobs_source_status",
+        "managed_sources",
+        "managed_sources_header",
+        "managed_sources_page",
+        "managed_sources_parent",
+        "managed_sources_path_session",
+        "managed_sources_physical",
+        "managed_sources_session_id",
         "memories",
         "memory_origins",
+        "observations_source",
         "session_deletions",
         "session_observations",
         "session_usages",
         "source_access",
+        "source_backfill",
+        "source_registry_cursors",
+        "source_registry_state",
+        "trigger_links_job",
+        "triggers_source_status",
+        "usages_source",
       ]);
       assert.deepEqual(check.prepare("PRAGMA table_info(memory_origins)").all().map((row) => row["name"]), [
         "memory_id",
@@ -598,7 +614,7 @@ test("a version-three database with an unrecognized object is rejected and prese
   }
 });
 
-test("version-three memory origins reject unexpected content columns", async (t) => {
+test("current memory origins reject unexpected content columns", async (t) => {
   const f = await fixture(t);
   const store = f.open();
   store.close();
@@ -713,5 +729,6 @@ test("external job, lease, observation, change, and stored JSON inputs are valid
   raw.prepare("UPDATE consolidation_jobs SET job_json = ? WHERE id = ?")
     .run('{"id":"validate"}', valid.id);
   raw.close();
-  assert.throws(() => new SQLiteMemoryStore(f.path), TypeError);
+  const reopened = f.open();
+  assert.throws(() => reopened.listConsolidationJobs(), TypeError);
 });

@@ -12,43 +12,55 @@ async function fixture(t) {
   t.after(async () => { for (const store of stores) store.close(); await rm(root, { recursive: true, force: true }); });
   const path = join(root, 'memory.sqlite');
   const state = createUsageProcessState();
-  let calls = 0;
-  const openStore = () => { const store = new SQLiteMemoryStore(path); stores.push(store); return store; };
+  let scans = 0;
+  const openStore = () => {
+    const store = new SQLiteMemoryStore(path);
+    const listKnownSessionFiles = store.listKnownSessionFiles.bind(store);
+    store.listKnownSessionFiles = (...args) => { scans++; return listKnownSessionFiles(...args); };
+    stores.push(store);
+    return store;
+  };
   const rows = () => { const db = openStore(); try { return db.listSessionUsages(); } finally { db.close(); } };
-  const assess = async files => { calls++; assert.ok(rows().some(r => r.state === 'active')); return { scope: 'provided-session-files', dependenciesComplete: true, sessions: [], files }; };
-  const coordinator = (extra = {}) => new SessionUsageCoordinator({ openStore, namespace: path, processState: state, assess, ...extra });
-  const context = (name) => {
+  const coordinator = (extra = {}) => new SessionUsageCoordinator({ openStore, namespace: path, processState: state, ...extra });
+  const context = (name, parentSession) => {
     let leaf = null;
-    const manager = { getSessionFile: () => join(root, name + '.jsonl'), getSessionId: () => name, getLeafId: () => leaf };
+    const manager = {
+      getSessionFile: () => join(root, name + '.jsonl'),
+      getSessionId: () => name,
+      getLeafId: () => leaf,
+      getHeader: () => ({ type: 'session', id: name, timestamp: '2026-10-23T00:00:00.000Z', cwd: root,
+        ...(parentSession === undefined ? {} : { parentSession }) }),
+    };
     return { cwd: root, sessionManager: manager, leaf(id) { leaf = id; } };
   };
-  return { root, openStore, rows, coordinator, context, get calls() { return calls; } };
+  return { root, openStore, rows, coordinator, context, get scans() { return scans; } };
 }
 
-test('register before one background assessment; reload, switch and extra runtime starts do not repeat it', async t => {
+test('startup tracks use without scanning known sessions; reload and switch preserve owner handoff', async t => {
   const f = await fixture(t); const a = f.context('a'); const c = f.coordinator();
   c.start({ reason: 'startup' }, a);
-  assert.equal(f.calls, 0, 'assessment must be background work');
   assert.equal(f.rows()[0].state, 'active');
-  await c.settled(); assert.equal(f.calls, 1);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(f.scans, 0);
+  assert.equal(c.settled, undefined);
   c.shutdown({ reason: 'reload' }, a);
   assert.equal(f.rows()[0].state, 'closing');
-  const reload = f.coordinator(); reload.start({ reason: 'reload' }, a); await reload.settled();
+  const reload = f.coordinator(); reload.start({ reason: 'reload' }, a);
   assert.deepEqual(f.rows().map(r => r.state).sort(), ['active', 'released']);
   reload.shutdown({ reason: 'new' }, a);
   const b = f.context('b'); const next = f.coordinator();
   next.start({ reason: 'new', previousSessionFile: a.sessionManager.getSessionFile() }, b);
-  await next.settled(); assert.equal(f.calls, 1);
+  assert.equal(f.scans, 0);
   assert.equal(f.rows().filter(r => r.state === 'released').length, 2);
-  const other = f.coordinator(); other.start({ reason: 'startup' }, f.context('c')); await other.settled();
-  assert.equal(f.calls, 1);
+  const other = f.coordinator(); other.start({ reason: 'startup' }, f.context('c'));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(f.scans, 0);
 });
 
 test('distinct owners on the same session cannot release each other; ambiguous same-process handoff retains protection', async t => {
   const f = await fixture(t); const a = f.context('shared'); const b = f.context('shared');
   const one = f.coordinator(); const two = f.coordinator();
   one.start({ reason: 'startup' }, a); two.start({ reason: 'startup' }, b);
-  await one.settled();
   assert.equal(new Set(f.rows().map(r => r.ownerId)).size, 2);
   one.shutdown({ reason: 'new' }, a);
   const next = f.coordinator(); next.start({ reason: 'new', previousSessionFile: a.sessionManager.getSessionFile() }, f.context('new'));
@@ -58,25 +70,63 @@ test('distinct owners on the same session cannot release each other; ambiguous s
 
 test('quit and unsuccessful replacement leave closing claims, checkpoints persist and replay cannot revive an owner', async t => {
   const f = await fixture(t); const ctx = f.context('a'); const c = f.coordinator();
-  c.start({ reason: 'startup' }, ctx); await c.settled();
+  c.start({ reason: 'startup' }, ctx);
   ctx.leaf('branch-checkpoint'); c.observe(ctx); c.shutdown({ reason: 'quit' }, ctx);
   c.observe(ctx); c.shutdown({ reason: 'quit' }, ctx);
   assert.equal(f.rows().length, 1); assert.equal(f.rows()[0].leafId, 'branch-checkpoint'); assert.equal(f.rows()[0].state, 'closing');
 });
 
-test('startup resume registers protection; storage and assessment failures do not escape lifecycle handlers', async t => {
-  const f = await fixture(t); const c = f.coordinator({ assess: async () => { throw new Error('synthetic failure'); } });
-  c.start({ reason: 'startup' }, f.context('resumed')); assert.equal(await c.settled(), undefined);
+test('storage failures do not escape lifecycle handlers or allow uncertain owner handoff', async t => {
+  const f = await fixture(t); const c = f.coordinator();
+  const resumed = f.context('resumed');
+  c.start({ reason: 'startup' }, resumed);
   assert.equal(f.rows()[0].state, 'active');
+  c.shutdown({ reason: 'new' }, resumed);
+  assert.equal(f.rows()[0].state, 'closing');
   const broken = f.coordinator({ openStore: () => { throw new Error('unavailable'); } });
   assert.doesNotThrow(() => broken.start({ reason: 'reload' }, f.context('other')));
   assert.doesNotThrow(() => broken.observe(f.context('other')));
   assert.doesNotThrow(() => broken.shutdown({ reason: 'quit' }, f.context('other')));
+  f.coordinator().start({ reason: 'new', previousSessionFile: resumed.sessionManager.getSessionFile() }, f.context('replacement'));
+  assert.equal(f.rows().find(row => row.sessionId === 'resumed').state, 'closing');
+});
+
+test('a failed reservation after usage save keeps the binding and does not create duplicate owners', async t => {
+  const f = await fixture(t);
+  const openStore = () => {
+    const store = f.openStore();
+    store.reserveSessionSource = () => { throw new Error('synthetic reservation failure'); };
+    return store;
+  };
+  const c = f.coordinator({ openStore });
+  const ctx = f.context('reservation-failure');
+  c.start({ reason: 'startup' }, ctx);
+  c.start({ reason: 'startup' }, ctx);
+  ctx.leaf('after-reservation-failure');
+  c.observe(ctx);
+  assert.equal(f.rows().length, 1);
+  assert.equal(f.rows()[0].state, 'active');
+  assert.equal(f.rows()[0].leafId, 'after-reservation-failure');
+});
+
+test('an unsaved fork reservation records its parent dependency', async t => {
+  const f = await fixture(t);
+  const parent = f.context('parent');
+  const fork = f.context('fork', 'parent.jsonl');
+  f.coordinator().start({ reason: 'startup' }, parent);
+  f.coordinator().start({ reason: 'fork', previousSessionFile: parent.sessionManager.getSessionFile() }, fork);
+  const store = f.openStore();
+  try {
+    const childSource = store.sources.get(fork.sessionManager.getSessionFile(), 'fork');
+    assert.ok(childSource?.reserved);
+    assert.equal(childSource.parentPath, parent.sessionManager.getSessionFile());
+    assert.ok(store.sources.reverseDependencies(parent.sessionManager.getSessionFile()).includes(fork.sessionManager.getSessionFile()));
+  } finally { store.close(); }
 });
 
 test('an unrelated startup cannot confirm an old quit or switch; duplicate start delivery is idempotent', async t => {
   const f = await fixture(t); const ctx = f.context('a'); const c = f.coordinator();
-  c.start({ reason: 'startup' }, ctx); c.start({ reason: 'startup' }, ctx); await c.settled();
+  c.start({ reason: 'startup' }, ctx); c.start({ reason: 'startup' }, ctx);
   assert.equal(f.rows().length, 1);
   c.shutdown({ reason: 'new' }, ctx);
   f.coordinator().start({ reason: 'startup' }, f.context('b'));
@@ -86,42 +136,28 @@ test('an unrelated startup cannot confirm an old quit or switch; duplicate start
 test('enabling an extension on reload or replacement does not masquerade as process startup', async t => {
   const f = await fixture(t);
   for (const reason of ['reload', 'new', 'resume', 'fork']) {
-    const c = f.coordinator(); c.start({ reason }, f.context(reason)); await c.settled();
+    const c = f.coordinator(); c.start({ reason }, f.context(reason));
   }
-  assert.equal(f.calls, 0);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(f.scans, 0);
 });
 
-test('a pending startup pass does not block checkpoint recording or lifecycle handoff', async t => {
-  const f = await fixture(t); let finish;
-  const wait = new Promise(resolve => { finish = resolve; });
-  const c = f.coordinator({ assess: async () => wait }); const ctx = f.context('a');
+test('checkpoint recording and lifecycle handoff do not start a retention scan', async t => {
+  const f = await fixture(t); const c = f.coordinator(); const ctx = f.context('a');
   c.start({ reason: 'startup' }, ctx);
-  await new Promise(resolve => setImmediate(resolve));
   ctx.leaf('updated'); c.observe(ctx);
   assert.equal(f.rows()[0].leafId, 'updated');
   c.shutdown({ reason: 'new' }, ctx);
   const next = f.coordinator(); next.start({ reason: 'new', previousSessionFile: ctx.sessionManager.getSessionFile() }, f.context('b'));
   assert.equal(f.rows().find(row => row.sessionId === 'a').state, 'released');
-  finish({ scope: 'provided-session-files', dependenciesComplete: false, sessions: [] });
-  assert.equal((await c.settled()).dependenciesComplete, false);
-});
-
-test('startup labels a saturated candidate batch as incomplete known-file discovery', async t => {
-  const f = await fixture(t); const db = f.openStore();
-  try {
-    for (let i = 0; i < 1024; i++) db.saveSessionUsage({ ownerId: 'owner-' + i, processToken: 'prior', state: 'active', sessionId: 'session-' + i, sessionFile: join(f.root, i + '.jsonl'), cwd: f.root, leafId: null, ownerPid: process.pid });
-  } finally { db.close(); }
-  const c = f.coordinator(); c.start({ reason: 'startup' }, f.context('current'));
-  const report = await c.settled();
-  assert.equal(report.discoveryScope, 'known-session-files');
-  assert.equal(report.candidateLimitReached, true);
-  assert.equal(report.files.length, 1024);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(f.scans, 0);
 });
 
 test('runtimes sharing the same manager cannot attribute overlapping reloads to each other', async t => {
   const f = await fixture(t); const ctx = f.context('shared-manager');
   const a = f.coordinator(); const b = f.coordinator();
-  a.start({ reason: 'startup' }, ctx); b.start({ reason: 'startup' }, ctx); await a.settled();
+  a.start({ reason: 'startup' }, ctx); b.start({ reason: 'startup' }, ctx);
   const old = f.rows().map(row => row.ownerId);
   a.shutdown({ reason: 'reload' }, ctx); b.shutdown({ reason: 'reload' }, ctx);
   f.coordinator().start({ reason: 'reload' }, ctx);

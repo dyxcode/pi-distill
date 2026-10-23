@@ -1,6 +1,7 @@
 import { isAbsolute } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { DatabaseSync, type StatementSync } from "node:sqlite";
+import { SourceRegistry, initializeSourceRegistry, SOURCE_REGISTRY_SCHEMAS } from "./source-registry.ts";
 import type {
   ConsolidationCommit,
   ConsolidationJob,
@@ -145,7 +146,21 @@ const cleanTasksSchema =
   ") STRICT";
 const sourceAccessSchema = "CREATE TABLE source_access (singleton INTEGER PRIMARY KEY NOT NULL CHECK (singleton = 1), token TEXT NOT NULL, owner_pid INTEGER NOT NULL CHECK (owner_pid > 0)) STRICT";
 const deletionsSchema = "CREATE TABLE session_deletions (session_file TEXT PRIMARY KEY NOT NULL, session_id TEXT NOT NULL, intent_id TEXT NOT NULL, file_version TEXT NOT NULL, state TEXT NOT NULL CHECK (state IN ('deleting', 'complete'))) STRICT";
-const latestSchemaVersion = 5;
+const sourceBackfillSchema = "CREATE TABLE source_backfill (singleton INTEGER PRIMARY KEY NOT NULL CHECK (singleton = 1), phase INTEGER NOT NULL, cursor_row INTEGER NOT NULL) STRICT";
+const storeIndexes = [
+  "CREATE INDEX jobs_source_status ON consolidation_jobs (json_extract(job_json, '$.sessionFile'), status)",
+  "CREATE INDEX triggers_source_status ON distill_triggers (json_extract(trigger_json, '$.sessionFile'), status)",
+  "CREATE INDEX clean_source ON clean_tasks (json_extract(task_json, '$.sessionFile'))",
+  "CREATE INDEX usages_source ON session_usages (session_file)",
+  "CREATE INDEX observations_source ON session_observations (session_file)",
+  "CREATE INDEX trigger_links_job ON distill_trigger_jobs (job_id)",
+];
+const storeSchemas = [sourceBackfillSchema, ...storeIndexes].map(sql => {
+  const match = /^CREATE (TABLE|INDEX) (\w+)/.exec(sql);
+  if (!match?.[2]) throw new Error("Invalid store schema declaration.");
+  return {name:match[2],sql};
+});
+const latestSchemaVersion = 6;
 
 export interface SessionDeletion {
   readonly sessionFile: string;
@@ -963,6 +978,8 @@ function parseSearchRequest(value: unknown): MemorySearchRequest {
 
 export class SQLiteMemoryStore {
   readonly #database: DatabaseSync;
+  #sources: SourceRegistry | undefined;
+  get sources(): SourceRegistry { return this.#sources ??= new SourceRegistry(this.#database); }
   readonly #textDecoder: TextDecoder;
   readonly #select: StatementSync;
   readonly #insert: StatementSync;
@@ -1230,6 +1247,7 @@ export class SQLiteMemoryStore {
     const triggerJson = JSON.stringify(record);
     const status = record.reason === "compact" ? "candidate" : "pending";
     this.#transaction(() => {
+      if (record.sessionFile !== null) this.#registerSource({sessionId: record.sessionId, sessionFile: record.sessionFile, cwd: record.cwd});
       const row = this.#database.prepare(`SELECT ${triggerColumns} FROM distill_triggers WHERE id = ?`).get(record.id);
       if (row !== undefined) {
         const existing = this.#readDistillTrigger(row);
@@ -1663,7 +1681,7 @@ export class SQLiteMemoryStore {
   }
 
   /** One snapshot; queued source triggers count as unresolved retention evidence. */
-  readConsolidationStatus(keys: readonly string[]): {
+  readConsolidationStatus(keys: readonly string[], scope?: readonly string[]): {
     readonly processedSources: readonly string[];
     readonly pendingJobs: readonly ConsolidationJob[];
     readonly pendingTriggers: readonly DistillTrigger[];
@@ -1672,31 +1690,23 @@ export class SQLiteMemoryStore {
   } {
     this.#ensureOpen();
     return this.#transaction(() => {
-      const rowCount = this.#database.prepare(
-        "SELECT COUNT(*) AS totalRows FROM (" +
-        "SELECT 1 FROM consolidation_jobs WHERE status = 'pending' " +
-        "UNION ALL SELECT 1 FROM distill_triggers WHERE status <> 'complete' " +
-        "UNION ALL SELECT 1 FROM session_observations " +
-        "UNION ALL SELECT 1 FROM session_usages LIMIT ?)",
-      ).get(maxSessionMetadataRows + 1)?.["totalRows"];
-      if (typeof rowCount !== "number" || !Number.isSafeInteger(rowCount) || rowCount < 0) {
-        throw new TypeError("SQLite returned an invalid consolidation status row count.");
-      }
-      if (rowCount > maxSessionMetadataRows) {
-        throw new RangeError(
-          "Consolidation status exceeds the " + maxSessionMetadataRows + "-row metadata limit.",
-        );
-      }
+      const filter = this.#scopeFilter(scope);
+      const rows = (table: string, columns: string, path: string, condition = "1") => {
+        const items = this.#database.prepare(`SELECT ${columns} FROM ${table} WHERE ${condition} AND ${filter.sql(path)} ORDER BY rowid LIMIT ?`)
+          .all(...filter.values, maxSessionMetadataRows + 1);
+        if (items.length > maxSessionMetadataRows) throw new RangeError("Source metadata exceeds its assessment budget.");
+        return items;
+      };
       return {
         processedSources: this.processedSources(keys),
-        pendingJobs: this.listConsolidationJobs(),
-        pendingTriggers: this.#listPendingDistillTriggers(),
-        observations: this.#database.prepare(
-          `SELECT ${observationColumns} FROM session_observations ORDER BY session_id COLLATE BINARY`,
-        ).all().map(row => parseStoredSessionObservation(this.#decodeRow(row)).observation),
-        usages: this.#database.prepare(
-          `SELECT ${sessionUsageColumns} FROM session_usages ORDER BY owner_id COLLATE BINARY`,
-        ).all().map(row => parseStoredSessionUsage(this.#decodeRow(row))),
+        pendingJobs: rows("consolidation_jobs", jobColumns, "json_extract(job_json, '$.sessionFile')", "status = 'pending'")
+          .map(row => parsePersistedJobRow(this.#decodeRow(row)).job),
+        pendingTriggers: rows("distill_triggers", triggerColumns, "json_extract(trigger_json, '$.sessionFile')", "status <> 'complete'")
+          .map(row => this.#distillTriggerItem(this.#readDistillTrigger(row))),
+        observations: rows("session_observations", observationColumns, "session_file")
+          .map(row => parseStoredSessionObservation(this.#decodeRow(row)).observation),
+        usages: rows("session_usages", sessionUsageColumns, "session_file")
+          .map(row => parseStoredSessionUsage(this.#decodeRow(row))),
       };
     }, "DEFERRED");
   }
@@ -1827,6 +1837,7 @@ export class SQLiteMemoryStore {
     this.#ensureOpen();
     const record = parseSessionObservation(observation);
     this.#transaction(() => {
+      if (record.sessionFile !== null) this.#registerSource({sessionId: record.sessionId, sessionFile: record.sessionFile, cwd: record.cwd});
       this.#database.prepare(
         "INSERT INTO session_observations " +
         "(session_id, session_file, cwd, leaf_id, owner_pid, captured) " +
@@ -1845,6 +1856,7 @@ export class SQLiteMemoryStore {
     this.#ensureOpen();
     const record = parseSessionUsage(usage);
     this.#transaction(() => {
+      if (record.sessionFile !== null) this.sources.register({sessionId: record.sessionId, sessionFile: record.sessionFile, cwd: record.cwd});
       const row = this.#database.prepare(
         `SELECT ${sessionUsageColumns} FROM session_usages WHERE owner_id = ?`,
       ).get(record.ownerId);
@@ -1970,56 +1982,72 @@ export class SQLiteMemoryStore {
       );
     }
     if (afterPath !== undefined) validateAbsolutePath(afterPath, "known session file cursor");
-    return this.#transaction(() => {
-      const rowCount = this.#database.prepare(
-        "SELECT COUNT(*) AS totalRows FROM (" +
-        "SELECT 1 FROM consolidation_jobs " +
-        "UNION ALL SELECT 1 FROM distill_triggers " +
-        "UNION ALL SELECT 1 FROM clean_tasks " +
-        "UNION ALL SELECT 1 FROM session_observations " +
-        "UNION ALL SELECT 1 FROM session_usages LIMIT ?)",
-      ).get(maxSessionMetadataRows + 1)?.["totalRows"];
-      if (typeof rowCount !== "number" || !Number.isSafeInteger(rowCount) || rowCount < 0) {
-        throw new TypeError("SQLite returned an invalid session metadata row count.");
+    return this.#database.prepare(
+      "SELECT " + textColumn("session_file", "path") + " FROM managed_sources " +
+      "WHERE deleted = 0 AND (? IS NULL OR session_file COLLATE BINARY > ?) " +
+      "GROUP BY session_file ORDER BY session_file COLLATE BINARY LIMIT ?",
+    ).all(afterPath ?? null, afterPath ?? null, limit).map(raw => {
+      const row = this.#decodeRow(raw);
+      validateAbsolutePath(row["path"], "Stored source path");
+      return row["path"];
+    });
+  }
+
+  #registerSource(source: {sessionId: string; sessionFile: string; cwd: string}): void {
+    this.sources.register(source);
+  }
+
+  /** The live Pi manager supplies the header before a new file has been written. */
+  reserveSessionSource(source: {sessionId: string; sessionFile: string; cwd: string; parentSession?: string}): void {
+    this.#transaction(() => {
+      this.sources.register({sessionId:source.sessionId,sessionFile:source.sessionFile,cwd:source.cwd});
+      this.sources.setReserved(source.sessionFile, source.sessionId, source.parentSession);
+    });
+  }
+
+  /** Bounded conversion of the old task-derived inventory; safe to repeat after interruption. */
+  backfillSources(limit = 128): boolean {
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 128) throw new TypeError("Invalid backfill budget.");
+    return this.#transaction(() => this.#backfillSources(limit));
+  }
+
+  #backfillSources(limit: number): boolean {
+    const state = this.#database.prepare("SELECT phase, cursor_row FROM source_backfill WHERE singleton = 1").get();
+    if (!state || typeof state["phase"] !== "number" || typeof state["cursor_row"] !== "number") throw new Error("Invalid source backfill progress.");
+    let phase = state["phase"], cursor = state["cursor_row"], remaining = limit;
+    const tables = ["consolidation_jobs", "distill_triggers", "clean_tasks", "session_observations", "session_usages"];
+    if (!Number.isSafeInteger(phase) || phase < 0 || phase > tables.length || !Number.isSafeInteger(cursor) || cursor < 0) throw new Error("Invalid source backfill progress.");
+    while (phase < tables.length && remaining > 0) {
+      const table = tables[phase]!;
+      const columns = [jobColumns, triggerColumns, cleanTaskColumns, observationColumns, sessionUsageColumns][phase]!;
+      const rows = this.#database.prepare(`SELECT rowid AS cursorRow, ${columns} FROM ${table} WHERE rowid > ? ORDER BY rowid LIMIT ?`).all(cursor, remaining);
+      for (const raw of rows) {
+        const {cursorRow, ...fields} = this.#decodeRow(raw);
+        validateNow(cursorRow, "Source backfill cursor");
+        let source: {sessionId:string; sessionFile:string|null; cwd:string};
+        if (phase === 0) source = parsePersistedJobRow(fields).job;
+        else if (phase === 1) source = this.#readDistillTrigger(fields).trigger;
+        else if (phase === 2) source = parsePersistedCleanTask(fields).task;
+        else if (phase === 3) source = parseStoredSessionObservation(fields).observation;
+        else source = parseStoredSessionUsage(fields);
+        if (source.sessionFile !== null) {
+          this.sources.register({sessionId:source.sessionId, sessionFile:source.sessionFile, cwd:source.cwd});
+          const receipt = this.getDeletion(source.sessionFile);
+          if (receipt?.state === "complete" && receipt.sessionId === source.sessionId) this.sources.markDeleted(source.sessionFile,source.sessionId);
+        }
+        cursor = cursorRow;
       }
-      if (rowCount > maxSessionMetadataRows) {
-        throw new RangeError(
-          "Session discovery exceeds the " + maxSessionMetadataRows + "-row metadata limit.",
-        );
-      }
-      for (const row of this.#database.prepare(`SELECT ${jobColumns} FROM consolidation_jobs`).iterate()) {
-        parsePersistedJobRow(this.#decodeRow(row));
-      }
-      for (const row of this.#database.prepare(`SELECT ${triggerColumns} FROM distill_triggers`).iterate()) {
-        this.#readDistillTrigger(this.#decodeRow(row));
-      }
-      for (const row of this.#database.prepare(`SELECT ${cleanTaskColumns} FROM clean_tasks`).iterate()) {
-        parsePersistedCleanTask(this.#decodeRow(row));
-      }
-      for (const row of this.#database.prepare(
-        `SELECT ${observationColumns} FROM session_observations`,
-      ).iterate()) parseStoredSessionObservation(this.#decodeRow(row));
-      for (const row of this.#database.prepare(
-        `SELECT ${sessionUsageColumns} FROM session_usages`,
-      ).iterate()) {
-        parseStoredSessionUsage(this.#decodeRow(row));
-      }
-      const paths = this.#database.prepare(
-        "SELECT " + textColumn("path") + " FROM (" +
-        "SELECT json_extract(job_json, '$.sessionFile') AS path FROM consolidation_jobs " +
-        "UNION SELECT json_extract(trigger_json, '$.sessionFile') AS path FROM distill_triggers " +
-        "UNION SELECT json_extract(task_json, '$.sessionFile') AS path FROM clean_tasks " +
-        "UNION SELECT session_file AS path FROM session_observations " +
-        "UNION SELECT session_file AS path FROM session_usages" +
-        ") WHERE path IS NOT NULL AND NOT EXISTS (SELECT 1 FROM session_deletions d WHERE d.session_file = path AND d.state = 'complete') AND (? IS NULL OR path COLLATE BINARY > ?) " +
-        "ORDER BY path COLLATE BINARY LIMIT ?",
-      ).all(afterPath ?? null, afterPath ?? null, limit);
-      return paths.map((row) => {
-        const { path } = fields(this.#decodeRow(row), ["path"]);
-        validateAbsolutePath(path, "known session file");
-        return path;
-      });
-    }, "DEFERRED");
+      remaining -= rows.length;
+      if (rows.length === 0) { phase++; cursor = 0; }
+    }
+    this.#database.prepare("UPDATE source_backfill SET phase = ?, cursor_row = ? WHERE singleton = 1").run(phase,cursor);
+    if (phase === tables.length) this.sources.setBackfillComplete(true);
+    return phase === tables.length;
+  }
+
+  hasUncapturedObservation(scope: readonly string[]): boolean {
+    const filter = this.#scopeFilter(scope);
+    return this.#database.prepare(`SELECT 1 FROM session_observations WHERE captured = 0 AND ${filter.sql("session_file")} LIMIT 1`).get(...filter.values) !== undefined;
   }
 
   /** Distinguishes a path reserved by a fresh empty session from a captured source. */
@@ -2060,15 +2088,53 @@ export class SQLiteMemoryStore {
     return { token: row["token"], pid };
   }
 
+  #scopeFilter(scope?: readonly string[]): { values: string[]; sql: (column: string) => string } {
+    if (scope === undefined) return { values: [], sql: () => "1" };
+    if (!Array.isArray(scope) || scope.length > 1024) throw new TypeError("Invalid source scope.");
+    for (const path of scope) validateAbsolutePath(path, "Source scope path");
+    const requested = [...new Set(scope)].sort();
+    const placeholders = requested.map(() => "?").join(",");
+    const related = requested.length === 0 ? [] : this.#database.prepare(
+      "SELECT DISTINCT session_file AS path FROM managed_sources WHERE deleted = 0 AND (" +
+      `session_id IN (SELECT session_id FROM managed_sources WHERE session_file IN (${placeholders})) OR ` +
+      `physical_identity IN (SELECT physical_identity FROM managed_sources WHERE session_file IN (${placeholders}))) LIMIT 1025`,
+    ).all(...requested, ...requested);
+    if (related.length > 1024) throw new RangeError("Source aliases exceed the assessment budget.");
+    const values = [...new Set([...requested, ...related.map(raw => {
+      const path = this.#decodeRow(raw)["path"]; validateAbsolutePath(path, "Source alias path"); return path;
+    })])].sort();
+    return { values, sql: column => values.length ? `${column} IN (${values.map(() => "?").join(",")})` : "0" };
+  }
+
   /** Compare on this connection only; includes other connections and local mutations. */
-  retentionVersion(): string {
+  retentionVersion(scope?: readonly string[]): string {
     this.#ensureOpen();
+    if (scope !== undefined) {
+      const filter = this.#scopeFilter(scope);
+      const digest = createHash("sha256").update(String(this.sources.topologyVersion()));
+      for (const [table, columns, path, condition] of [
+        ["session_observations", observationColumns, "session_file", "1"],
+        ["session_usages", sessionUsageColumns, "session_file", "1"],
+        ["consolidation_jobs", "job_json, status", "json_extract(job_json, '$.sessionFile')", "status = 'pending'"],
+        ["distill_triggers", "trigger_json, status, compaction_record_id", "json_extract(trigger_json, '$.sessionFile')", "status <> 'complete'"],
+        ["clean_tasks", "task_json", "json_extract(task_json, '$.sessionFile')", "1"],
+      ]) {
+        let count = 0;
+        for (const raw of this.#database.prepare(`SELECT ${columns} FROM ${table} WHERE ${condition} AND ${filter.sql(path!)} ORDER BY rowid LIMIT ?`)
+          .iterate(...filter.values, maxSessionMetadataRows + 1)) {
+          if (++count > maxSessionMetadataRows) throw new RangeError("Source metadata exceeds its fence budget.");
+          digest.update(JSON.stringify(this.#decodeRow(raw)));
+        }
+      }
+      return digest.digest("hex");
+    }
     return `${this.#database.prepare("PRAGMA data_version").get()?.["data_version"]}:${this.#database.prepare("SELECT total_changes() AS n").get()?.["n"]}`;
   }
 
-  reconcileExitedSessionOwners(): void {
+  reconcileExitedSessionOwners(scope?: readonly string[]): void {
     this.#transaction(() => {
-      const rows = this.#database.prepare(`SELECT ${sessionUsageColumns} FROM session_usages WHERE state != 'released'`).all();
+      const filter = this.#scopeFilter(scope);
+      const rows = this.#database.prepare(`SELECT ${sessionUsageColumns} FROM session_usages WHERE state != 'released' AND ${filter.sql("session_file")} ORDER BY rowid LIMIT 128`).all(...filter.values);
       for (const raw of rows) {
         const owner = parseStoredSessionUsage(this.#decodeRow(raw));
         if (processHasExited(owner.ownerPid)) this.#database.prepare("UPDATE session_usages SET state = 'released' WHERE owner_id = ?").run(owner.ownerId);
@@ -2090,8 +2156,8 @@ export class SQLiteMemoryStore {
     return {sessionFile:row["session_file"], sessionId:row["session_id"], intentId:row["intent_id"], fileVersion:row["file_version"], state:row["state"]};
   }
 
-  #deletionTask(id: string, owner: string, access: string, version: string): CleanTaskInput | undefined {
-    if (this.retentionVersion() !== version || this.#sourceAccess()?.token !== access) return undefined;
+  #deletionTask(id: string, owner: string, access: string, version: string, scope?: readonly string[]): CleanTaskInput | undefined {
+    if (this.retentionVersion(scope) !== version || this.#sourceAccess()?.token !== access) return undefined;
     const raw = this.#database.prepare(`SELECT ${cleanTaskColumns} FROM clean_tasks WHERE id = ?`).get(id);
     if (!raw) return undefined;
     const record = parsePersistedCleanTask(this.#decodeRow(raw));
@@ -2099,10 +2165,10 @@ export class SQLiteMemoryStore {
     return record.task;
   }
 
-  prepareDeletion(id: string, owner: string, access: string, version: string, fileVersion: string): boolean {
+  prepareDeletion(id: string, owner: string, access: string, version: string, fileVersion: string, scope?: readonly string[]): boolean {
     if (typeof fileVersion !== "string" || !/^\d+:\d+:\d+:\d+:\d+$/.test(fileVersion)) throw new TypeError("Invalid deletion file version.");
     return this.#transaction(() => {
-      const task = this.#deletionTask(id, owner, access, version);
+      const task = this.#deletionTask(id, owner, access, version, scope);
       if (!task) return false;
       const previous = this.getDeletion(task.sessionFile);
       if (previous && (previous.state === "complete" || previous.sessionId !== task.sessionId || previous.fileVersion.split(":").slice(0, 2).join(":") !== fileVersion.split(":").slice(0, 2).join(":"))) return false;
@@ -2113,14 +2179,15 @@ export class SQLiteMemoryStore {
   }
 
   /** Callback performs only bounded synchronous identity checks/unlink, under the writer reservation. */
-  finishDeletion(id: string, owner: string, access: string, version: string, mutate: () => boolean): boolean {
+  finishDeletion(id: string, owner: string, access: string, version: string, mutate: () => boolean, scope?: readonly string[]): boolean {
     return this.#transaction(() => {
-      const task = this.#deletionTask(id, owner, access, version);
+      const task = this.#deletionTask(id, owner, access, version, scope);
       if (!task) return false;
       const receipt = this.getDeletion(task.sessionFile);
       if (!receipt || receipt.state !== "deleting" || receipt.sessionId !== task.sessionId || receipt.intentId !== task.intentId) return false;
       if (mutate() !== true) return false;
       this.#database.prepare("UPDATE session_deletions SET state = 'complete' WHERE session_file = ?").run(task.sessionFile);
+      this.sources.markDeleted(task.sessionFile, task.sessionId);
       this.#database.prepare("UPDATE clean_tasks SET lease_owner = NULL, lease_until = NULL WHERE id = ?").run(id);
       return true;
     });
@@ -2153,12 +2220,6 @@ export class SQLiteMemoryStore {
       retryCategory: record.retryCategory,
       retryAt: record.retryAt,
     };
-  }
-
-  #listPendingDistillTriggers(): readonly DistillTrigger[] {
-    return this.#database.prepare(
-      `SELECT ${triggerColumns} FROM distill_triggers WHERE status <> 'complete' ORDER BY rowid`,
-    ).all().map(row => this.#distillTriggerItem(this.#readDistillTrigger(row)));
   }
 
   #triggerJobIds(triggerId: string): readonly string[] {
@@ -2321,6 +2382,7 @@ export class SQLiteMemoryStore {
   }
 
   #enqueueConsolidationInTransaction(record: ConsolidationJob): void {
+    if (record.sessionFile !== null) this.#registerSource({sessionId: record.sessionId, sessionFile: record.sessionFile, cwd: record.cwd});
     const serialized = JSON.stringify(record);
     const row = this.#database.prepare(`SELECT ${jobColumns} FROM consolidation_jobs WHERE id = ?`).get(record.id);
     if (row !== undefined) {
@@ -2348,6 +2410,7 @@ export class SQLiteMemoryStore {
 
   #enqueueCleanTaskInTransaction(task: CleanTaskInput): CleanTask {
     const record = parseCleanTaskInput(task);
+    if (record.sessionFile !== null) this.#registerSource({sessionId: record.sessionId, sessionFile: record.sessionFile, cwd: record.cwd});
     const id = cleanTaskId(record.sessionFile);
     const serialized = JSON.stringify(record);
     const row = this.#database.prepare(`SELECT ${cleanTaskColumns} FROM clean_tasks WHERE id = ?`).get(id);
@@ -2432,8 +2495,14 @@ export class SQLiteMemoryStore {
 
   #initializeSchema(): void {
     const version = this.#database.prepare("PRAGMA user_version").get()?.["user_version"];
-    if (version !== 0 && version !== 1 && version !== 2 && version !== 3 && version !== 4 && version !== latestSchemaVersion) {
+    if (version !== 0 && version !== 1 && version !== 2 && version !== 3 && version !== 4 && version !== 5 && version !== latestSchemaVersion) {
       throw new Error("Unsupported memory database schema version: " + String(version) + ".");
+    }
+    if (version === latestSchemaVersion) {
+      this.#validateLatestSchema();
+      this.#validateMemoryRows();
+      this.#sourceAccess();
+      return;
     }
     const objects = this.#database.prepare(
       `SELECT ${schemaColumns} FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*'`,
@@ -2500,8 +2569,8 @@ export class SQLiteMemoryStore {
       this.#validateSchema(true, true);
       this.#validateAllRows(true, true);
     }
-    if (version !== 4 && version !== latestSchemaVersion) this.#migrateV3ToV4();
-    if (version !== latestSchemaVersion) {
+    if (version !== 4 && version !== 5) this.#migrateV3ToV4();
+    if (version !== 5) {
       this.#validateSchema(true);
       this.#validateAllRows();
       this.#database.exec(sourceAccessSchema);
@@ -2510,6 +2579,11 @@ export class SQLiteMemoryStore {
     }
     this.#validateLatestSchema();
     this.#validateAllRows();
+    initializeSourceRegistry(this.#database);
+    for (const sql of [sourceBackfillSchema, ...storeIndexes]) this.#database.exec(sql);
+    this.#database.prepare("INSERT INTO source_backfill VALUES (1,0,0)").run();
+    this.#backfillSources(128);
+    this.#database.exec("PRAGMA user_version = 6");
     this.#sourceAccess();
     for (const row of this.#database.prepare(`SELECT ${textColumn("session_file")} FROM session_deletions`).iterate()) {
       const path = this.#decodeRow(row)["session_file"];
@@ -2678,7 +2752,8 @@ export class SQLiteMemoryStore {
         ],
       });
     }
-    if (this.#database.prepare("PRAGMA user_version").get()?.["user_version"] === 5) {
+    const schemaVersion = this.#database.prepare("PRAGMA user_version").get()?.["user_version"];
+    if (typeof schemaVersion === "number" && schemaVersion >= 5) {
       schemas.set("source_access", { sql: sourceAccessSchema, columns: [
         { name: "singleton", type: "INTEGER", notNull: 1, primaryKey: 1 },
         { name: "token", type: "TEXT", notNull: 1, primaryKey: 0 },
@@ -2692,9 +2767,16 @@ export class SQLiteMemoryStore {
         { name: "state", type: "TEXT", notNull: 1, primaryKey: 0 },
       ] });
     }
-    if (objects.length !== schemas.size) throw new Error("Unsupported memory database schema.");
+    const additional = typeof schemaVersion === "number" && schemaVersion >= 6 ? [...SOURCE_REGISTRY_SCHEMAS, ...storeSchemas] : [];
+    const extraSchemas = new Map(additional.map(schema => [schema.name, schema.sql]));
+    if (objects.length !== schemas.size + extraSchemas.size) throw new Error("Unsupported memory database schema.");
     for (const object of objects) {
       const name = object["name"];
+      if (typeof name === "string" && extraSchemas.has(name)) {
+        const expected = extraSchemas.get(name)!;
+        if (typeof object["sql"] !== "string" || object["sql"].replace(/\s+/g, "").toUpperCase() !== expected.replace(/\s+/g, "").toUpperCase()) throw new Error("Unsupported registry schema.");
+        continue;
+      }
       if (typeof name !== "string" || object["type"] !== "table") {
         throw new Error("Unsupported memory database schema.");
       }
