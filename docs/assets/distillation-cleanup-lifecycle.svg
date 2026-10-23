@@ -1,0 +1,60 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1220" height="880" viewBox="0 0 1220 880" role="img" aria-labelledby="title description">
+<title id="title">Keep the knowledge. Let the chats go.</title>
+<desc id="description">Two durable queues connect conversation distillation, current memories, and eligible source deletion.</desc>
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#64748b"/></marker></defs>
+<rect width="1220" height="880" rx="20" fill="#f6f8fb"/>
+<text x="40" y="65" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="34" font-weight="700" fill="#163c40" text-anchor="start">Keep the knowledge. Let the chats go.</text>
+<text x="40" y="108" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="22" font-weight="400" fill="#465569" text-anchor="start">Distill uses the model. Cleanup performs local checks.</text>
+<rect x="40" y="180" width="320" height="110" rx="14" fill="#fff" stroke="#d9e1ec" stroke-width="1.5"/>
+<text x="60" y="215" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="23" font-weight="700" fill="#23354b" text-anchor="start">Conversation boundary</text>
+<text x="60" y="245" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="18" font-weight="400" fill="#465569" text-anchor="start">Session closes or</text>
+<text x="60" y="270" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="18" font-weight="400" fill="#465569" text-anchor="start">compaction succeeds</text>
+<rect x="450" y="180" width="320" height="110" rx="14" fill="#fff" stroke="#d9e1ec" stroke-width="1.5"/>
+<text x="470" y="215" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="23" font-weight="700" fill="#23354b" text-anchor="start">Distill queue</text>
+<text x="470" y="245" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="18" font-weight="400" fill="#465569" text-anchor="start">Durable source references</text>
+<text x="470" y="270" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="18" font-weight="400" fill="#465569" text-anchor="start">Recover after interruption</text>
+<rect x="860" y="180" width="320" height="110" rx="14" fill="#fff" stroke="#d9e1ec" stroke-width="1.5"/>
+<text x="880" y="215" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="23" font-weight="700" fill="#23354b" text-anchor="start">Background distill</text>
+<text x="880" y="245" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="18" font-weight="400" fill="#465569" text-anchor="start">Read evidence and memories</text>
+<text x="880" y="270" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="18" font-weight="400" fill="#465569" text-anchor="start">Propose memory changes</text>
+<rect x="860" y="370" width="320" height="110" rx="14" fill="#e3f3ee" stroke="#9bcdbd" stroke-width="1.5"/>
+<text x="880" y="405" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="23" font-weight="700" fill="#155f50" text-anchor="start">Durable commit</text>
+<text x="880" y="435" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="18" font-weight="400" fill="#465569" text-anchor="start">Memory changes + progress</text>
+<text x="880" y="460" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="18" font-weight="400" fill="#465569" text-anchor="start">Complete the processed range</text>
+<rect x="450" y="370" width="320" height="110" rx="14" fill="#e3f3ee" stroke="#9bcdbd" stroke-width="1.5"/>
+<text x="470" y="405" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="23" font-weight="700" fill="#155f50" text-anchor="start">Current memories</text>
+<text x="470" y="435" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="18" font-weight="400" fill="#465569" text-anchor="start">Decisions, conditions, tasks</text>
+<text x="470" y="460" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="18" font-weight="400" fill="#465569" text-anchor="start">Corrections keep them current</text>
+<rect x="40" y="370" width="320" height="110" rx="14" fill="#e3f3ee" stroke="#9bcdbd" stroke-width="1.5"/>
+<text x="60" y="405" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="23" font-weight="700" fill="#155f50" text-anchor="start">Fresh session</text>
+<text x="60" y="435" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="18" font-weight="400" fill="#465569" text-anchor="start">Search and read memories</text>
+<text x="60" y="460" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="18" font-weight="400" fill="#465569" text-anchor="start">Continue related work</text>
+<rect x="860" y="560" width="320" height="110" rx="14" fill="#fff" stroke="#d9e1ec" stroke-width="1.5"/>
+<text x="880" y="595" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="23" font-weight="700" fill="#23354b" text-anchor="start">Cleanup queue</text>
+<text x="880" y="625" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="18" font-weight="400" fill="#465569" text-anchor="start">Added on range completion</text>
+<text x="880" y="650" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="18" font-weight="400" fill="#465569" text-anchor="start">Independent of the model</text>
+<rect x="450" y="560" width="320" height="110" rx="14" fill="#fff" stroke="#d9e1ec" stroke-width="1.5"/>
+<text x="470" y="595" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="23" font-weight="700" fill="#23354b" text-anchor="start">Assess whole source</text>
+<text x="470" y="625" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="18" font-weight="400" fill="#465569" text-anchor="start">Processed, unused, unchanged</text>
+<text x="470" y="650" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="18" font-weight="400" fill="#465569" text-anchor="start">Dependencies resolved</text>
+<rect x="40" y="560" width="320" height="110" rx="14" fill="#fff3e7" stroke="#e3c9aa" stroke-width="1.5"/>
+<text x="60" y="595" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="23" font-weight="700" fill="#80512a" text-anchor="start">Delete chat file</text>
+<text x="60" y="625" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="18" font-weight="400" fill="#465569" text-anchor="start">Remove the eligible source</text>
+<text x="60" y="650" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="18" font-weight="400" fill="#465569" text-anchor="start">Keep distilled memories</text>
+<polyline points="360,235 440,235" fill="none" stroke="#64748b" stroke-width="2.5" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<polyline points="770,235 850,235" fill="none" stroke="#64748b" stroke-width="2.5" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<polyline points="1020,290 1020,360" fill="none" stroke="#64748b" stroke-width="2.5" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<polyline points="860,425 780,425" fill="none" stroke="#64748b" stroke-width="2.5" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<polyline points="450,425 370,425" fill="none" stroke="#64748b" stroke-width="2.5" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<polyline points="1020,480 1020,550" fill="none" stroke="#64748b" stroke-width="2.5" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<polyline points="860,615 780,615" fill="none" stroke="#64748b" stroke-width="2.5" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<polyline points="450,615 370,615" fill="none" stroke="#64748b" stroke-width="2.5" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<polyline points="610,670 610,730" fill="none" stroke="#64748b" stroke-width="2.5" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<polyline points="770,775 1020,775 1020,680" fill="none" stroke="#64748b" stroke-width="2.5" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<text x="405" y="599" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="15" font-weight="400" fill="#465569" text-anchor="middle">Eligible</text>
+<text x="625" y="706" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="16" font-weight="400" fill="#465569" text-anchor="start">Pending</text>
+<rect x="450" y="740" width="320" height="80" rx="14" fill="#fff3e7" stroke="#e3c9aa" stroke-width="1.5"/>
+<text x="470" y="775" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="23" font-weight="700" fill="#80512a" text-anchor="start">Retain and recheck</text>
+<text x="470" y="805" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="18" font-weight="400" fill="#465569" text-anchor="start">Wait for work or protection to end</text>
+<text x="40" y="852" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="18" font-weight="400" fill="#465569" text-anchor="start">A completed range queues cleanup; deletion requires the whole source to be eligible.</text>
+</svg>

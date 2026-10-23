@@ -1,0 +1,60 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="930" viewBox="0 0 1600 930" role="img" aria-labelledby="title description">
+  <title id="title">pi-distill 产品工作流愿景</title>
+  <desc id="description">从对话中提炼记忆，为新对话检索相关上下文；处理完成、无人使用且依赖解决后清理聊天原文。记忆查看器展示产品愿景。</desc>
+  <rect width="1600" height="930" fill="#f6f8fb" />
+  <text x="60" y="88.8" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="48" font-weight="700" fill="#163c40">pi-distill</text>
+  <text x="62" y="132.25" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="25" font-weight="400" fill="#465569">为 Pi 提供自适应记忆与上下文。</text>
+  <text x="62" y="200.9" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="14" font-weight="700" fill="#64748b">产品工作流愿景</text>
+  <rect x="60" y="240" width="300" height="170" rx="18" fill="#ffffff" stroke="#d9e1ec" />
+  <text x="84" y="287.25" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="25" font-weight="700" fill="#23354b">对话</text>
+  <text x="84" y="333.15" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="19" font-weight="400" fill="#465569">自由切换话题，随时开始新对话</text>
+  <text x="84" y="362.15" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="19" font-weight="400" fill="#465569">也涵盖压缩前的对话历史</text>
+  <rect x="440" y="240" width="300" height="170" rx="18" fill="#ffffff" stroke="#d9e1ec" />
+  <text x="464" y="287.25" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="25" font-weight="700" fill="#23354b">提炼记忆</text>
+  <text x="464" y="333.15" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="19" font-weight="400" fill="#465569">决策、经验、任务</text>
+  <text x="464" y="362.15" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="19" font-weight="400" fill="#465569">以及稳定的偏好</text>
+  <rect x="820" y="240" width="300" height="170" rx="18" fill="#e3f3ee" stroke="#9bcdbd" />
+  <text x="844" y="287.25" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="25" font-weight="700" fill="#155f50">记忆管理</text>
+  <text x="844" y="333.15" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="19" font-weight="400" fill="#465569">保留有用的知识</text>
+  <text x="844" y="362.15" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="19" font-weight="400" fill="#465569">更新、纠正或遗忘</text>
+  <rect x="1200" y="240" width="300" height="170" rx="18" fill="#ffffff" stroke="#d9e1ec" />
+  <text x="1224" y="287.25" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="25" font-weight="700" fill="#23354b">记忆查看器</text>
+  <text x="1224" y="333.15" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="19" font-weight="400" fill="#465569">使用了哪些记忆，为什么</text>
+  <text x="1224" y="362.15" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="19" font-weight="400" fill="#465569">何时提炼、何时更新</text>
+  <polyline points="365,325 430,325" fill="none" stroke="#7c8ca3" stroke-width="3" />
+  <polygon points="430,325 418.0,319.0 418.0,331.0" fill="#7c8ca3" />
+  <polyline points="745,325 810,325" fill="none" stroke="#7c8ca3" stroke-width="3" />
+  <polygon points="810,325 798.0,319.0 798.0,331.0" fill="#7c8ca3" />
+  <polyline points="1125,325 1190,325" fill="none" stroke="#7c8ca3" stroke-width="3" />
+  <polygon points="1190,325 1178.0,319.0 1178.0,331.0" fill="#7c8ca3" />
+  <rect x="60" y="620" width="300" height="170" rx="18" fill="#fff3e7" stroke="#e3c9aa" />
+  <text x="84" y="667.25" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="25" font-weight="700" fill="#80512a">清理聊天历史</text>
+  <text x="84" y="713.15" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="19" font-weight="400" fill="#465569">删除受管理的聊天原文</text>
+  <text x="84" y="742.15" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="19" font-weight="400" fill="#465569">保留提炼后的记忆</text>
+  <rect x="440" y="620" width="300" height="170" rx="18" fill="#ffffff" stroke="#d9e1ec" />
+  <text x="464" y="667.25" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="25" font-weight="700" fill="#23354b">新输入</text>
+  <text x="464" y="713.15" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="19" font-weight="400" fill="#465569">当前消息</text>
+  <text x="464" y="742.15" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="19" font-weight="400" fill="#465569">以及近期对话</text>
+  <rect x="820" y="620" width="300" height="170" rx="18" fill="#e3f3ee" stroke="#9bcdbd" />
+  <text x="844" y="667.25" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="25" font-weight="700" fill="#155f50">相关上下文</text>
+  <text x="844" y="713.15" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="19" font-weight="400" fill="#465569">选择有帮助的记忆</text>
+  <text x="844" y="742.15" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="19" font-weight="400" fill="#465569">控制大小与处理时间</text>
+  <rect x="1200" y="620" width="300" height="170" rx="18" fill="#ffffff" stroke="#d9e1ec" />
+  <text x="1224" y="667.25" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="25" font-weight="700" fill="#23354b">Pi 回答</text>
+  <text x="1224" y="713.15" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="19" font-weight="400" fill="#465569">结合有用的背景知识</text>
+  <text x="1224" y="742.15" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="19" font-weight="400" fill="#465569">继续对话与工作</text>
+  <polyline points="970,416 970,610" fill="none" stroke="#287c66" stroke-width="3" />
+  <polygon points="970,610 976.0,598.0 964.0,598.0" fill="#287c66" />
+  <text x="991" y="522.3" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="18" font-weight="400" fill="#287c66">检索</text>
+  <polyline points="745,705 810,705" fill="none" stroke="#7c8ca3" stroke-width="3" />
+  <polygon points="810,705 798.0,699.0 798.0,711.0" fill="#7c8ca3" />
+  <polyline points="1125,705 1190,705" fill="none" stroke="#7c8ca3" stroke-width="3" />
+  <polygon points="1190,705 1178.0,699.0 1178.0,711.0" fill="#7c8ca3" />
+  <polyline points="210,416 210,451" fill="none" stroke="#b78b59" stroke-width="3" stroke-dasharray="9 9" />
+  <polyline points="210,566 210,610" fill="none" stroke="#b78b59" stroke-width="3" stroke-dasharray="9 9" />
+  <polygon points="210,610 216.0,598.0 204.0,598.0" fill="#b78b59" />
+  <text x="74" y="481.45" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="17" font-weight="400" fill="#80512a">处理结果已持久化，</text>
+  <text x="74" y="508.45" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="17" font-weight="400" fill="#80512a">确认文件不再使用，</text>
+  <text x="74" y="535.45" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="17" font-weight="400" fill="#80512a">且源文件依赖已解决。</text>
+  <text x="60" y="866.15" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="19" font-weight="400" fill="#526276">本地记忆  /  不永久归档聊天  /  由用户掌握纠正与遗忘</text>
+</svg>

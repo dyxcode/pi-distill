@@ -6,11 +6,17 @@ English | [简体中文](docs/i18n/README.zh-CN.md)
 
 pi-distill is an extension for [Pi](https://github.com/earendil-works/pi) that brings memory into everyday conversations.
 
+## Product vision
+
 ![Conversations become memories that supply context to future Pi sessions.](docs/assets/pi-distill-workflow.svg)
 
-## Vision
+*Product vision, including the planned memory inspector.*
 
-Start a fresh session and move freely between topics and projects. Pi brings useful knowledge from earlier conversations into the work at hand.
+Open a fresh session and continue your work. pi-distill aims to make relevant memories available wherever the conversation goes.
+
+Sessions are temporary places to talk. You can move between topics and projects, close Pi, and start again without naming conversations or finding the session where a decision was made. You can work in several terminals at once, with each session drawing on the same personal memory store.
+
+The extension maintains memories through ordinary conversation. It brings back the knowledge relevant to the current request, including decisions, preferences, conditions, and unfinished work. You choose what to work on; pi-distill handles remembering and letting old chats go.
 
 pi-distill aims to:
 
@@ -36,7 +42,7 @@ Delete chat history
 
 ### Keep the knowledge, let the chats go
 
-Distilled memories carry useful knowledge after the original conversations are deleted. Chat cleanup follows your retention policy, removing the original chats and managed copies after processing is complete and the sessions are inactive.
+Useful knowledge lives on in memories after its original conversation is gone. Completed memory processing and the end of session use make old chats eligible for automatic cleanup. A fresh session continues from relevant memories, so continuity comes from what was learned rather than from reopening a particular chat.
 
 ### Design principles
 
@@ -46,12 +52,22 @@ Distilled memories carry useful knowledge after the original conversations are d
 
 ## Available today
 
-- Pi extension loading and reload through Pi's normal extension system.
-- A local SQLite store for saving, reading, correcting, and forgetting memories.
-- Agentic memory search through `memory_search` and `memory_read`.
+### Automatic distillation and cleanup
+
+When a session ends or compaction succeeds, pi-distill records distillation work. A live Pi uses its model to process that evidence in the background, creating, correcting, or deleting memories as the conversation warrants. Exit saves pending work; after the last Pi process closes, it continues on the next startup.
+
+Cleanup independently performs local checks and deletes managed chat files once processing is complete, use has ended, and dependencies are resolved. Memories remain available. Knowledge from a just-closed conversation becomes searchable after distillation commits it. See [Distillation and cleanup](docs/distillation-and-cleanup.md) for queue timing and diagrams.
 
 ### Agentic memory search
 
-Pi's current model can choose search terms, try alternate expressions and languages, inspect candidates, and read their current content before judging applicability. SQLite performs literal matching across the personal memory store. Memories remain searchable across projects, with their original context available for interpretation.
+Pi's current model chooses keywords and alternate expressions or languages through `memory_search`, then uses `memory_read` to inspect candidates and judge applicability. SQLite performs literal matching. Memories remain searchable across projects, with their original conditions and context.
 
-Search results include original text previews, with pagination and full reads for further exploration. See [Agentic memory search](docs/agentic-search.md) for the tool contracts and retrieval behavior.
+Search and read results appear in Pi's tool cards. Expanded results show search terms, matching previews, read content, and memory update times. See [Agentic memory search](docs/agentic-search.md) for tool contracts and retrieval behavior.
+
+### Local storage and recovery
+
+Memories and task queues persist in local SQLite. The extension supports normal Pi loading and reload, coordinates multiple Pi processes sharing the store, and recovers persisted pending work after restart. Distillation uses the claiming Pi's configured model and sends relevant evidence to that model provider.
+
+## Recommended use
+
+Start fresh with `pi` or `/new`, and let relevant memories carry your work forward. While automatic cleanup is running, leave old session files to the extension. The [operation checklist](docs/distillation-and-cleanup.md#operations-to-avoid-with-automatic-cleanup) lists Pi's old-session commands and UI actions to avoid, with reasons and current-session distinctions. See [Distillation and cleanup](docs/distillation-and-cleanup.md) for timing and diagrams.

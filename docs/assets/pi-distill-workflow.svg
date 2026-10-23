@@ -51,8 +51,8 @@
 <polyline points="210,416 210,451" fill="none" stroke="#b78b59" stroke-width="3" stroke-dasharray="9 9"/>
 <polyline points="210,566 210,610" fill="none" stroke="#b78b59" stroke-width="3" stroke-dasharray="9 9"/>
 <polygon points="210,610 216.0,598.0 204.0,598.0" fill="#b78b59"/>
-<text x="74" y="481.45" font-family="Arial,sans-serif" font-size="17" font-weight="400" fill="#80512a">Only after durable processing,</text>
-<text x="74" y="508.45" font-family="Arial,sans-serif" font-size="17" font-weight="400" fill="#80512a">inactivity checks, and an</text>
-<text x="74" y="535.45" font-family="Arial,sans-serif" font-size="17" font-weight="400" fill="#80512a">explicit deletion policy.</text>
+<text x="74" y="481.45" font-family="Arial,sans-serif" font-size="17" font-weight="400" fill="#80512a">After durable processing,</text>
+<text x="74" y="508.45" font-family="Arial,sans-serif" font-size="17" font-weight="400" fill="#80512a">inactivity checks, and</text>
+<text x="74" y="535.45" font-family="Arial,sans-serif" font-size="17" font-weight="400" fill="#80512a">resolved source dependencies.</text>
 <text x="60" y="866.15" font-family="Arial,sans-serif" font-size="19" font-weight="400" fill="#526276">Local memory  /  No permanent chat archive  /  User-controlled correction and forgetting</text>
 </svg>

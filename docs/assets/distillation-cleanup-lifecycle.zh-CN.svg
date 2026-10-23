@@ -1,0 +1,60 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1220" height="880" viewBox="0 0 1220 880" role="img" aria-labelledby="title description">
+<title id="title">保留知识，让旧聊天离开。</title>
+<desc id="description">两个持久化队列连接对话提炼、当前记忆和符合条件的聊天删除。</desc>
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#64748b"/></marker></defs>
+<rect width="1220" height="880" rx="20" fill="#f6f8fb"/>
+<text x="40" y="65" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="34" font-weight="700" fill="#163c40" text-anchor="start">保留知识，让旧聊天离开。</text>
+<text x="40" y="108" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="22" font-weight="400" fill="#465569" text-anchor="start">Distill 使用模型；cleanup 执行本地检查。</text>
+<rect x="40" y="180" width="320" height="110" rx="14" fill="#fff" stroke="#d9e1ec" stroke-width="1.5"/>
+<text x="60" y="215" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="23" font-weight="700" fill="#23354b" text-anchor="start">记录对话边界</text>
+<text x="60" y="245" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="18" font-weight="400" fill="#465569" text-anchor="start">Session 结束，或</text>
+<text x="60" y="270" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="18" font-weight="400" fill="#465569" text-anchor="start">上下文压缩成功</text>
+<rect x="450" y="180" width="320" height="110" rx="14" fill="#fff" stroke="#d9e1ec" stroke-width="1.5"/>
+<text x="470" y="215" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="23" font-weight="700" fill="#23354b" text-anchor="start">Distill 队列</text>
+<text x="470" y="245" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="18" font-weight="400" fill="#465569" text-anchor="start">持久化源文件引用</text>
+<text x="470" y="270" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="18" font-weight="400" fill="#465569" text-anchor="start">中断后继续恢复</text>
+<rect x="860" y="180" width="320" height="110" rx="14" fill="#fff" stroke="#d9e1ec" stroke-width="1.5"/>
+<text x="880" y="215" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="23" font-weight="700" fill="#23354b" text-anchor="start">后台提炼</text>
+<text x="880" y="245" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="18" font-weight="400" fill="#465569" text-anchor="start">读取证据和已有记忆</text>
+<text x="880" y="270" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="18" font-weight="400" fill="#465569" text-anchor="start">提出记忆变更</text>
+<rect x="860" y="370" width="320" height="110" rx="14" fill="#e3f3ee" stroke="#9bcdbd" stroke-width="1.5"/>
+<text x="880" y="405" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="23" font-weight="700" fill="#155f50" text-anchor="start">持久化提交</text>
+<text x="880" y="435" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="18" font-weight="400" fill="#465569" text-anchor="start">记忆变更与处理进度</text>
+<text x="880" y="460" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="18" font-weight="400" fill="#465569" text-anchor="start">完成对应范围的处理</text>
+<rect x="450" y="370" width="320" height="110" rx="14" fill="#e3f3ee" stroke="#9bcdbd" stroke-width="1.5"/>
+<text x="470" y="405" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="23" font-weight="700" fill="#155f50" text-anchor="start">当前记忆</text>
+<text x="470" y="435" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="18" font-weight="400" fill="#465569" text-anchor="start">决策、条件、任务</text>
+<text x="470" y="460" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="18" font-weight="400" fill="#465569" text-anchor="start">通过修正保持准确</text>
+<rect x="40" y="370" width="320" height="110" rx="14" fill="#e3f3ee" stroke="#9bcdbd" stroke-width="1.5"/>
+<text x="60" y="405" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="23" font-weight="700" fill="#155f50" text-anchor="start">新 session</text>
+<text x="60" y="435" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="18" font-weight="400" fill="#465569" text-anchor="start">搜索并读取记忆</text>
+<text x="60" y="460" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="18" font-weight="400" fill="#465569" text-anchor="start">继续相关工作</text>
+<rect x="860" y="560" width="320" height="110" rx="14" fill="#fff" stroke="#d9e1ec" stroke-width="1.5"/>
+<text x="880" y="595" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="23" font-weight="700" fill="#23354b" text-anchor="start">Cleanup 队列</text>
+<text x="880" y="625" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="18" font-weight="400" fill="#465569" text-anchor="start">范围处理完成后加入</text>
+<text x="880" y="650" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="18" font-weight="400" fill="#465569" text-anchor="start">独立于模型运行</text>
+<rect x="450" y="560" width="320" height="110" rx="14" fill="#fff" stroke="#d9e1ec" stroke-width="1.5"/>
+<text x="470" y="595" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="23" font-weight="700" fill="#23354b" text-anchor="start">评估整个源文件</text>
+<text x="470" y="625" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="18" font-weight="400" fill="#465569" text-anchor="start">已处理、无人使用、未变化</text>
+<text x="470" y="650" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="18" font-weight="400" fill="#465569" text-anchor="start">依赖已经解决</text>
+<rect x="40" y="560" width="320" height="110" rx="14" fill="#fff3e7" stroke="#e3c9aa" stroke-width="1.5"/>
+<text x="60" y="595" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="23" font-weight="700" fill="#80512a" text-anchor="start">删除聊天文件</text>
+<text x="60" y="625" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="18" font-weight="400" fill="#465569" text-anchor="start">移除符合条件的源文件</text>
+<text x="60" y="650" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="18" font-weight="400" fill="#465569" text-anchor="start">保留提炼后的记忆</text>
+<polyline points="360,235 440,235" fill="none" stroke="#64748b" stroke-width="2.5" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<polyline points="770,235 850,235" fill="none" stroke="#64748b" stroke-width="2.5" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<polyline points="1020,290 1020,360" fill="none" stroke="#64748b" stroke-width="2.5" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<polyline points="860,425 780,425" fill="none" stroke="#64748b" stroke-width="2.5" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<polyline points="450,425 370,425" fill="none" stroke="#64748b" stroke-width="2.5" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<polyline points="1020,480 1020,550" fill="none" stroke="#64748b" stroke-width="2.5" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<polyline points="860,615 780,615" fill="none" stroke="#64748b" stroke-width="2.5" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<polyline points="450,615 370,615" fill="none" stroke="#64748b" stroke-width="2.5" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<polyline points="610,670 610,730" fill="none" stroke="#64748b" stroke-width="2.5" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<polyline points="770,775 1020,775 1020,680" fill="none" stroke="#64748b" stroke-width="2.5" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<text x="405" y="599" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="15" font-weight="400" fill="#465569" text-anchor="middle">满足条件</text>
+<text x="625" y="706" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="16" font-weight="400" fill="#465569" text-anchor="start">待处理</text>
+<rect x="450" y="740" width="320" height="80" rx="14" fill="#fff3e7" stroke="#e3c9aa" stroke-width="1.5"/>
+<text x="470" y="775" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="23" font-weight="700" fill="#80512a" text-anchor="start">保留，稍后重新检查</text>
+<text x="470" y="805" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="18" font-weight="400" fill="#465569" text-anchor="start">等待工作完成或使用保护结束</text>
+<text x="40" y="852" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="18" font-weight="400" fill="#465569" text-anchor="start">一段处理完成即可加入清理队列；删除要求整个源文件符合条件。</text>
+</svg>
