@@ -21,7 +21,17 @@ async function fixture(t,long=false){
  store.enqueueCleanTask({...source,reason:'close',intentId:'test'});
  t.after(async()=>{for(const worker of workers)worker.close();for(const s of opened)s.close();await rm(root,{recursive:true,force:true});});
  const view=async leaf=>{let result;do{result=await store.sourceViews.advance(file,leaf);}while(!result.ready);return result.view;};
- const complete=async leaf=>{const v=await view(leaf);let cursor=0;do{const page=await v.page(cursor);const done=new Set(store.processedSources(page.items.map(i=>i.part.key)));const keys=page.items.map(i=>i.part.key).filter(k=>!done.has(k));if(keys.length){const id=`job-${leaf}-${cursor}`;store.enqueueConsolidation({id,...source,leafId:leaf,sourceKeys:keys});store.claimConsolidation(id,'test',Date.now(),60000);store.commitConsolidation({jobId:id,owner:'test',now:Date.now(),creates:[],updates:[],deletes:[]});}cursor=page.nextCursor;}while(cursor!==undefined);};
+ const complete=async leaf=>{
+  // Synthetic distillation participates in the same source-access protocol as
+  // the running cleaner, so its fixture writes cannot race a coverage page.
+  const deadline=Date.now()+5000;let access;
+  while(!(access=store.acquireSourceAccess())&&Date.now()<deadline)await new Promise(r=>setTimeout(r,10));
+  assert.ok(access,'synthetic distillation must acquire source access');
+  try{
+   const v=await view(leaf);let cursor=0;
+   do{const page=await v.page(cursor);const done=new Set(store.processedSources(page.items.map(i=>i.part.key)));const keys=page.items.map(i=>i.part.key).filter(k=>!done.has(k));if(keys.length){const id=`job-${leaf}-${cursor}`;store.enqueueConsolidation({id,...source,leafId:leaf,sourceKeys:keys});store.claimConsolidation(id,'test',Date.now(),60000);store.commitConsolidation({jobId:id,owner:'test',now:Date.now(),creates:[],updates:[],deletes:[]});}cursor=page.nextCursor;}while(cursor!==undefined);
+  }finally{store.releaseSourceAccess(access);}
+ };
  const worker=()=>{const c=new CleanupCoordinator({openStore:open,retryDelayMs:1});workers.push(c);return c;};
  return {root,file,source,open,store,view,complete,worker,entries};
 }
@@ -52,7 +62,10 @@ test('a recorded historical boundary retains evidence removed from the terminal 
  f.store.observeSession({...f.source,leafId:'base',ownerPid:2147483647});f.store.acknowledgeObservation('source','base');
  const c=f.worker();c.wake();await c.whenIdle();assert.ok(await readFile(f.file));
  assert.equal(f.store.listCleanTasks({limit:10}).items.find(t=>t.sessionFile===f.file).waitReason,'unprocessed');
- await f.complete('base');c.wake();await c.whenIdle();await assert.rejects(readFile(f.file),{code:'ENOENT'});
+ await f.complete('base');c.wake();await c.whenIdle();
+ const deadline=Date.now()+2000;
+ while(Date.now()<deadline){try{await readFile(f.file);}catch(e){if(e.code==='ENOENT')break;throw e;}await new Promise(r=>setTimeout(r,10));}
+ await assert.rejects(readFile(f.file),{code:'ENOENT'});
 });
 
 test('source fences scale beyond the prior metadata cap and detect other connections without changing for lease bookkeeping',async t=>{

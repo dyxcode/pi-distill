@@ -113,6 +113,7 @@ export interface CleanTask extends CleanTaskInput {
 }
 
 export interface CleanTaskPageOptions {
+  readonly throughCursor?: number;
   readonly limit: number;
   readonly cursor?: number;
   /** When omitted, return future retry tasks so an explicit wake can recheck them. */

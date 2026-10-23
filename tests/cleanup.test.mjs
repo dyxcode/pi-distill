@@ -1,5 +1,6 @@
 import {fork} from 'node:child_process';
 import {once} from 'node:events';
+import {DatabaseSync} from 'node:sqlite';
 import assert from 'node:assert/strict';
 import { link, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -9,6 +10,7 @@ import { SessionManager } from '@earendil-works/pi-coding-agent';
 import { SQLiteMemoryStore } from '../src/memory-store.ts';
 import { loadSnapshot, planSources } from '../src/consolidation-source.ts';
 import { CleanupCoordinator } from '../src/cleanup.ts';
+import { DistillFailure } from '../src/distill-failure.ts';
 import { readSessionHeader } from '../src/session-header.ts';
 
 async function fixture(t) {
@@ -378,4 +380,192 @@ test('two actual Pi-side worker processes coordinate one deletion',async t=>{
  const fileState=await readFile(f.file).then(()=> 'present',error=>error.code);
  assert.equal(fileState,'ENOENT',JSON.stringify({task:f.task(),deletion:f.store.getDeletion(f.file),stderrA:a.stderr(),stderrB:b.stderr()}));
  assert.equal(f.store.getDeletion(f.file).state,'complete');
+});
+
+test('cleanup automatically resumes after a source reservation is released without another wake', async t => {
+  const f = await fixture(t); await f.complete(); await releaseFixture(f);
+  const access = f.store.acquireSourceAccess(); assert.ok(access);
+  t.mock.timers.enable({apis:['setTimeout','Date'],now:Date.now()});
+  const c = f.worker({retryDelayMs:undefined}); c.wake(); await c.whenIdle();
+  assert.ok(await readFile(f.file));
+  f.store.releaseSourceAccess(access);
+  t.mock.timers.tick(100); await c.whenIdle();
+  await assert.rejects(readFile(f.file),{code:'ENOENT'});
+});
+
+test('a held reservation uses bounded backoff and a later release resumes cleanup without host activity', async t => {
+  const f=await fixture(t);await f.complete();await releaseFixture(f);
+  const access=f.store.acquireSourceAccess();let probes=0;
+  class ObservedStore extends SQLiteMemoryStore { acquireSourceAccess(){probes++;return super.acquireSourceAccess();} }
+  t.mock.timers.enable({apis:['setTimeout','Date'],now:Date.now()});
+  const c=f.worker({retryDelayMs:undefined,openStore:()=>new ObservedStore(f.path)});c.wake();await c.whenIdle();
+  const initial=probes;
+  t.mock.timers.tick(100);await c.whenIdle();assert.ok(probes>initial,'temporary contention must retry promptly');
+  const afterFirst=probes;
+  t.mock.timers.tick(100);await c.whenIdle();assert.equal(probes,afterFirst,'the second retry backs off');
+  for(let i=0;i<30;i++){t.mock.timers.tick(100);await c.whenIdle();}
+  assert.ok(probes<40,'held access must not cause a tight poll loop');assert.ok(await readFile(f.file));
+  f.store.releaseSourceAccess(access);t.mock.timers.tick(5000);await c.whenIdle();
+  await assert.rejects(readFile(f.file),{code:'ENOENT'});
+});
+
+test('a wake bypassing an old assessment survives temporary contention without a second wake',async t=>{
+  const f=await fixture(t);await f.complete();
+  const previous=f.worker();previous.wake();await previous.whenIdle();previous.close();
+  assert.equal(f.task().waitReason,'usage');await releaseFixture(f);
+  const access=f.store.acquireSourceAccess();
+  t.mock.timers.enable({apis:['setTimeout','Date'],now:Date.now()});
+  const c=f.worker({retryDelayMs:undefined});c.wake();await c.whenIdle();
+  f.store.releaseSourceAccess(access);
+  for(let i=0;i<10;i++){t.mock.timers.tick(100);await c.whenIdle();}
+  await assert.rejects(readFile(f.file),{code:'ENOENT'});
+});
+
+test('temporary source projection conflicts retry automatically without marking the source unavailable',async t=>{
+  const f=await fixture(t);await f.complete();await releaseFixture(f);
+  let conflicts=0;
+  class ContendedStore extends SQLiteMemoryStore {
+    get sourceCoverage(){
+      const coverage=super.sourceCoverage,advance=coverage.advance.bind(coverage);
+      coverage.advance=async(...args)=>{
+        if(conflicts++<3)throw new DistillFailure('conflict','Another source projection writer committed first.');
+        return advance(...args);
+      };
+      return coverage;
+    }
+  }
+  t.mock.timers.enable({apis:['setTimeout','Date'],now:Date.now()});
+  const c=f.worker({retryDelayMs:undefined,openStore:()=>new ContendedStore(f.path)});c.wake();await c.whenIdle();
+  assert.notEqual(f.task()?.waitReason,'unavailable','a concurrent writer is not an invalid source');
+  for(let i=0;i<20;i++){t.mock.timers.tick(100);await c.whenIdle();}
+  await assert.rejects(readFile(f.file),{code:'ENOENT'});
+});
+
+test('a temporary SQLite writer lock resumes maintenance after release without a second wake',async t=>{
+  const f=await fixture(t);await f.complete();await releaseFixture(f);
+  const workerStore=new SQLiteMemoryStore(f.path),writer=new DatabaseSync(f.path);
+  writer.exec('BEGIN IMMEDIATE');t.after(()=>writer.close());
+  t.mock.timers.enable({apis:['setTimeout','Date'],now:Date.now()});
+  const c=f.worker({retryDelayMs:undefined,openStore:()=>workerStore});c.wake();await c.whenIdle();
+  assert.ok(await readFile(f.file));writer.exec('ROLLBACK');
+  for(let i=0;i<10;i++){t.mock.timers.tick(100);await c.whenIdle();}
+  await assert.rejects(readFile(f.file),{code:'ENOENT'});
+});
+
+test('one wake examines later clean pages automatically and then stops fast polling blocked sources', async t => {
+  const f=await fixture(t);
+  for(let i=0;i<11;i++)f.store.enqueueCleanTask({...f.input(),sessionFile:join(f.root,`missing-${i}.jsonl`)});
+  t.mock.timers.enable({apis:['setTimeout','Date'],now:Date.now()});
+  const c=f.worker({retryDelayMs:undefined});c.wake();await c.whenIdle();
+  for(let i=0;i<20;i++){t.mock.timers.tick(100);await c.whenIdle();}
+  const before=f.store.listCleanTasks({limit:20}).items;
+  assert.ok(before.every(x=>x.status==='waiting'),'all bounded pages must be visited without extra wakes');
+  for(let i=0;i<20;i++){t.mock.timers.tick(100);await c.whenIdle();}
+  assert.deepEqual(f.store.listCleanTasks({limit:20}).items,before,'blocked tasks must not be reassessed on every short tick');
+});
+
+test('one wake deletes eligible sources beyond the clean page limit without changing memories',async t=>{
+  const f=await fixture(t),files=[];
+  f.store.save({id:'retained',content:'Synthetic Cedar keeps local tests.',createdAt:'2026-10-23T00:00:00.000Z'});
+  for(let i=0;i<11;i++){
+    const manager=SessionManager.inMemory(f.root),file=join(f.root,`ready-${i}.jsonl`);files.push(file);
+    await writeFile(file,JSON.stringify(manager.getHeader())+'\n');
+    const source={sessionId:manager.getSessionId(),sessionFile:file,cwd:f.root,leafId:null};
+    for(const state of ['active','closing','released'])f.store.saveSessionUsage({...source,ownerId:`ready-${i}`,processToken:`ready-${i}`,ownerPid:process.pid,state});
+    f.store.enqueueCleanTask({...source,reason:'close',intentId:`ready-${i}`});
+  }
+  t.mock.timers.enable({apis:['setTimeout','Date'],now:Date.now()});
+  const c=f.worker({retryDelayMs:undefined});c.wake();await c.whenIdle();
+  assert.ok(await readFile(files.at(-1)),'the first pass must leave later work for a bounded continuation');
+  for(let i=0;i<20;i++){t.mock.timers.tick(100);await c.whenIdle();}
+  for(const file of files)await assert.rejects(readFile(file),{code:'ENOENT'});
+  assert.equal(f.store.get('retained').content,'Synthetic Cedar keeps local tests.');
+});
+
+test('header discovery automatically crosses a page boundary and reevaluates the now-known clean source', async t => {
+  const f=await fixture(t);await f.complete();await releaseFixture(f);
+  for(let i=0;i<130;i++){
+    const manager=SessionManager.inMemory(f.root),file=join(f.root,`header-${i}.jsonl`);
+    await writeFile(file,JSON.stringify(manager.getHeader())+'\n');
+    f.store.sources.register({sessionId:manager.getSessionId(),sessionFile:file,cwd:f.root});
+  }
+  t.mock.timers.enable({apis:['setTimeout','Date'],now:Date.now()});
+  const c=f.worker({retryDelayMs:undefined});c.wake();await c.whenIdle();
+  for(let i=0;i<20&&f.task();i++){t.mock.timers.tick(100);await c.whenIdle();}
+  await assert.rejects(readFile(f.file),{code:'ENOENT'});
+});
+
+test('an empty clean queue still drains metadata pages automatically and then settles', async t => {
+  const f=await fixture(t);
+  for(let i=0;i<180;i++){
+    const job={id:`gc-${i}`,sessionId:`gc-${i}`,sessionFile:null,cwd:f.root,leafId:null,sourceKeys:[`key-${i}`]};
+    f.store.enqueueConsolidation(job);f.store.claimConsolidation(job.id,'gc',1,100);
+    f.store.commitConsolidation({jobId:job.id,owner:'gc',now:2,creates:[],updates:[],deletes:[]});
+  }
+  let removed=0,passes=0;
+  class ObservedStore extends SQLiteMemoryStore { collectMetadata(limit){passes++;const result=super.collectMetadata(limit);removed+=result.removed;return result;} }
+  t.mock.timers.enable({apis:['setTimeout','Date'],now:Date.now()});
+  const c=f.worker({retryDelayMs:undefined,openStore:()=>new ObservedStore(f.path)});c.wake();await c.whenIdle();
+  for(let i=0;i<60;i++){t.mock.timers.tick(100);await c.whenIdle();}
+  assert.ok(removed>=180,'unreferenced evidence must be reclaimed beyond the first page');
+  const settled=passes;
+  for(let i=0;i<20;i++){t.mock.timers.tick(100);await c.whenIdle();}
+  assert.equal(passes,settled,'retained jobs must not keep the completed sweep in a fast loop');
+});
+
+test('automatic child cleanup makes its parent eligible without another wake',async t=>{
+  const f=await fixture(t);await f.complete();await releaseFixture(f);
+  const child=SessionManager.forkFrom(f.file,f.root,join(f.root,'forks'));
+  const file=child.getSessionFile();
+  for(const {evidence,context,...job} of planSources(await loadSnapshot(file),new Set())){
+    f.store.enqueueConsolidation(job);f.store.claimConsolidation(job.id,'child',Date.now(),60000);
+    f.store.commitConsolidation({jobId:job.id,owner:'child',now:Date.now(),creates:[],updates:[],deletes:[]});
+  }
+  const source={sessionId:child.getSessionId(),sessionFile:file,cwd:f.root,leafId:child.getLeafId()};
+  for(const state of ['active','closing','released'])f.store.saveSessionUsage({...source,ownerId:'child',processToken:'child',ownerPid:process.pid,state});
+  f.store.enqueueCleanTask({...source,reason:'close',intentId:'child'});
+  t.mock.timers.enable({apis:['setTimeout','Date'],now:Date.now()});
+  const c=f.worker({retryDelayMs:undefined});c.wake();await c.whenIdle();
+  for(let i=0;i<8;i++){t.mock.timers.tick(100);await c.whenIdle();}
+  await assert.rejects(readFile(file),{code:'ENOENT'});await assert.rejects(readFile(f.file),{code:'ENOENT'});
+});
+
+test('an exited process releases contention for automatic cleanup without another lifecycle event',async t=>{
+  const f=await fixture(t);await f.complete();await releaseFixture(f);
+  const {child,stderr}=fixtureChild(t,f,'hold',f.input());const [ready]=await once(child,'message');assert.ok(ready.ready,stderr());
+  t.mock.timers.enable({apis:['setTimeout','Date'],now:Date.now()});
+  const c=f.worker({retryDelayMs:undefined});c.wake();await c.whenIdle();assert.ok(await readFile(f.file));
+  const exit=once(child,'exit');child.kill('SIGKILL');await exit;
+  for(let i=0;i<8&&f.task();i++){t.mock.timers.tick(100);await c.whenIdle();}
+  await assert.rejects(readFile(f.file),{code:'ENOENT'});
+});
+
+test('closing while maintenance is waiting cancels automatic continuation and a new worker resumes',async t=>{
+  const f=await fixture(t);await f.complete();await releaseFixture(f);const access=f.store.acquireSourceAccess();
+  t.mock.timers.enable({apis:['setTimeout','Date'],now:Date.now()});
+  const first=f.worker({retryDelayMs:undefined});first.wake();await first.whenIdle();first.close();
+  f.store.releaseSourceAccess(access);t.mock.timers.tick(30000);await first.whenIdle();assert.ok(await readFile(f.file));
+  const next=f.worker({retryDelayMs:undefined});next.wake();await next.whenIdle();await assert.rejects(readFile(f.file),{code:'ENOENT'});
+});
+
+test('repeated wakes coalesce and still yield between maintenance passes',async t=>{
+  const f=await fixture(t);await f.complete();await releaseFixture(f);const access=f.store.acquireSourceAccess();
+  t.mock.timers.enable({apis:['setTimeout','Date'],now:Date.now()});
+  const c=f.worker({retryDelayMs:undefined});for(let i=0;i<100;i++)c.wake();await c.whenIdle();
+  f.store.releaseSourceAccess(access);assert.ok(await readFile(f.file));
+  t.mock.timers.tick(100);await c.whenIdle();await assert.rejects(readFile(f.file),{code:'ENOENT'});
+});
+
+test('two actual cleanup processes retry a released reservation without a second wake', {timeout:15000}, async t=>{
+  const f=await fixture(t);await f.complete();await releaseFixture(f);
+  const access=f.store.acquireSourceAccess();
+  const a=fixtureChild(t,f,'clean-auto',f.input()),b=fixtureChild(t,f,'clean-auto',f.input());
+  await Promise.all([once(a.child,'message'),once(b.child,'message')]);
+  const replies=[once(a.child,'message'),once(b.child,'message')];
+  a.child.send({start:true});b.child.send({start:true});
+  await new Promise(resolve=>setTimeout(resolve,200));assert.ok(await readFile(f.file));
+  f.store.releaseSourceAccess(access);
+  const results=await Promise.all(replies);
+  assert.ok(results.every(([result])=>result.done&&result.completed),a.stderr()+b.stderr());
+  await assert.rejects(readFile(f.file),{code:'ENOENT'});
 });

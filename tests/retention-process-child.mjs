@@ -3,13 +3,13 @@ import {SQLiteMemoryStore} from '../src/memory-store.ts';
 const [mode,path,payload]=process.argv.slice(2);
 const task=JSON.parse(payload);
 const store=new SQLiteMemoryStore(path);
-if (mode === 'clean') {
+if (mode === 'clean' || mode === 'clean-auto') {
  const {CleanupCoordinator}=await import('../src/cleanup.ts');
  process.send({ready:true});
  await new Promise(resolve=>process.once('message',resolve));
- const cleaner=new CleanupCoordinator({openStore:()=>new SQLiteMemoryStore(path),retryDelayMs:10});
+ const cleaner=new CleanupCoordinator({openStore:()=>new SQLiteMemoryStore(path),...(mode==='clean'?{retryDelayMs:10}:{})});
  cleaner.wake();await cleaner.whenIdle();
- const deadline=Date.now()+1_500;
+ const deadline=Date.now()+(mode==='clean'?1_500:8_000);
  while(Date.now()<deadline&&store.getDeletion(task.sessionFile)?.state!=='complete') {
   await new Promise(resolve=>setTimeout(resolve,5));
  }

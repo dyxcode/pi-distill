@@ -126,7 +126,7 @@ async function stopPi(child) {
   if (!terminated) child.kill('SIGKILL');
 }
 
-test('Pi CLI Ctrl+D queues the source without a shutdown model call, then a fresh startup distills and cleans it', async (t) => {
+for (const attempt of [1, 2, 3]) test(`Pi CLI Ctrl+D queues without a shutdown model call, then fresh startup distills and cleans (attempt ${attempt})`, async (t) => {
   const root = await mkdtemp(join(tmpdir(), 'pi-distill-cli-queue-'));
   const logPath = join(root, 'provider-events.jsonl');
   await writeFile(logPath, '');

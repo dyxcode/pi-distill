@@ -1,5 +1,5 @@
 import { DistillSchedule, DISTILL_SCHEDULE_SCHEMAS, type ScheduledDistill } from "./distill-schedule.ts";
-import { SourceCoverage, SOURCE_COVERAGE_SCHEMAS, collectDerivedSources } from "./source-coverage.ts";
+import { SourceCoverage, SOURCE_COVERAGE_SCHEMAS, collectDerivedSources, derivedSourceBoundaries } from "./source-coverage.ts";
 import { SourceViews, SOURCE_VIEW_SCHEMAS } from "./source-view.ts";
 import { SourceIndex, SOURCE_INDEX_SCHEMAS } from "./source-index.ts";
 import { dirname, isAbsolute } from "node:path";
@@ -921,8 +921,9 @@ function parseTaskPageOptions(value: unknown, allowNow: boolean): {
   readonly limit: number;
   readonly cursor?: number;
   readonly now?: number;
+  readonly throughCursor?: number;
 } {
-  const allowed = allowNow ? ["limit", "cursor", "now"] : ["limit", "cursor"];
+  const allowed = allowNow ? ["limit", "cursor", "now", "throughCursor"] : ["limit", "cursor"];
   if (
     !isRecord(value) || Reflect.ownKeys(value).some(key => typeof key !== "string" || !allowed.includes(key)) ||
     !Object.hasOwn(value, "limit")
@@ -931,7 +932,7 @@ function parseTaskPageOptions(value: unknown, allowNow: boolean): {
   if (typeof limit !== "number" || !Number.isSafeInteger(limit) || limit < 1 || limit > maxTaskPageSize) {
     throw new TypeError("Task page limit must be an integer from 1 through " + maxTaskPageSize + ".");
   }
-  const parsed: { limit: number; cursor?: number; now?: number } = { limit };
+  const parsed: { limit: number; cursor?: number; now?: number; throughCursor?: number } = { limit };
   if (Object.hasOwn(value, "cursor")) {
     const cursor = value["cursor"];
     if (typeof cursor !== "number" || !Number.isSafeInteger(cursor) || cursor < 0) {
@@ -942,6 +943,10 @@ function parseTaskPageOptions(value: unknown, allowNow: boolean): {
   if (Object.hasOwn(value, "now")) {
     validateNow(value["now"], "Task page time");
     parsed.now = value["now"];
+  }
+  if (Object.hasOwn(value, "throughCursor")) {
+    validateNow(value["throughCursor"], "Task sweep boundary");
+    parsed.throughCursor = value["throughCursor"];
   }
   return parsed;
 }
@@ -1240,6 +1245,7 @@ function parseSearchRequest(value: unknown): MemorySearchRequest {
 export class SQLiteMemoryStore {
   readonly #database: DatabaseSync;
   #sources: SourceRegistry | undefined;
+  #gcBoundaries: { core: number[]; derived: number[] } | undefined;
   #sourceIndex: SourceIndex | undefined;
   #sourceViews: SourceViews | undefined;
   get sourceCoverage(): SourceCoverage { this.#ensureOpen(); return new SourceCoverage(this.#database, this); }
@@ -2014,12 +2020,20 @@ export class SQLiteMemoryStore {
     return this.#transaction(() => this.#enqueueCleanTaskInTransaction(task));
   }
 
+  maintenanceBoundary(kind: "clean" | "legacy"): number {
+    this.#ensureOpen();
+    if (kind !== "clean" && kind !== "legacy") throw new TypeError("Invalid maintenance boundary kind.");
+    const table = kind === "clean" ? "clean_tasks" : "consolidation_jobs";
+    const value = this.#database.prepare(`SELECT COALESCE(MAX(rowid),0) AS value FROM ${table}`).get()?.["value"];
+    validateNow(value, "Maintenance sweep boundary"); return value;
+  }
+
   listCleanTasks(options: CleanTaskPageOptions): TaskPage<CleanTask> {
     this.#ensureOpen();
     const page = parseTaskPageOptions(options, true);
     const cursor = page.cursor ?? 0;
-    const clauses = ["rowid > ?", "NOT EXISTS (SELECT 1 FROM session_deletions d WHERE d.session_file = json_extract(clean_tasks.task_json, '$.sessionFile') AND d.state = 'complete')"];
-    const params: (number | string)[] = [cursor];
+    const clauses = ["rowid > ?", "rowid <= ?", "NOT EXISTS (SELECT 1 FROM session_deletions d WHERE d.session_file = json_extract(clean_tasks.task_json, '$.sessionFile') AND d.state = 'complete')"];
+    const params: (number | string)[] = [cursor, page.throughCursor ?? this.maintenanceBoundary("clean")];
     if (page.now !== undefined) {
       clauses.push("(retry_at IS NULL OR retry_at <= ?)");
       params.push(page.now);
@@ -2107,17 +2121,19 @@ export class SQLiteMemoryStore {
     });
   }
 
-  reconcileLegacyCleanTasks(limit = 32, cursor?: number): { readonly created: number; readonly nextCursor?: number } {
+  reconcileLegacyCleanTasks(limit = 32, cursor?: number, throughCursor?: number): { readonly created: number; readonly nextCursor?: number } {
     this.#ensureOpen();
     if (typeof limit !== "number" || !Number.isSafeInteger(limit) || limit < 1 || limit > maxTaskPageSize) {
       throw new TypeError("Legacy cleanup reconciliation limit must be from 1 through " + maxTaskPageSize + ".");
     }
     const after = validateTaskCursor(cursor, "Legacy cleanup reconciliation cursor") ?? 0;
+    const end = throughCursor ?? this.maintenanceBoundary("legacy");
+    validateNow(end, "Legacy reconciliation boundary");
     return this.#transaction(() => {
       const rows = this.#database.prepare(
         `SELECT rowid AS cursorRow, ${jobColumns} FROM consolidation_jobs ` +
-        "WHERE rowid > ? AND status = 'complete' ORDER BY rowid LIMIT ?",
-      ).all(after, limit + 1);
+        "WHERE rowid > ? AND rowid <= ? AND status = 'complete' ORDER BY rowid LIMIT ?",
+      ).all(after, end, limit + 1);
       const hasMore = rows.length > limit;
       const visible = rows.slice(0, limit);
       let created = 0;
@@ -2684,91 +2700,116 @@ export class SQLiteMemoryStore {
   }
 
   /** Reclaim terminal metadata in a restartable sweep; receipts, origins, and progress survive. */
-  collectMetadata(limit = maxMetadataGcPageSize): { readonly removed: number; readonly hasMore: boolean } {
+  collectMetadata(limit = maxMetadataGcPageSize): { readonly removed: number; readonly hasMore: boolean; readonly contended: boolean } {
+    this.#ensureOpen();
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > maxMetadataGcPageSize) throw new TypeError("Invalid metadata collection page size.");
-    const coreBudget = Math.max(1, Math.floor(limit / 2));
-    const core = this.#collectOperationalMetadata(coreBudget);
-    if (limit === 1 && (core.hasMore || core.removed > 0)) return core;
     const access = this.acquireSourceAccess();
-    if (!access) return core;
+    if (!access) return { removed: 0, hasMore: true, contended: true };
     try {
-      const derived = collectDerivedSources(this.#database, this, Math.max(1, limit - coreBudget));
-      return { removed: core.removed + derived.removed, hasMore: core.hasMore || derived.hasMore };
+      return this.#transaction(() => {
+        // Bits 1/2 latch completed collectors; bit 4 requests a fresh sweep after
+        // removals. Retained rows do not require both collectors to end together.
+        let state = this.sources.readCursor("gc") ?? 0;
+        if (state > 7) throw new TypeError("Invalid metadata sweep completion state.");
+        this.#gcBoundaries ??= {
+          core: ["clean_tasks", "distill_trigger_jobs", "distill_triggers", "consolidation_jobs", "session_observations", "session_usages", "managed_sources", "memory_evidence"].map(table => {
+            const column = table === "managed_sources" ? "row_id" : "rowid";
+            const end = this.#database.prepare(`SELECT COALESCE(MAX(${column}),0) AS value FROM ${table}`).get()?.["value"];
+            validateNow(end, "Metadata sweep boundary"); return end;
+          }),
+          derived: derivedSourceBoundaries(this.#database),
+        };
+        let removed = 0;
+        const coreBudget = state & 2 ? limit : Math.max(1, Math.floor(limit / 2));
+        const corePending = !(state & 1);
+        if (corePending) {
+          const core = this.#collectOperationalMetadata(coreBudget, this.#gcBoundaries.core);
+          removed += core.removed;
+          if (!core.hasMore) state |= 1;
+        }
+        if (!(state & 2) && (limit > 1 || (state & 1 && removed === 0))) {
+          const derived = collectDerivedSources(this.#database, this, corePending ? Math.max(1, limit - coreBudget) : limit, this.#gcBoundaries.derived);
+          removed += derived.removed;
+          if (!derived.hasMore) state |= 2;
+        }
+        if (removed > 0) state |= 4;
+        const finished = (state & 3) === 3;
+        const hasMore = !finished || (state & 4) !== 0;
+        this.sources.writeCursor("gc", finished ? null : state);
+        if (finished) this.#gcBoundaries = undefined;
+        return { removed, hasMore, contended: false };
+      });
     } finally { this.releaseSourceAccess(access); }
   }
 
-  #collectOperationalMetadata(limit: number): { readonly removed: number; readonly hasMore: boolean } {
+  #collectOperationalMetadata(limit: number, through: readonly number[]): { readonly removed: number; readonly hasMore: boolean } {
     this.#ensureOpen();
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > maxMetadataGcPageSize) {
       throw new TypeError("Metadata collection limit must be an integer from 1 through 128.");
     }
-    return this.#transaction(() => {
-      const access = this.#sourceAccess();
-      if (access && !processHasExited(access.pid)) return { removed: 0, hasMore: false };
-      if (access) this.#database.prepare("DELETE FROM source_access WHERE token = ?").run(access.token);
-      if (!this.#backfillSources(maxTaskPageSize)) return { removed: 0, hasMore: true };
 
-      const state = this.#database.prepare(
-        "SELECT phase, cursor_row AS cursorRow FROM metadata_gc_state WHERE singleton = 1",
-      ).get();
-      if (state === undefined) throw new Error("Metadata collection state is missing.");
-      let phase = state["phase"];
-      let cursor = state["cursorRow"];
-      if (typeof phase !== "number" || !Number.isSafeInteger(phase) || phase < 0 || phase > 7 ||
-        typeof cursor !== "number" || !Number.isSafeInteger(cursor) || cursor < 0) {
-        throw new TypeError("Stored metadata collection progress is invalid.");
-      }
+    if (!this.#backfillSources(maxTaskPageSize)) return { removed: 0, hasMore: true };
 
-      let examined = 0;
-      let removed = 0;
-      while (phase < 8 && examined < limit) {
-        const remaining = limit - examined;
-        const rows = this.#metadataGcRows(phase, cursor, remaining);
-        if (rows.length === 0) {
-          phase += 1;
-          cursor = 0;
-          continue;
-        }
-        for (const raw of rows) {
-          const row = this.#decodeRow(raw);
-          const rowId = row["gcRow"];
-          if (typeof rowId !== "number" || !Number.isSafeInteger(rowId) || rowId <= cursor) {
-            throw new TypeError("Stored metadata collection row cursor is invalid.");
-          }
-          cursor = rowId;
-          examined += 1;
-          if (this.#collectMetadataRow(phase, row)) removed += 1;
-        }
-        if (rows.length < remaining) {
-          phase += 1;
-          cursor = 0;
-        }
-      }
+    const state = this.#database.prepare(
+      "SELECT phase, cursor_row AS cursorRow FROM metadata_gc_state WHERE singleton = 1",
+    ).get();
+    if (state === undefined) throw new Error("Metadata collection state is missing.");
+    let phase = state["phase"];
+    let cursor = state["cursorRow"];
+    if (typeof phase !== "number" || !Number.isSafeInteger(phase) || phase < 0 || phase > 7 ||
+      typeof cursor !== "number" || !Number.isSafeInteger(cursor) || cursor < 0) {
+      throw new TypeError("Stored metadata collection progress is invalid.");
+    }
 
-      if (phase >= 8) {
-        this.#database.prepare("UPDATE metadata_gc_state SET phase = 0, cursor_row = 0 WHERE singleton = 1").run();
-        return { removed, hasMore: removed > 0 };
+    let examined = 0;
+    let removed = 0;
+    while (phase < 8 && examined < limit) {
+      const remaining = limit - examined;
+      const rows = this.#metadataGcRows(phase, cursor, remaining, through[phase] ?? 0);
+      if (rows.length === 0) {
+        phase += 1;
+        cursor = 0;
+        continue;
       }
-      this.#database.prepare("UPDATE metadata_gc_state SET phase = ?, cursor_row = ? WHERE singleton = 1")
-        .run(phase, cursor);
-      return { removed, hasMore: true };
-    });
+      for (const raw of rows) {
+        const row = this.#decodeRow(raw);
+        const rowId = row["gcRow"];
+        if (typeof rowId !== "number" || !Number.isSafeInteger(rowId) || rowId <= cursor) {
+          throw new TypeError("Stored metadata collection row cursor is invalid.");
+        }
+        cursor = rowId;
+        examined += 1;
+        if (this.#collectMetadataRow(phase, row)) removed += 1;
+      }
+      if (rows.length < remaining) {
+        phase += 1;
+        cursor = 0;
+      }
+    }
+
+    if (phase >= 8) {
+      this.#database.prepare("UPDATE metadata_gc_state SET phase = 0, cursor_row = 0 WHERE singleton = 1").run();
+      return { removed, hasMore: removed > 0 };
+    }
+    this.#database.prepare("UPDATE metadata_gc_state SET phase = ?, cursor_row = ? WHERE singleton = 1")
+      .run(phase, cursor);
+    return { removed, hasMore: true };
   }
 
-  #metadataGcRows(phase: number, cursor: number, limit: number): Record<string, unknown>[] {
+  #metadataGcRows(phase: number, cursor: number, limit: number, through: number): Record<string, unknown>[] {
     const queries: readonly string[] = [
-      `SELECT rowid AS gcRow, ${cleanTaskColumns} FROM clean_tasks WHERE rowid > ? ORDER BY rowid LIMIT ?`,
-      `SELECT rowid AS gcRow, ${textColumn("id")}, ${textColumn("trigger_id", "triggerId")}, ${textColumn("job_id", "jobId")} FROM distill_trigger_jobs WHERE rowid > ? ORDER BY rowid LIMIT ?`,
-      `SELECT rowid AS gcRow, ${triggerColumns} FROM distill_triggers WHERE rowid > ? ORDER BY rowid LIMIT ?`,
-      `SELECT rowid AS gcRow, ${jobColumns} FROM consolidation_jobs WHERE rowid > ? ORDER BY rowid LIMIT ?`,
-      `SELECT rowid AS gcRow, ${observationColumns} FROM session_observations WHERE rowid > ? ORDER BY rowid LIMIT ?`,
-      `SELECT rowid AS gcRow, ${sessionUsageColumns} FROM session_usages WHERE rowid > ? ORDER BY rowid LIMIT ?`,
-      `SELECT row_id AS gcRow, ${textColumn("generation")}, ${textColumn("session_file", "sessionFile")}, ${textColumn("session_id", "sessionId")}, deleted FROM managed_sources WHERE row_id > ? ORDER BY row_id LIMIT ?`,
-      `SELECT rowid AS gcRow, ${evidenceColumns} FROM memory_evidence WHERE rowid > ? ORDER BY rowid LIMIT ?`,
+      `SELECT rowid AS gcRow, ${cleanTaskColumns} FROM clean_tasks WHERE rowid > ? AND rowid <= ? ORDER BY rowid LIMIT ?`,
+      `SELECT rowid AS gcRow, ${textColumn("id")}, ${textColumn("trigger_id", "triggerId")}, ${textColumn("job_id", "jobId")} FROM distill_trigger_jobs WHERE rowid > ? AND rowid <= ? ORDER BY rowid LIMIT ?`,
+      `SELECT rowid AS gcRow, ${triggerColumns} FROM distill_triggers WHERE rowid > ? AND rowid <= ? ORDER BY rowid LIMIT ?`,
+      `SELECT rowid AS gcRow, ${jobColumns} FROM consolidation_jobs WHERE rowid > ? AND rowid <= ? ORDER BY rowid LIMIT ?`,
+      `SELECT rowid AS gcRow, ${observationColumns} FROM session_observations WHERE rowid > ? AND rowid <= ? ORDER BY rowid LIMIT ?`,
+      `SELECT rowid AS gcRow, ${sessionUsageColumns} FROM session_usages WHERE rowid > ? AND rowid <= ? ORDER BY rowid LIMIT ?`,
+      `SELECT row_id AS gcRow, ${textColumn("generation")}, ${textColumn("session_file", "sessionFile")}, ${textColumn("session_id", "sessionId")}, deleted FROM managed_sources WHERE row_id > ? AND row_id <= ? ORDER BY row_id LIMIT ?`,
+      `SELECT rowid AS gcRow, ${evidenceColumns} FROM memory_evidence WHERE rowid > ? AND rowid <= ? ORDER BY rowid LIMIT ?`,
     ];
     const query = queries[phase];
     if (query === undefined) throw new Error("Metadata collection phase is invalid.");
-    return this.#database.prepare(query).all(cursor, limit);
+    return this.#database.prepare(query).all(cursor, through, limit);
   }
 
   #collectMetadataRow(phase: number, row: Record<string, unknown>): boolean {

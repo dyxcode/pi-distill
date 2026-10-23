@@ -53,6 +53,7 @@ export interface SourceRegistryPage {
 
 export interface SourceRegistryPageOptions {
   readonly afterRowId?: number;
+  readonly throughRowId?: number;
   readonly limit: number;
 }
 
@@ -320,12 +321,17 @@ export class SourceRegistry {
   }
 
   /** Read a bounded row-id page; deleted generations never re-enter discovery. */
+  highWater(): number {
+    const value = this.#database.prepare("SELECT COALESCE(MAX(row_id),0) AS value FROM managed_sources").get()?.["value"];
+    return parseNonnegativeInteger(value, "source sweep boundary");
+  }
+
   listPage(options: SourceRegistryPageOptions): SourceRegistryPage {
     const page = parsePageOptions(options);
     const rows = this.#database.prepare(
       `SELECT ${managedSourceColumns} ` +
-      "FROM managed_sources WHERE deleted = 0 AND row_id > ? ORDER BY row_id LIMIT ?",
-    ).all(page.afterRowId, page.limit + 1);
+      "FROM managed_sources WHERE deleted = 0 AND row_id > ? AND row_id <= ? ORDER BY row_id LIMIT ?",
+    ).all(page.afterRowId, page.throughRowId ?? this.highWater(), page.limit + 1);
     const hasMore = rows.length > page.limit;
     const visible = rows.slice(0, page.limit).map(row => this.#readSource(row));
     const nextCursor = hasMore ? visible.at(-1)?.rowId ?? null : null;
@@ -602,15 +608,19 @@ function parseUnknownRecord(value: unknown): SourceUnknownRecord {
   };
 }
 
-function parsePageOptions(value: unknown): { afterRowId: number; limit: number } {
+function parsePageOptions(value: unknown): { afterRowId: number; limit: number; throughRowId?: number } {
   if (!isRecord(value)) throw new TypeError("Source page options must be an object.");
-  assertExactKeys(value, ["afterRowId", "limit"]);
+  assertExactKeys(value, ["afterRowId", "limit", "throughRowId"]);
   const limit = value["limit"];
   if (typeof limit !== "number" || !Number.isSafeInteger(limit) || limit < 1 || limit > maxPageSize) {
     throw new TypeError(`Source page limit must be an integer from 1 through ${maxPageSize}.`);
   }
   const afterRowId = Object.hasOwn(value, "afterRowId") ? value["afterRowId"] : 0;
   validateNonnegativeInteger(afterRowId, "source row cursor");
+  if (Object.hasOwn(value, "throughRowId")) {
+    const throughRowId = value["throughRowId"]; validateNonnegativeInteger(throughRowId, "source sweep boundary");
+    return { afterRowId, limit, throughRowId };
+  }
   return { afterRowId, limit };
 }
 

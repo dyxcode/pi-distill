@@ -130,8 +130,16 @@ export class SourceCoverage {
 }
 
 /** Collect each derived row separately; never delete a whole long index in one transaction. */
-export function collectDerivedSources(database: DatabaseSync, store: SQLiteMemoryStore, limit: number): { removed: number; hasMore: boolean } {
-  const tables = ["source_preparation", "source_coverage", "source_views", "source_view_parts", "source_view_edits", "source_view_entries", "source_index_files", "source_index_entries", "source_fences"];
+const derivedTables = ["source_preparation", "source_coverage", "source_views", "source_view_parts", "source_view_edits", "source_view_entries", "source_index_files", "source_index_entries", "source_fences"];
+export function derivedSourceBoundaries(database: DatabaseSync): number[] {
+  return derivedTables.map(table => {
+    const value = database.prepare(`SELECT COALESCE(MAX(rowid),0) AS value FROM ${table}`).get()?.["value"];
+    if (!integer(value)) return invalid("Invalid derived source boundary.");
+    return value;
+  });
+}
+export function collectDerivedSources(database: DatabaseSync, store: SQLiteMemoryStore, limit: number, through: readonly number[]): { removed: number; hasMore: boolean } {
+  const tables = derivedTables;
   const gc = database.prepare("SELECT phase,cursor,dirty FROM source_derived_gc WHERE singleton=1").get();
   if (!gc || !integer(gc["phase"]) || gc["phase"] >= tables.length || !integer(gc["cursor"]) || (gc["dirty"] !== 0 && gc["dirty"] !== 1)) return invalid("Invalid derived metadata collection cursor.");
   let phase = gc["phase"], cursor = gc["cursor"], examined = 0, removed = 0;
@@ -148,7 +156,7 @@ export function collectDerivedSources(database: DatabaseSync, store: SQLiteMemor
   try {
     while (phase < tables.length && examined < limit) {
       const table = tables[phase];
-      const rows = database.prepare(`SELECT rowid AS gcRow,*${table === "source_preparation" ? ",json_quote(trigger_id) AS trigger_json" : ""} FROM ${table} WHERE rowid>? ORDER BY rowid LIMIT ?`).all(cursor, limit - examined);
+      const rows = database.prepare(`SELECT rowid AS gcRow,*${table === "source_preparation" ? ",json_quote(trigger_id) AS trigger_json" : ""} FROM ${table} WHERE rowid>? AND rowid<=? ORDER BY rowid LIMIT ?`).all(cursor, through[phase] ?? 0, limit - examined);
       if (rows.length === 0) { phase++; cursor = 0; continue; }
       for (const row of rows) {
         if (!integer(row["gcRow"]) || row["gcRow"] <= cursor) return invalid("Invalid derived metadata row cursor.");

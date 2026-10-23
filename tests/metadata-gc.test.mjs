@@ -324,7 +324,7 @@ test("metadata collection reclaims deleted-source jobs without losing memory fac
   assert.deepEqual(store.processedSources(completed.sourceKeys), processedBefore);
   assert.deepEqual(store.listConsolidationJobs(), [pending]);
   assert.equal(store.getDeletion(completedFile)?.state, "complete");
-  assert.deepEqual(collectAtMost(store, f.path, 128), { removed: 0, hasMore: false });
+  assert.deepEqual(collectAtMost(store, f.path, 128), { removed: 0, hasMore: false, contended: false });
   assert.throws(() => store.enqueueConsolidation(completed), ConsolidationConflictError);
   assert.throws(() => store.enqueueConsolidation(job("late-job", completed.sessionId, completedFile, ["late:entry"])), ConsolidationConflictError);
   assert.throws(() => store.enqueueDistillTrigger({
@@ -546,7 +546,7 @@ test("metadata collection bounds row deletions across two stores and resumes aft
     assert.equal(hasJob(f.path, source.id), false);
     assert.equal(resumed.getDeletion(source.sessionFile)?.state, "complete");
   }
-  assert.deepEqual(collectAtMost(resumed, f.path, 2), { removed: 0, hasMore: false },
+  assert.deepEqual(collectAtMost(resumed, f.path, 2), { removed: 0, hasMore: false, contended: false },
     "repeating collection after completion is idempotent");
 });
 
@@ -558,9 +558,9 @@ test("a deletion between the jobs and registry phases leaves the tombstone until
     ["interleaved:entry-1"]);
   completeJob(store, source);
 
-  assert.deepEqual(collectAtMost(store, f.path, 1), { removed: 0, hasMore: true },
+  assert.deepEqual(collectAtMost(store, f.path, 1), { removed: 0, hasMore: true, contended: false },
     "the first bounded pass examines the clean task before a deletion receipt exists");
-  assert.deepEqual(collectAtMost(store, f.path, 1), { removed: 0, hasMore: true },
+  assert.deepEqual(collectAtMost(store, f.path, 1), { removed: 0, hasMore: true, contended: false },
     "the next bounded pass advances through the completed job row");
   assert.equal(hasJob(f.path, source.id), true);
   assert.equal(store.listCleanTasks({ limit: 10 }).items.some(item => item.sessionFile === sessionFile), true);
@@ -699,4 +699,46 @@ test("metadata collection retains only prefix evidence groups referenced by curr
   }
   assert.equal(secondOrphan.hasMore, false);
   assert.equal(hasEvidenceForSource(f.path, source.sessionId, secondOrigin.sourceKeys), false);
+});
+
+test('a metadata round with unequal retained core and derived sweeps finishes across reopen',async t=>{
+  const f=await fixture(t);let store=f.open();
+  const pending={id:'pending-gc',sessionId:'pending-gc',sessionFile:join(f.root,'pending.jsonl'),cwd:f.root,leafId:null,reason:'close'};
+  store.enqueueDistillTrigger(pending);
+  const raw=new DatabaseSync(f.path);
+  // Persistent synthetic preparation references remain live, while orphan rows
+  // exercise a different-sized derived sweep than the operational records.
+  raw.prepare('INSERT INTO source_preparation VALUES (?,?,?)').run(pending.id,'a'.repeat(64),0);
+  for(let i=0;i<17;i++)raw.prepare('INSERT INTO source_preparation VALUES (?,?,?)').run(`orphan-${i}`,'b'.repeat(64),0);
+  raw.close();
+  let result,removed=0;
+  for(let i=0;i<100;i++){
+    result=collectAtMost(store,f.path,2);removed+=result.removed;
+    if(i===3){store.close();store=f.open();}
+    if(!result.hasMore)break;
+  }
+  assert.equal(result.hasMore,false,'retained metadata must not require coincident sweep completion');
+  assert.equal(removed,17);assert.equal(store.readDistillTrigger(pending.id).status,'pending');
+  assert.equal(store.readSourcePreparation(pending.id,'a'.repeat(64)),0);
+});
+
+test('source access contention is reported separately from completed metadata work',async t=>{
+  const f=await fixture(t);const owner=f.open(),worker=f.open(),token=owner.acquireSourceAccess();
+  assert.ok(token);assert.deepEqual(worker.collectMetadata(128),{removed:0,hasMore:true,contended:true});
+  owner.releaseSourceAccess(token);
+  assert.deepEqual(worker.collectMetadata(128),{removed:0,hasMore:false,contended:false});
+});
+
+test('finite metadata sweeps finish despite new retained work arriving after every page',async t=>{
+  const f=await fixture(t),store=f.open();
+  const add=id=>store.enqueueConsolidation({id,sessionId:id,sessionFile:null,leafId:null,cwd:f.root,sourceKeys:[id+':key']});
+  for(let i=0;i<20;i++)add(`old-${i}`);
+  let result;
+  for(let i=0;i<100;i++){
+    result=collectAtMost(store,f.path,2);
+    for(let j=0;j<3;j++)add(`new-${i}-${j}`);
+    if(!result.hasMore)break;
+  }
+  assert.equal(result.hasMore,false,'new arrivals cannot indefinitely extend the current finite sweep');
+  assert.ok(store.listConsolidationJobs().some(job=>job.id==='old-19'));
 });
