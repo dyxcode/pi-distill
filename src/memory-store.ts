@@ -1,4 +1,4 @@
-import { isAbsolute } from "node:path";
+import { dirname, isAbsolute } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { DatabaseSync, type StatementSync } from "node:sqlite";
 import { SourceRegistry, initializeSourceRegistry, SOURCE_REGISTRY_SCHEMAS } from "./source-registry.ts";
@@ -39,6 +39,7 @@ const maxSearchBatchSize = 128;
 const maxKnownSessionFiles = 1_024;
 // Assessment reads validate at most this many persisted metadata records per snapshot.
 const maxSessionMetadataRows = 16_384;
+const maxMetadataGcPageSize = 128;
 
 const consolidationJobsV3Schema =
   "CREATE TABLE consolidation_jobs (" +
@@ -64,17 +65,43 @@ const consolidationJobsSchema =
   "CHECK ((retry_category IS NULL AND retry_at IS NULL) OR " +
   "(retry_category IS NOT NULL AND retry_at IS NOT NULL))" +
   ") STRICT";
-const consolidationProgressSchema =
+const consolidationProgressSchemaV6 =
   "CREATE TABLE consolidation_progress (" +
   "source_key TEXT PRIMARY KEY NOT NULL, " +
   "job_id TEXT NOT NULL, " +
   "processed_at INTEGER NOT NULL" +
   ") STRICT";
-const memoryOriginsSchema =
+const consolidationProgressSchema =
+  "CREATE TABLE consolidation_progress (" +
+  "source_key TEXT PRIMARY KEY NOT NULL, " +
+  "processed_at INTEGER NOT NULL" +
+  ") STRICT";
+const memoryOriginsSchemaV6 =
   "CREATE TABLE memory_origins (" +
   "memory_id TEXT PRIMARY KEY NOT NULL, " +
   "job_id TEXT NOT NULL, " +
   "revision INTEGER NOT NULL" +
+  ") STRICT";
+const memoryOriginsSchema =
+  "CREATE TABLE memory_origins (" +
+  "memory_id TEXT PRIMARY KEY NOT NULL, " +
+  "evidence_id TEXT NOT NULL, " +
+  "revision INTEGER NOT NULL" +
+  ") STRICT";
+const memoryEvidenceSchema =
+  "CREATE TABLE memory_evidence (" +
+  "evidence_id TEXT PRIMARY KEY NOT NULL, " +
+  "session_id TEXT NOT NULL, " +
+  "session_file TEXT, " +
+  "source_generation TEXT, " +
+  "cwd TEXT NOT NULL, " +
+  "leaf_id TEXT, " +
+  "source_keys TEXT NOT NULL, " +
+  "lineage_session_ids TEXT, " +
+  "source_time TEXT, " +
+  "branch_anchor TEXT, " +
+  "CHECK ((session_file IS NULL AND source_generation IS NULL) OR " +
+  "(session_file IS NOT NULL AND source_generation IS NOT NULL))" +
   ") STRICT";
 const sessionObservationsSchema =
   "CREATE TABLE session_observations (" +
@@ -145,8 +172,10 @@ const cleanTasksSchema =
   "(lease_owner IS NOT NULL AND lease_until IS NOT NULL))" +
   ") STRICT";
 const sourceAccessSchema = "CREATE TABLE source_access (singleton INTEGER PRIMARY KEY NOT NULL CHECK (singleton = 1), token TEXT NOT NULL, owner_pid INTEGER NOT NULL CHECK (owner_pid > 0)) STRICT";
-const deletionsSchema = "CREATE TABLE session_deletions (session_file TEXT PRIMARY KEY NOT NULL, session_id TEXT NOT NULL, intent_id TEXT NOT NULL, file_version TEXT NOT NULL, state TEXT NOT NULL CHECK (state IN ('deleting', 'complete'))) STRICT";
+const deletionsSchemaV5 = "CREATE TABLE session_deletions (session_file TEXT PRIMARY KEY NOT NULL, session_id TEXT NOT NULL, intent_id TEXT NOT NULL, file_version TEXT NOT NULL, state TEXT NOT NULL CHECK (state IN ('deleting', 'complete'))) STRICT";
+const deletionsSchema = "CREATE TABLE session_deletions (session_file TEXT PRIMARY KEY NOT NULL, session_id TEXT NOT NULL, intent_id TEXT NOT NULL, file_version TEXT NOT NULL, source_generation TEXT, state TEXT NOT NULL CHECK (state IN ('deleting', 'complete'))) STRICT";
 const sourceBackfillSchema = "CREATE TABLE source_backfill (singleton INTEGER PRIMARY KEY NOT NULL CHECK (singleton = 1), phase INTEGER NOT NULL, cursor_row INTEGER NOT NULL) STRICT";
+const metadataGcSchema = "CREATE TABLE metadata_gc_state (singleton INTEGER PRIMARY KEY NOT NULL CHECK (singleton = 1), phase INTEGER NOT NULL CHECK (phase BETWEEN 0 AND 7), cursor_row INTEGER NOT NULL CHECK (cursor_row >= 0)) STRICT";
 const storeIndexes = [
   "CREATE INDEX jobs_source_status ON consolidation_jobs (json_extract(job_json, '$.sessionFile'), status)",
   "CREATE INDEX triggers_source_status ON distill_triggers (json_extract(trigger_json, '$.sessionFile'), status)",
@@ -155,18 +184,28 @@ const storeIndexes = [
   "CREATE INDEX observations_source ON session_observations (session_file)",
   "CREATE INDEX trigger_links_job ON distill_trigger_jobs (job_id)",
 ];
+const storeIndexesV7 = [
+  "CREATE INDEX memory_origins_evidence ON memory_origins (evidence_id)",
+  "CREATE INDEX session_deletions_generation ON session_deletions (source_generation, state)",
+];
 const storeSchemas = [sourceBackfillSchema, ...storeIndexes].map(sql => {
   const match = /^CREATE (TABLE|INDEX) (\w+)/.exec(sql);
   if (!match?.[2]) throw new Error("Invalid store schema declaration.");
   return {name:match[2],sql};
 });
-const latestSchemaVersion = 6;
+const storeSchemasV7 = [...storeSchemas, ...[metadataGcSchema, ...storeIndexesV7].map(sql => {
+  const match = /^CREATE (TABLE|INDEX) (\w+)/.exec(sql);
+  if (!match?.[2]) throw new Error("Invalid store schema declaration.");
+  return {name:match[2],sql};
+})];
+const latestSchemaVersion = 7;
 
 export interface SessionDeletion {
   readonly sessionFile: string;
   readonly sessionId: string;
   readonly intentId: string;
   readonly fileVersion: string;
+  readonly sourceGeneration: string | null;
   readonly state: "deleting" | "complete";
 }
 
@@ -206,8 +245,22 @@ const cleanTaskColumns = [
   textColumn("wait_reason", "waitReason"), textColumn("retry_category", "retryCategory"),
   "retry_at AS retryAt", textColumn("lease_owner", "leaseOwner"), "lease_until AS leaseUntil",
 ].join(", ");
-const progressColumns = [textColumn("source_key"), textColumn("job_id"), "processed_at"].join(", ");
-const originColumns = [textColumn("memory_id", "memoryId"), textColumn("job_id", "jobId"), "revision"].join(", ");
+const progressColumnsV6 = [textColumn("source_key"), textColumn("job_id"), "processed_at"].join(", ");
+const progressColumns = [textColumn("source_key"), "processed_at"].join(", ");
+const originColumnsV6 = [textColumn("memory_id", "memoryId"), textColumn("job_id", "jobId"), "revision"].join(", ");
+const originColumns = [textColumn("memory_id", "memoryId"), textColumn("evidence_id", "evidenceId"), "revision"].join(", ");
+const evidenceColumns = [
+  textColumn("evidence_id", "evidenceId"), textColumn("session_id", "sessionId"),
+  textColumn("session_file", "sessionFile"), textColumn("source_generation", "sourceGeneration"),
+  textColumn("cwd"), textColumn("leaf_id", "leafId"), textColumn("source_keys", "sourceKeys"),
+  textColumn("lineage_session_ids", "lineageSessionIds"), textColumn("source_time", "sourceTime"),
+  textColumn("branch_anchor", "branchAnchor"),
+].join(", ");
+const deletionColumns = [
+  textColumn("session_file", "sessionFile"), textColumn("session_id", "sessionId"),
+  textColumn("intent_id", "intentId"), textColumn("file_version", "fileVersion"),
+  textColumn("source_generation", "sourceGeneration"), textColumn("state"),
+].join(", ");
 const observationColumns = [
   textColumn("session_id"), textColumn("session_file"), textColumn("cwd"),
   textColumn("leaf_id"), "owner_pid", "captured",
@@ -254,6 +307,19 @@ interface PersistedConsolidationJob {
   readonly leaseUntil: number | null;
   readonly retryCategory: RetryCategory | null;
   readonly retryAt: number | null;
+}
+
+interface MemoryEvidence {
+  readonly evidenceId: string;
+  readonly sessionId: string;
+  readonly sessionFile: string | null;
+  readonly sourceGeneration: string | null;
+  readonly cwd: string;
+  readonly leafId: string | null;
+  readonly sourceKeys: readonly string[];
+  readonly lineageSessionIds?: readonly string[];
+  readonly sourceTime?: string;
+  readonly branchAnchor?: string;
 }
 
 interface SchemaColumn {
@@ -894,6 +960,18 @@ function validateLeaseDuration(value: unknown, now: number, field: string): numb
 
 function parseMemoryOriginRow(value: unknown): {
   readonly memoryId: string;
+  readonly evidenceId: string;
+  readonly revision: number;
+} {
+  const { memoryId, evidenceId, revision } = fields(value, ["memoryId", "evidenceId", "revision"]);
+  validateText(memoryId, "memory origin ID");
+  validateText(evidenceId, "memory origin evidence ID");
+  validateRevision(revision);
+  return { memoryId, evidenceId, revision };
+}
+
+function parseMemoryOriginRowV6(value: unknown): {
+  readonly memoryId: string;
   readonly jobId: string;
   readonly revision: number;
 } {
@@ -906,6 +984,16 @@ function parseMemoryOriginRow(value: unknown): {
 
 function parseProgressRow(value: unknown): {
   readonly sourceKey: string;
+  readonly processedAt: number;
+} {
+  const { source_key, processed_at } = fields(value, ["source_key", "processed_at"]);
+  validateText(source_key, "processed source key");
+  validateNow(processed_at, "Stored source processing time");
+  return { sourceKey: source_key, processedAt: processed_at };
+}
+
+function parseProgressRowV6(value: unknown): {
+  readonly sourceKey: string;
   readonly jobId: string;
   readonly processedAt: number;
 } {
@@ -914,6 +1002,53 @@ function parseProgressRow(value: unknown): {
   validateText(job_id, "processed source job ID");
   validateNow(processed_at, "Stored source processing time");
   return { sourceKey: source_key, jobId: job_id, processedAt: processed_at };
+}
+
+function parseEvidenceRow(value: unknown): MemoryEvidence {
+  const row = fields(value, [
+    "evidenceId", "sessionId", "sessionFile", "sourceGeneration", "cwd", "leafId",
+    "sourceKeys", "lineageSessionIds", "sourceTime", "branchAnchor",
+  ]);
+  validateText(row["evidenceId"], "stored evidence ID");
+  validateText(row["sessionId"], "stored evidence session ID");
+  const sessionFile = row["sessionFile"] === null
+    ? null
+    : (validateAbsolutePath(row["sessionFile"], "stored evidence session file"), row["sessionFile"] as string);
+  const sourceGeneration = row["sourceGeneration"] === null
+    ? null
+    : (validateText(row["sourceGeneration"], "stored source generation"), row["sourceGeneration"] as string);
+  if ((sessionFile === null) !== (sourceGeneration === null)) {
+    throw new TypeError("Stored evidence source identity is incomplete.");
+  }
+  validateAbsolutePath(row["cwd"], "stored evidence working directory");
+  const leafId = parseNullableText(row["leafId"], "stored evidence leaf ID");
+  const parseJson = (value: unknown, field: string): unknown => {
+    validateText(value, field);
+    try { return JSON.parse(value); }
+    catch (error) { throw new TypeError(field + " is not valid JSON.", { cause: error }); }
+  };
+  const sourceKeys = parseSourceKeys(parseJson(row["sourceKeys"], "stored evidence source keys"), "stored evidence source keys", false);
+  const lineage = row["lineageSessionIds"] === null
+    ? undefined
+    : parseSourceKeys(parseJson(row["lineageSessionIds"], "stored evidence lineage IDs"), "stored evidence lineage IDs", false);
+  const sourceTime = row["sourceTime"] === null
+    ? undefined
+    : (validateTimestamp(row["sourceTime"], "stored evidence source time"), row["sourceTime"] as string);
+  const branchAnchor = row["branchAnchor"] === null
+    ? undefined
+    : (validateText(row["branchAnchor"], "stored evidence branch anchor"), row["branchAnchor"] as string);
+  return {
+    evidenceId: row["evidenceId"],
+    sessionId: row["sessionId"],
+    sessionFile,
+    sourceGeneration,
+    cwd: row["cwd"],
+    leafId,
+    sourceKeys,
+    ...(lineage === undefined ? {} : { lineageSessionIds: lineage }),
+    ...(sourceTime === undefined ? {} : { sourceTime }),
+    ...(branchAnchor === undefined ? {} : { branchAnchor }),
+  };
 }
 
 function validateSearchTerm(value: unknown, index: number): asserts value is string {
@@ -1017,8 +1152,8 @@ export class SQLiteMemoryStore {
       );
       this.#delete = this.#database.prepare("DELETE FROM memories WHERE id = ?");
       this.#upsertOrigin = this.#database.prepare(
-        "INSERT INTO memory_origins (memory_id, job_id, revision) VALUES (?, ?, ?) " +
-        "ON CONFLICT(memory_id) DO UPDATE SET job_id = excluded.job_id, revision = excluded.revision",
+        "INSERT INTO memory_origins (memory_id, evidence_id, revision) VALUES (?, ?, ?) " +
+        "ON CONFLICT(memory_id) DO UPDATE SET evidence_id = excluded.evidence_id, revision = excluded.revision",
       );
       this.#deleteOrigin = this.#database.prepare("DELETE FROM memory_origins WHERE memory_id = ?");
     } catch (error) {
@@ -1105,15 +1240,16 @@ export class SQLiteMemoryStore {
         textColumn("m.id", "currentId"), textColumn("m.content", "content"),
         textColumn("m.created_at", "createdAt"), "m.revision AS currentRevision",
         textColumn("m.updated_at", "updatedAt"), textColumn("o.memory_id", "memoryId"),
-        textColumn("o.job_id", "originJobId"), "o.revision AS originRevision",
-        textColumn("j.id", "jobRecordId"), textColumn("j.job_json", "jobJson"),
-        textColumn("j.status", "jobStatus"), textColumn("j.lease_owner", "leaseOwner"),
-        "j.lease_until AS leaseUntil", textColumn("j.retry_category", "retryCategory"),
-        "j.retry_at AS retryAt",
+        textColumn("o.evidence_id", "originEvidenceId"), "o.revision AS originRevision",
+        textColumn("e.evidence_id", "evidenceId"), textColumn("e.session_id", "sessionId"),
+        textColumn("e.session_file", "sessionFile"), textColumn("e.source_generation", "sourceGeneration"),
+        textColumn("e.cwd", "cwd"), textColumn("e.leaf_id", "leafId"),
+        textColumn("e.source_keys", "sourceKeys"), textColumn("e.lineage_session_ids", "lineageSessionIds"),
+        textColumn("e.source_time", "sourceTime"), textColumn("e.branch_anchor", "branchAnchor"),
       ].join(", ") + " " +
       "FROM memories AS m " +
       "LEFT JOIN memory_origins AS o ON o.memory_id = m.id " +
-      "LEFT JOIN consolidation_jobs AS j ON j.id = o.job_id " +
+      "LEFT JOIN memory_evidence AS e ON e.evidence_id = o.evidence_id " +
       "WHERE m.id = ?",
     ).get(id);
     if (row === undefined) return undefined;
@@ -1124,15 +1260,18 @@ export class SQLiteMemoryStore {
       currentRevision,
       updatedAt,
       memoryId,
-      originJobId,
+      originEvidenceId,
       originRevision,
-      jobRecordId,
-      jobJson,
-      jobStatus,
-      leaseOwner,
-      leaseUntil,
-      retryCategory,
-      retryAt,
+      evidenceId,
+      sessionId,
+      sessionFile,
+      sourceGeneration,
+      cwd,
+      leafId,
+      sourceKeys,
+      lineageSessionIds,
+      sourceTime,
+      branchAnchor,
     } = fields(this.#decodeRow(row), [
       "currentId",
       "content",
@@ -1140,15 +1279,18 @@ export class SQLiteMemoryStore {
       "currentRevision",
       "updatedAt",
       "memoryId",
-      "originJobId",
+      "originEvidenceId",
       "originRevision",
-      "jobRecordId",
-      "jobJson",
-      "jobStatus",
-      "leaseOwner",
-      "leaseUntil",
-      "retryCategory",
-      "retryAt",
+      "evidenceId",
+      "sessionId",
+      "sessionFile",
+      "sourceGeneration",
+      "cwd",
+      "leafId",
+      "sourceKeys",
+      "lineageSessionIds",
+      "sourceTime",
+      "branchAnchor",
     ]);
     const current = parseMemory({
       id: currentId,
@@ -1158,34 +1300,28 @@ export class SQLiteMemoryStore {
       updatedAt,
     });
     if (memoryId === null) {
-      if (
-        originJobId !== null || originRevision !== null || jobRecordId !== null || jobJson !== null ||
-        jobStatus !== null || leaseOwner !== null || leaseUntil !== null ||
-        retryCategory !== null || retryAt !== null
-      ) throw new TypeError("Stored memory origin row is inconsistent.");
+      if (originEvidenceId !== null || originRevision !== null || evidenceId !== null || sessionId !== null ||
+        sessionFile !== null || sourceGeneration !== null || cwd !== null || leafId !== null || sourceKeys !== null ||
+        lineageSessionIds !== null || sourceTime !== null || branchAnchor !== null) {
+        throw new TypeError("Stored memory origin row is inconsistent.");
+      }
       return undefined;
     }
-    const origin = parseMemoryOriginRow({ memoryId, jobId: originJobId, revision: originRevision });
+    const origin = parseMemoryOriginRow({ memoryId, evidenceId: originEvidenceId, revision: originRevision });
     if (origin.memoryId !== current.id || origin.revision !== current.revision) return undefined;
-    if (jobRecordId === null) throw new TypeError("Stored memory origin references a missing consolidation job.");
-    const job = parsePersistedJobRow({
-      id: jobRecordId,
-      job_json: jobJson,
-      status: jobStatus,
-      lease_owner: leaseOwner,
-      lease_until: leaseUntil,
-      retryCategory,
-      retryAt,
+    if (evidenceId === null) throw new TypeError("Stored memory origin references missing evidence.");
+    const evidence = parseEvidenceRow({
+      evidenceId, sessionId, sessionFile, sourceGeneration, cwd, leafId, sourceKeys,
+      lineageSessionIds, sourceTime, branchAnchor,
     });
-    if (job.status !== "complete") throw new TypeError("Stored memory origin references an incomplete job.");
     return {
-      sessionId: job.job.sessionId,
-      sourceKeys: [...job.job.sourceKeys],
-      ...(job.job.lineageSessionIds === undefined
+      sessionId: evidence.sessionId,
+      sourceKeys: [...evidence.sourceKeys],
+      ...(evidence.lineageSessionIds === undefined
         ? {}
-        : { lineageSessionIds: [...job.job.lineageSessionIds] }),
-      ...(job.job.sourceTime === undefined ? {} : { sourceTime: job.job.sourceTime }),
-      ...(job.job.branchAnchor === undefined ? {} : { branchAnchor: job.job.branchAnchor }),
+        : { lineageSessionIds: [...evidence.lineageSessionIds] }),
+      ...(evidence.sourceTime === undefined ? {} : { sourceTime: evidence.sourceTime }),
+      ...(evidence.branchAnchor === undefined ? {} : { branchAnchor: evidence.branchAnchor }),
     };
   }
 
@@ -1247,7 +1383,7 @@ export class SQLiteMemoryStore {
     const triggerJson = JSON.stringify(record);
     const status = record.reason === "compact" ? "candidate" : "pending";
     this.#transaction(() => {
-      if (record.sessionFile !== null) this.#registerSource({sessionId: record.sessionId, sessionFile: record.sessionFile, cwd: record.cwd});
+      if (record.sessionFile !== null) this.#assertSourceEnqueueAllowed(record.sessionId, record.sessionFile, record.cwd);
       const row = this.#database.prepare(`SELECT ${triggerColumns} FROM distill_triggers WHERE id = ?`).get(record.id);
       if (row !== undefined) {
         const existing = this.#readDistillTrigger(row);
@@ -1388,7 +1524,8 @@ export class SQLiteMemoryStore {
         if (prepared === undefined) throw new Error("Prepared batch index exceeded its validated input.");
         const linkId = createHash("sha256").update(JSON.stringify([request.id, prepared.id])).digest("hex");
         const existing = this.#database.prepare(
-          "SELECT id, trigger_id AS triggerId, job_id AS jobId, ordinal FROM distill_trigger_jobs WHERE id = ?",
+          `SELECT ${textColumn("id")}, ${textColumn("trigger_id", "triggerId")}, ` +
+          `${textColumn("job_id", "jobId")}, ordinal FROM distill_trigger_jobs WHERE id = ?`,
         ).get(linkId);
         if (existing === undefined) {
           this.#database.prepare(
@@ -1761,6 +1898,10 @@ export class SQLiteMemoryStore {
         return false;
       }
 
+      if (request.creates.length > 0 || request.updates.length > 0) {
+        this.#persistMemoryEvidence(current.job);
+      }
+
       for (const record of request.creates) {
         const existing = this.get(record.id);
         let revision = 1;
@@ -1817,9 +1958,9 @@ export class SQLiteMemoryStore {
       }
 
       const insertProgress = this.#database.prepare(
-        "INSERT INTO consolidation_progress (source_key, job_id, processed_at) VALUES (?, ?, ?)",
+        "INSERT INTO consolidation_progress (source_key, processed_at) VALUES (?, ?)",
       );
-      for (const key of remaining) insertProgress.run(key, request.jobId, request.now);
+      for (const key of remaining) insertProgress.run(key, request.now);
       const completion = this.#database.prepare(
         "UPDATE consolidation_jobs SET status = 'complete', lease_owner = NULL, lease_until = NULL, " +
         "retry_category = NULL, retry_at = NULL " +
@@ -1997,6 +2138,73 @@ export class SQLiteMemoryStore {
     this.sources.register(source);
   }
 
+  #assertSourceEnqueueAllowed(sessionId: string, sessionFile: string, cwd: string): void {
+    this.#registerSource({sessionId, sessionFile, cwd});
+    const source = this.sources.get(sessionFile, sessionId);
+    const receipt = this.getDeletion(sessionFile);
+    if (source?.deleted || (receipt?.state === "complete" && receipt.sessionId === sessionId)) {
+      throw new ConsolidationConflictError(sessionFile, "has a completed deletion receipt for this source generation");
+    }
+  }
+
+  #persistMemoryEvidence(job: ConsolidationJob, allowDeletedSource = false): void {
+    if (job.sessionFile !== null && !allowDeletedSource) {
+      this.#assertSourceEnqueueAllowed(job.sessionId, job.sessionFile, job.cwd);
+    }
+    let source = job.sessionFile === null ? undefined : this.sources.get(job.sessionFile, job.sessionId);
+    if (job.sessionFile !== null && !source) {
+      source = this.sources.register({sessionId: job.sessionId, sessionFile: job.sessionFile, cwd: job.cwd});
+    }
+    if (allowDeletedSource && job.sessionFile !== null) {
+      const receipt = this.getDeletion(job.sessionFile);
+      if (receipt?.state === "complete" && receipt.sessionId === job.sessionId) {
+        this.sources.markDeleted(job.sessionFile, job.sessionId);
+        source = this.sources.get(job.sessionFile, job.sessionId);
+      }
+    } else if (source?.deleted) {
+      throw new ConsolidationConflictError(job.id, "belongs to a deleted source generation");
+    }
+    const evidence: MemoryEvidence = {
+      evidenceId: job.id,
+      sessionId: job.sessionId,
+      sessionFile: job.sessionFile,
+      sourceGeneration: source?.generation ?? null,
+      cwd: job.cwd,
+      leafId: job.leafId,
+      sourceKeys: job.sourceKeys,
+      ...(job.lineageSessionIds === undefined ? {} : { lineageSessionIds: job.lineageSessionIds }),
+      ...(job.sourceTime === undefined ? {} : { sourceTime: job.sourceTime }),
+      ...(job.branchAnchor === undefined ? {} : { branchAnchor: job.branchAnchor }),
+    };
+    if ((evidence.sessionFile === null) !== (evidence.sourceGeneration === null)) {
+      throw new ConsolidationConflictError(job.id, "has no stable source generation for memory provenance");
+    }
+    const raw = this.#database.prepare(`SELECT ${evidenceColumns} FROM memory_evidence WHERE evidence_id = ?`).get(job.id);
+    if (raw !== undefined) {
+      const stored = parseEvidenceRow(this.#decodeRow(raw));
+      if (JSON.stringify(stored) !== JSON.stringify(evidence)) {
+        throw new ConsolidationConflictError(job.id, "already has different immutable memory provenance");
+      }
+      return;
+    }
+    this.#database.prepare(
+      "INSERT INTO memory_evidence " +
+      "(evidence_id, session_id, session_file, source_generation, cwd, leaf_id, source_keys, " +
+      "lineage_session_ids, source_time, branch_anchor) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    ).run(
+      evidence.evidenceId,
+      evidence.sessionId,
+      evidence.sessionFile,
+      evidence.sourceGeneration,
+      evidence.cwd,
+      evidence.leafId,
+      JSON.stringify(evidence.sourceKeys),
+      evidence.lineageSessionIds === undefined ? null : JSON.stringify(evidence.lineageSessionIds),
+      evidence.sourceTime ?? null,
+      evidence.branchAnchor ?? null,
+    );
+  }
+
   /** The live Pi manager supplies the header before a new file has been written. */
   reserveSessionSource(source: {sessionId: string; sessionFile: string; cwd: string; parentSession?: string}): void {
     this.#transaction(() => {
@@ -2009,6 +2217,198 @@ export class SQLiteMemoryStore {
   backfillSources(limit = 128): boolean {
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > 128) throw new TypeError("Invalid backfill budget.");
     return this.#transaction(() => this.#backfillSources(limit));
+  }
+
+  /** Reclaim terminal metadata in a restartable sweep; receipts, origins, and progress survive. */
+  collectMetadata(limit = maxMetadataGcPageSize): { readonly removed: number; readonly hasMore: boolean } {
+    this.#ensureOpen();
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > maxMetadataGcPageSize) {
+      throw new TypeError("Metadata collection limit must be an integer from 1 through 128.");
+    }
+    return this.#transaction(() => {
+      const access = this.#sourceAccess();
+      if (access && !processHasExited(access.pid)) return { removed: 0, hasMore: false };
+      if (access) this.#database.prepare("DELETE FROM source_access WHERE token = ?").run(access.token);
+      if (!this.#backfillSources(maxTaskPageSize)) return { removed: 0, hasMore: true };
+
+      const state = this.#database.prepare(
+        "SELECT phase, cursor_row AS cursorRow FROM metadata_gc_state WHERE singleton = 1",
+      ).get();
+      if (state === undefined) throw new Error("Metadata collection state is missing.");
+      let phase = state["phase"];
+      let cursor = state["cursorRow"];
+      if (typeof phase !== "number" || !Number.isSafeInteger(phase) || phase < 0 || phase > 7 ||
+        typeof cursor !== "number" || !Number.isSafeInteger(cursor) || cursor < 0) {
+        throw new TypeError("Stored metadata collection progress is invalid.");
+      }
+
+      let examined = 0;
+      let removed = 0;
+      while (phase < 8 && examined < limit) {
+        const remaining = limit - examined;
+        const rows = this.#metadataGcRows(phase, cursor, remaining);
+        if (rows.length === 0) {
+          phase += 1;
+          cursor = 0;
+          continue;
+        }
+        for (const raw of rows) {
+          const row = this.#decodeRow(raw);
+          const rowId = row["gcRow"];
+          if (typeof rowId !== "number" || !Number.isSafeInteger(rowId) || rowId <= cursor) {
+            throw new TypeError("Stored metadata collection row cursor is invalid.");
+          }
+          cursor = rowId;
+          examined += 1;
+          if (this.#collectMetadataRow(phase, row)) removed += 1;
+        }
+        if (rows.length < remaining) {
+          phase += 1;
+          cursor = 0;
+        }
+      }
+
+      if (phase >= 8) {
+        this.#database.prepare("UPDATE metadata_gc_state SET phase = 0, cursor_row = 0 WHERE singleton = 1").run();
+        return { removed, hasMore: removed > 0 };
+      }
+      this.#database.prepare("UPDATE metadata_gc_state SET phase = ?, cursor_row = ? WHERE singleton = 1")
+        .run(phase, cursor);
+      return { removed, hasMore: true };
+    });
+  }
+
+  #metadataGcRows(phase: number, cursor: number, limit: number): Record<string, unknown>[] {
+    const queries: readonly string[] = [
+      `SELECT rowid AS gcRow, ${cleanTaskColumns} FROM clean_tasks WHERE rowid > ? ORDER BY rowid LIMIT ?`,
+      `SELECT rowid AS gcRow, ${textColumn("id")}, ${textColumn("trigger_id", "triggerId")}, ${textColumn("job_id", "jobId")} FROM distill_trigger_jobs WHERE rowid > ? ORDER BY rowid LIMIT ?`,
+      `SELECT rowid AS gcRow, ${triggerColumns} FROM distill_triggers WHERE rowid > ? ORDER BY rowid LIMIT ?`,
+      `SELECT rowid AS gcRow, ${jobColumns} FROM consolidation_jobs WHERE rowid > ? ORDER BY rowid LIMIT ?`,
+      `SELECT rowid AS gcRow, ${observationColumns} FROM session_observations WHERE rowid > ? ORDER BY rowid LIMIT ?`,
+      `SELECT rowid AS gcRow, ${sessionUsageColumns} FROM session_usages WHERE rowid > ? ORDER BY rowid LIMIT ?`,
+      `SELECT row_id AS gcRow, ${textColumn("generation")}, ${textColumn("session_file", "sessionFile")}, ${textColumn("session_id", "sessionId")}, deleted FROM managed_sources WHERE row_id > ? ORDER BY row_id LIMIT ?`,
+      `SELECT rowid AS gcRow, ${evidenceColumns} FROM memory_evidence WHERE rowid > ? ORDER BY rowid LIMIT ?`,
+    ];
+    const query = queries[phase];
+    if (query === undefined) throw new Error("Metadata collection phase is invalid.");
+    return this.#database.prepare(query).all(cursor, limit);
+  }
+
+  #collectMetadataRow(phase: number, row: Record<string, unknown>): boolean {
+    const rowId = row["gcRow"];
+    if (typeof rowId !== "number" || !Number.isSafeInteger(rowId) || rowId < 1) {
+      throw new TypeError("Stored metadata row ID is invalid.");
+    }
+    if (phase === 0) {
+      const record = parsePersistedCleanTask(this.#metadataPayload(row));
+      if (record.task.sessionFile === null || !this.#metadataSourceEligible(record.task.sessionFile, record.task.sessionId)) return false;
+      return this.#database.prepare("DELETE FROM clean_tasks WHERE rowid = ?").run(rowId).changes === 1;
+    }
+    if (phase === 1) {
+      const link = fields(this.#metadataPayload(row), ["id", "triggerId", "jobId"]);
+      validateText(link["id"], "stored trigger batch link ID");
+      validateText(link["triggerId"], "stored trigger batch ID");
+      validateText(link["jobId"], "stored trigger batch job ID");
+      const triggerRow = this.#database.prepare(`SELECT ${triggerColumns} FROM distill_triggers WHERE id = ?`).get(link["triggerId"]);
+      const jobRow = this.#database.prepare(`SELECT ${jobColumns} FROM consolidation_jobs WHERE id = ?`).get(link["jobId"]);
+      if (triggerRow === undefined || jobRow === undefined) throw new TypeError("Stored trigger batch link is orphaned.");
+      const trigger = this.#readDistillTrigger(triggerRow);
+      const job = parsePersistedJobRow(this.#decodeRow(jobRow));
+      if (trigger.status !== "complete" || job.status !== "complete" || job.job.sessionFile === null ||
+        job.job.sessionFile !== trigger.trigger.sessionFile || job.job.sessionId !== trigger.trigger.sessionId ||
+        !this.#metadataSourceEligible(trigger.trigger.sessionFile, trigger.trigger.sessionId)) return false;
+      return this.#database.prepare("DELETE FROM distill_trigger_jobs WHERE rowid = ?").run(rowId).changes === 1;
+    }
+    if (phase === 2) {
+      const trigger = this.#readDistillTrigger(this.#metadataPayload(row));
+      if (trigger.status !== "complete" || trigger.jobIds.length > 0 || trigger.trigger.sessionFile === null ||
+        !this.#metadataSourceEligible(trigger.trigger.sessionFile, trigger.trigger.sessionId)) return false;
+      return this.#database.prepare("DELETE FROM distill_triggers WHERE rowid = ?").run(rowId).changes === 1;
+    }
+    if (phase === 3) {
+      const job = parsePersistedJobRow(this.#metadataPayload(row));
+      if (job.status !== "complete" || job.job.sessionFile === null ||
+        this.#database.prepare("SELECT 1 AS present FROM distill_trigger_jobs WHERE job_id = ? LIMIT 1").get(job.job.id) !== undefined ||
+        !this.#metadataSourceEligible(job.job.sessionFile, job.job.sessionId)) return false;
+      return this.#database.prepare("DELETE FROM consolidation_jobs WHERE rowid = ?").run(rowId).changes === 1;
+    }
+    if (phase === 4) {
+      const stored = parseStoredSessionObservation(this.#metadataPayload(row));
+      const observation = stored.observation;
+      if (!stored.captured || !this.#metadataSourceEligible(observation.sessionFile, observation.sessionId)) return false;
+      return this.#database.prepare("DELETE FROM session_observations WHERE rowid = ?").run(rowId).changes === 1;
+    }
+    if (phase === 5) {
+      const usage = parseStoredSessionUsage(this.#metadataPayload(row));
+      if (usage.state !== "released" || !this.#metadataSourceEligible(usage.sessionFile, usage.sessionId)) return false;
+      return this.#database.prepare("DELETE FROM session_usages WHERE rowid = ?").run(rowId).changes === 1;
+    }
+    if (phase === 6) {
+      validateAbsolutePath(row["sessionFile"], "stored managed source path");
+      validateText(row["sessionId"], "stored managed source session ID");
+      validateText(row["generation"], "stored managed source generation");
+      if (row["deleted"] !== 1) return false;
+      const eligible = this.#metadataSourceEligible(row["sessionFile"], row["sessionId"]);
+      if (!eligible || eligible.generation !== row["generation"] ||
+        this.#hasOperationalSourceMetadata(row["sessionFile"])) return false;
+      return this.#database.prepare(
+        "DELETE FROM managed_sources WHERE row_id = ? AND generation = ? AND deleted = 1",
+      ).run(rowId, eligible.generation).changes === 1;
+    }
+    if (phase === 7) {
+      const evidence = parseEvidenceRow(this.#metadataPayload(row));
+      if (this.#database.prepare("SELECT 1 AS present FROM memory_origins WHERE evidence_id = ? LIMIT 1").get(evidence.evidenceId) !== undefined) return false;
+      return this.#database.prepare("DELETE FROM memory_evidence WHERE rowid = ?").run(rowId).changes === 1;
+    }
+    throw new Error("Metadata collection phase is invalid.");
+  }
+
+  #metadataPayload(row: Record<string, unknown>): Record<string, unknown> {
+    const { gcRow: _cursor, ...payload } = row;
+    return payload;
+  }
+
+  #metadataSourceEligible(sessionFile: string, sessionId: string): { readonly generation: string } | undefined {
+    const source = this.sources.get(sessionFile, sessionId);
+    if (!source || !source.deleted) return undefined;
+    const receipt = this.getDeletion(sessionFile);
+    if (receipt?.state !== "complete" || receipt.sessionId !== sessionId || receipt.sourceGeneration !== source.generation) return undefined;
+    if (this.sources.hasDependents(sessionFile) || this.#hasLiveSourceReferences(sessionFile)) return undefined;
+    return { generation: source.generation };
+  }
+
+  #hasLiveSourceReferences(sessionFile: string): boolean {
+    const filter = this.#scopeFilter([sessionFile]);
+    for (const [table, column, condition] of [
+      ["consolidation_jobs", "json_extract(job_json, '$.sessionFile')", "status = 'pending'"],
+      ["distill_triggers", "json_extract(trigger_json, '$.sessionFile')", "status <> 'complete'"],
+      ["session_observations", "session_file", "captured = 0"],
+      ["session_usages", "session_file", "state <> 'released'"],
+    ] as const) {
+      if (this.#database.prepare(`SELECT 1 AS present FROM ${table} WHERE ${condition} AND ${filter.sql(column)} LIMIT 1`)
+        .get(...filter.values) !== undefined) return true;
+    }
+    return false;
+  }
+
+  #hasOperationalSourceMetadata(sessionFile: string): boolean {
+    const filter = this.#scopeFilter([sessionFile]);
+    const queries = [
+      ["clean_tasks", "json_extract(task_json, '$.sessionFile')"],
+      ["consolidation_jobs", "json_extract(job_json, '$.sessionFile')"],
+      ["distill_triggers", "json_extract(trigger_json, '$.sessionFile')"],
+      ["session_observations", "session_file"],
+      ["session_usages", "session_file"],
+    ] as const;
+    for (const [table, column] of queries) {
+      if (this.#database.prepare(`SELECT 1 AS present FROM ${table} WHERE ${filter.sql(column)} LIMIT 1`)
+        .get(...filter.values) !== undefined) return true;
+    }
+    return this.#database.prepare(
+      "SELECT 1 AS present FROM distill_trigger_jobs AS links " +
+      "JOIN distill_triggers AS triggers ON triggers.id = links.trigger_id WHERE " +
+      filter.sql("json_extract(triggers.trigger_json, '$.sessionFile')") + " LIMIT 1",
+    ).get(...filter.values) !== undefined;
   }
 
   #backfillSources(limit: number): boolean {
@@ -2144,16 +2544,34 @@ export class SQLiteMemoryStore {
 
   getDeletion(path: string): SessionDeletion | undefined {
     validateAbsolutePath(path, "Deletion path");
-    const raw = this.#database.prepare(`SELECT ${["session_file", "session_id", "intent_id", "file_version", "state"].map(c => textColumn(c)).join(", ")} FROM session_deletions WHERE session_file = ?`).get(path);
+    const schemaVersion = this.#database.prepare("PRAGMA user_version").get()?.["user_version"];
+    const columns = schemaVersion === latestSchemaVersion
+      ? deletionColumns
+      : [textColumn("session_file", "sessionFile"), textColumn("session_id", "sessionId"),
+        textColumn("intent_id", "intentId"), textColumn("file_version", "fileVersion"),
+        "NULL AS sourceGeneration", textColumn("state")].join(", ");
+    const raw = this.#database.prepare(`SELECT ${columns} FROM session_deletions WHERE session_file = ?`).get(path);
     if (!raw) return undefined;
-    const row = this.#decodeRow(raw);
-    validateAbsolutePath(row["session_file"], "Stored deletion path");
-    validateText(row["session_id"], "Stored deletion session ID");
-    validateText(row["intent_id"], "Stored deletion intent ID");
-    validateText(row["file_version"], "Stored deletion file version");
-    if (!/^\d+:\d+:\d+:\d+:\d+$/.test(row["file_version"])) throw new TypeError("Invalid deletion file version.");
+    return this.#parseDeletionRow(this.#decodeRow(raw));
+  }
+
+  #parseDeletionRow(value: unknown): SessionDeletion {
+    const row = fields(value, ["sessionFile", "sessionId", "intentId", "fileVersion", "sourceGeneration", "state"]);
+    validateAbsolutePath(row["sessionFile"], "Stored deletion path");
+    validateText(row["sessionId"], "Stored deletion session ID");
+    validateText(row["intentId"], "Stored deletion intent ID");
+    validateText(row["fileVersion"], "Stored deletion file version");
+    if (!/^\d+:\d+:\d+:\d+:\d+$/.test(row["fileVersion"])) throw new TypeError("Invalid deletion file version.");
+    const sourceGeneration = parseNullableText(row["sourceGeneration"], "Stored deletion source generation");
     if (row["state"] !== "deleting" && row["state"] !== "complete") throw new TypeError("Invalid deletion state.");
-    return {sessionFile:row["session_file"], sessionId:row["session_id"], intentId:row["intent_id"], fileVersion:row["file_version"], state:row["state"]};
+    return {
+      sessionFile: row["sessionFile"],
+      sessionId: row["sessionId"],
+      intentId: row["intentId"],
+      fileVersion: row["fileVersion"],
+      sourceGeneration,
+      state: row["state"],
+    };
   }
 
   #deletionTask(id: string, owner: string, access: string, version: string, scope?: readonly string[]): CleanTaskInput | undefined {
@@ -2170,10 +2588,15 @@ export class SQLiteMemoryStore {
     return this.#transaction(() => {
       const task = this.#deletionTask(id, owner, access, version, scope);
       if (!task) return false;
+      const source = this.sources.get(task.sessionFile, task.sessionId);
+      if (!source || source.deleted) return false;
       const previous = this.getDeletion(task.sessionFile);
       if (previous && (previous.state === "complete" || previous.sessionId !== task.sessionId || previous.fileVersion.split(":").slice(0, 2).join(":") !== fileVersion.split(":").slice(0, 2).join(":"))) return false;
-      this.#database.prepare("INSERT INTO session_deletions VALUES (?, ?, ?, ?, 'deleting') ON CONFLICT(session_file) DO UPDATE SET intent_id = excluded.intent_id, file_version = excluded.file_version")
-        .run(task.sessionFile, task.sessionId, task.intentId, fileVersion);
+      this.#database.prepare(
+        "INSERT INTO session_deletions (session_file, session_id, intent_id, file_version, source_generation, state) " +
+        "VALUES (?, ?, ?, ?, ?, 'deleting') ON CONFLICT(session_file) DO UPDATE SET " +
+        "intent_id = excluded.intent_id, file_version = excluded.file_version, source_generation = excluded.source_generation",
+      ).run(task.sessionFile, task.sessionId, task.intentId, fileVersion, source.generation);
       return true;
     });
   }
@@ -2184,7 +2607,9 @@ export class SQLiteMemoryStore {
       const task = this.#deletionTask(id, owner, access, version, scope);
       if (!task) return false;
       const receipt = this.getDeletion(task.sessionFile);
-      if (!receipt || receipt.state !== "deleting" || receipt.sessionId !== task.sessionId || receipt.intentId !== task.intentId) return false;
+      const source = this.sources.get(task.sessionFile, task.sessionId);
+      if (!receipt || receipt.state !== "deleting" || receipt.sessionId !== task.sessionId ||
+        receipt.intentId !== task.intentId || !source || source.deleted || receipt.sourceGeneration !== source.generation) return false;
       if (mutate() !== true) return false;
       this.#database.prepare("UPDATE session_deletions SET state = 'complete' WHERE session_file = ?").run(task.sessionFile);
       this.sources.markDeleted(task.sessionFile, task.sessionId);
@@ -2224,7 +2649,8 @@ export class SQLiteMemoryStore {
 
   #triggerJobIds(triggerId: string): readonly string[] {
     const rows = this.#database.prepare(
-      "SELECT id, trigger_id AS triggerId, job_id AS jobId, ordinal " +
+      `SELECT ${textColumn("id")}, ${textColumn("trigger_id", "triggerId")}, ` +
+      `${textColumn("job_id", "jobId")}, ordinal ` +
       "FROM distill_trigger_jobs WHERE trigger_id = ? ORDER BY ordinal, rowid",
     ).all(triggerId);
     const result: string[] = [];
@@ -2249,7 +2675,8 @@ export class SQLiteMemoryStore {
 
   #jobTriggerIds(jobId: string): readonly string[] {
     const rows = this.#database.prepare(
-      "SELECT id, trigger_id AS triggerId, job_id AS jobId " +
+      `SELECT ${textColumn("id")}, ${textColumn("trigger_id", "triggerId")}, ` +
+      `${textColumn("job_id", "jobId")} ` +
       "FROM distill_trigger_jobs WHERE job_id = ? ORDER BY rowid",
     ).all(jobId);
     return rows.map(raw => {
@@ -2382,7 +2809,7 @@ export class SQLiteMemoryStore {
   }
 
   #enqueueConsolidationInTransaction(record: ConsolidationJob): void {
-    if (record.sessionFile !== null) this.#registerSource({sessionId: record.sessionId, sessionFile: record.sessionFile, cwd: record.cwd});
+    if (record.sessionFile !== null) this.#assertSourceEnqueueAllowed(record.sessionId, record.sessionFile, record.cwd);
     const serialized = JSON.stringify(record);
     const row = this.#database.prepare(`SELECT ${jobColumns} FROM consolidation_jobs WHERE id = ?`).get(record.id);
     if (row !== undefined) {
@@ -2410,7 +2837,7 @@ export class SQLiteMemoryStore {
 
   #enqueueCleanTaskInTransaction(task: CleanTaskInput): CleanTask {
     const record = parseCleanTaskInput(task);
-    if (record.sessionFile !== null) this.#registerSource({sessionId: record.sessionId, sessionFile: record.sessionFile, cwd: record.cwd});
+    if (record.sessionFile !== null) this.#assertSourceEnqueueAllowed(record.sessionId, record.sessionFile, record.cwd);
     const id = cleanTaskId(record.sessionFile);
     const serialized = JSON.stringify(record);
     const row = this.#database.prepare(`SELECT ${cleanTaskColumns} FROM clean_tasks WHERE id = ?`).get(id);
@@ -2495,7 +2922,7 @@ export class SQLiteMemoryStore {
 
   #initializeSchema(): void {
     const version = this.#database.prepare("PRAGMA user_version").get()?.["user_version"];
-    if (version !== 0 && version !== 1 && version !== 2 && version !== 3 && version !== 4 && version !== 5 && version !== latestSchemaVersion) {
+    if (version !== 0 && version !== 1 && version !== 2 && version !== 3 && version !== 4 && version !== 5 && version !== 6 && version !== latestSchemaVersion) {
       throw new Error("Unsupported memory database schema version: " + String(version) + ".");
     }
     if (version === latestSchemaVersion) {
@@ -2569,27 +2996,116 @@ export class SQLiteMemoryStore {
       this.#validateSchema(true, true);
       this.#validateAllRows(true, true);
     }
-    if (version !== 4 && version !== 5) this.#migrateV3ToV4();
-    if (version !== 5) {
+    if (version !== 4 && version !== 5 && version !== 6) this.#migrateV3ToV4();
+    if (version < 5) {
       this.#validateSchema(true);
       this.#validateAllRows();
       this.#database.exec(sourceAccessSchema);
-      this.#database.exec(deletionsSchema);
+      this.#database.exec(deletionsSchemaV5);
       this.#database.exec("PRAGMA user_version = 5");
     }
+    if (version < 6) {
+      this.#validateLatestSchema();
+      this.#validateAllRows();
+      initializeSourceRegistry(this.#database);
+      for (const sql of [sourceBackfillSchema, ...storeIndexes]) this.#database.exec(sql);
+      this.#database.prepare("INSERT INTO source_backfill VALUES (1,0,0)").run();
+      this.#backfillSources(128);
+      this.#database.exec("PRAGMA user_version = 6");
+    } else {
+      this.#validateSchema(true);
+      this.#validateAllRows();
+      initializeSourceRegistry(this.#database);
+    }
+    this.#migrateV6ToV7();
     this.#validateLatestSchema();
     this.#validateAllRows();
-    initializeSourceRegistry(this.#database);
-    for (const sql of [sourceBackfillSchema, ...storeIndexes]) this.#database.exec(sql);
-    this.#database.prepare("INSERT INTO source_backfill VALUES (1,0,0)").run();
-    this.#backfillSources(128);
-    this.#database.exec("PRAGMA user_version = 6");
     this.#sourceAccess();
-    for (const row of this.#database.prepare(`SELECT ${textColumn("session_file")} FROM session_deletions`).iterate()) {
-      const path = this.#decodeRow(row)["session_file"];
-      validateAbsolutePath(path, "Stored deletion path");
-      this.getDeletion(path);
+  }
+
+  #migrateV6ToV7(): void {
+    const currentVersion = this.#database.prepare("PRAGMA user_version").get()?.["user_version"];
+    if (currentVersion !== 6) throw new Error("Memory schema migration expected version 6.");
+    this.#validateSchema(true);
+    this.#validateAllRows();
+
+    this.#database.exec(
+      "ALTER TABLE memory_origins RENAME TO memory_origins_v6; " +
+      "ALTER TABLE consolidation_progress RENAME TO consolidation_progress_v6; " +
+      "ALTER TABLE session_deletions RENAME TO session_deletions_v6; " +
+      memoryEvidenceSchema + "; " + memoryOriginsSchema + "; " + consolidationProgressSchema + "; " + deletionsSchema + "; " +
+      metadataGcSchema + "; " + storeIndexesV7.join("; "),
+    );
+    this.#database.prepare("INSERT INTO metadata_gc_state VALUES (1, 0, 0)").run();
+
+    const originRows = this.#database.prepare(
+      `SELECT ${originColumnsV6} FROM memory_origins_v6 ORDER BY rowid`,
+    ).all();
+    const insertOrigin = this.#database.prepare(
+      "INSERT INTO memory_origins (memory_id, evidence_id, revision) VALUES (?, ?, ?)",
+    );
+    const originsToMigrate: { memoryId: string; job: ConsolidationJob; revision: number }[] = [];
+    for (const raw of originRows) {
+      const origin = parseMemoryOriginRowV6(this.#decodeRow(raw));
+      const jobRow = this.#database.prepare(`SELECT ${jobColumns} FROM consolidation_jobs WHERE id = ?`).get(origin.jobId);
+      if (jobRow === undefined) throw new TypeError("Stored memory origin references a missing consolidation job.");
+      const job = parsePersistedJobRow(this.#decodeRow(jobRow));
+      if (job.status !== "complete") throw new TypeError("Stored memory origin references an incomplete consolidation job.");
+      originsToMigrate.push({memoryId:origin.memoryId, job:job.job, revision:origin.revision});
     }
+    for (const origin of originsToMigrate) {
+      this.#persistMemoryEvidence(origin.job, true);
+      insertOrigin.run(origin.memoryId, origin.job.id, origin.revision);
+    }
+
+    const progressRows = this.#database.prepare(
+      `SELECT ${progressColumnsV6} FROM consolidation_progress_v6 ORDER BY rowid`,
+    ).all();
+    const insertProgress = this.#database.prepare(
+      "INSERT INTO consolidation_progress (source_key, processed_at) VALUES (?, ?)",
+    );
+    for (const raw of progressRows) {
+      const progress = parseProgressRowV6(this.#decodeRow(raw));
+      const jobRow = this.#database.prepare(`SELECT ${jobColumns} FROM consolidation_jobs WHERE id = ?`).get(progress.jobId);
+      if (jobRow === undefined || !parsePersistedJobRow(this.#decodeRow(jobRow)).job.sourceKeys.includes(progress.sourceKey)) {
+        throw new TypeError("Stored source progress does not match its consolidation job.");
+      }
+      insertProgress.run(progress.sourceKey, progress.processedAt);
+    }
+
+    const deletionRows = this.#database.prepare(
+      "SELECT " + [textColumn("session_file", "sessionFile"), textColumn("session_id", "sessionId"),
+        textColumn("intent_id", "intentId"), textColumn("file_version", "fileVersion"), textColumn("state")].join(", ") +
+      " FROM session_deletions_v6 ORDER BY rowid",
+    ).all();
+    const insertDeletion = this.#database.prepare(
+      "INSERT INTO session_deletions (session_file, session_id, intent_id, file_version, source_generation, state) " +
+      "VALUES (?, ?, ?, ?, ?, ?)",
+    );
+    for (const raw of deletionRows) {
+      const row = this.#decodeRow(raw);
+      validateAbsolutePath(row["sessionFile"], "Stored deletion path");
+      validateText(row["sessionId"], "Stored deletion session ID");
+      validateText(row["intentId"], "Stored deletion intent ID");
+      validateText(row["fileVersion"], "Stored deletion file version");
+      if (!/^\d+:\d+:\d+:\d+:\d+$/.test(row["fileVersion"])) throw new TypeError("Invalid deletion file version.");
+      if (row["state"] !== "deleting" && row["state"] !== "complete") throw new TypeError("Invalid deletion state.");
+      let source = this.sources.get(row["sessionFile"], row["sessionId"]);
+      if (!source) {
+        source = this.sources.register({
+          sessionId: row["sessionId"],
+          sessionFile: row["sessionFile"],
+          cwd: dirname(row["sessionFile"]),
+        });
+      }
+      if (row["state"] === "complete") this.sources.markDeleted(row["sessionFile"], row["sessionId"]);
+      insertDeletion.run(row["sessionFile"], row["sessionId"], row["intentId"], row["fileVersion"], source.generation, row["state"]);
+    }
+
+    this.#database.exec(
+      "DROP TABLE memory_origins_v6; DROP TABLE consolidation_progress_v6; DROP TABLE session_deletions_v6; " +
+      "PRAGMA user_version = 7",
+    );
   }
 
   #migrateV3ToV4(): void {
@@ -2609,8 +3125,8 @@ export class SQLiteMemoryStore {
 
   #createAuxiliaryTables(): void {
     this.#database.exec(consolidationJobsV3Schema);
-    this.#database.exec(consolidationProgressSchema);
-    this.#database.exec(memoryOriginsSchema);
+    this.#database.exec(consolidationProgressSchemaV6);
+    this.#database.exec(memoryOriginsSchemaV6);
     this.#database.exec(sessionObservationsSchema);
     this.#database.exec(sessionUsagesSchema);
   }
@@ -2634,6 +3150,8 @@ export class SQLiteMemoryStore {
     const objects = this.#database.prepare(
       `SELECT ${schemaColumns} FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*'`,
     ).all().map((row) => this.#decodeRow(row));
+    const schemaVersion = this.#database.prepare("PRAGMA user_version").get()?.["user_version"];
+    const usesV7Metadata = schemaVersion === latestSchemaVersion;
     const schemas = new Map<string, { readonly sql: string; readonly columns: readonly SchemaColumn[] }>([
       ["memories", {
         sql: currentSchema,
@@ -2664,16 +3182,23 @@ export class SQLiteMemoryStore {
         ],
       }],
       ["consolidation_progress", {
-        sql: consolidationProgressSchema,
-        columns: [
+        sql: usesV7Metadata ? consolidationProgressSchema : consolidationProgressSchemaV6,
+        columns: usesV7Metadata ? [
+          { name: "source_key", type: "TEXT", notNull: 1, primaryKey: 1 },
+          { name: "processed_at", type: "INTEGER", notNull: 1, primaryKey: 0 },
+        ] : [
           { name: "source_key", type: "TEXT", notNull: 1, primaryKey: 1 },
           { name: "job_id", type: "TEXT", notNull: 1, primaryKey: 0 },
           { name: "processed_at", type: "INTEGER", notNull: 1, primaryKey: 0 },
         ],
       }],
       ["memory_origins", {
-        sql: memoryOriginsSchema,
-        columns: [
+        sql: usesV7Metadata ? memoryOriginsSchema : memoryOriginsSchemaV6,
+        columns: usesV7Metadata ? [
+          { name: "memory_id", type: "TEXT", notNull: 1, primaryKey: 1 },
+          { name: "evidence_id", type: "TEXT", notNull: 1, primaryKey: 0 },
+          { name: "revision", type: "INTEGER", notNull: 1, primaryKey: 0 },
+        ] : [
           { name: "memory_id", type: "TEXT", notNull: 1, primaryKey: 1 },
           { name: "job_id", type: "TEXT", notNull: 1, primaryKey: 0 },
           { name: "revision", type: "INTEGER", notNull: 1, primaryKey: 0 },
@@ -2691,6 +3216,23 @@ export class SQLiteMemoryStore {
         ],
       }],
     ]);
+    if (usesV7Metadata) {
+      schemas.set("memory_evidence", {
+        sql: memoryEvidenceSchema,
+        columns: [
+          { name: "evidence_id", type: "TEXT", notNull: 1, primaryKey: 1 },
+          { name: "session_id", type: "TEXT", notNull: 1, primaryKey: 0 },
+          { name: "session_file", type: "TEXT", notNull: 0, primaryKey: 0 },
+          { name: "source_generation", type: "TEXT", notNull: 0, primaryKey: 0 },
+          { name: "cwd", type: "TEXT", notNull: 1, primaryKey: 0 },
+          { name: "leaf_id", type: "TEXT", notNull: 0, primaryKey: 0 },
+          { name: "source_keys", type: "TEXT", notNull: 1, primaryKey: 0 },
+          { name: "lineage_session_ids", type: "TEXT", notNull: 0, primaryKey: 0 },
+          { name: "source_time", type: "TEXT", notNull: 0, primaryKey: 0 },
+          { name: "branch_anchor", type: "TEXT", notNull: 0, primaryKey: 0 },
+        ],
+      });
+    }
     if (includeSessionUsages) {
       schemas.set("session_usages", {
         sql: sessionUsagesSchema,
@@ -2752,22 +3294,24 @@ export class SQLiteMemoryStore {
         ],
       });
     }
-    const schemaVersion = this.#database.prepare("PRAGMA user_version").get()?.["user_version"];
     if (typeof schemaVersion === "number" && schemaVersion >= 5) {
       schemas.set("source_access", { sql: sourceAccessSchema, columns: [
         { name: "singleton", type: "INTEGER", notNull: 1, primaryKey: 1 },
         { name: "token", type: "TEXT", notNull: 1, primaryKey: 0 },
         { name: "owner_pid", type: "INTEGER", notNull: 1, primaryKey: 0 },
       ] });
-      schemas.set("session_deletions", { sql: deletionsSchema, columns: [
+      schemas.set("session_deletions", { sql: usesV7Metadata ? deletionsSchema : deletionsSchemaV5, columns: [
         { name: "session_file", type: "TEXT", notNull: 1, primaryKey: 1 },
         { name: "session_id", type: "TEXT", notNull: 1, primaryKey: 0 },
         { name: "intent_id", type: "TEXT", notNull: 1, primaryKey: 0 },
         { name: "file_version", type: "TEXT", notNull: 1, primaryKey: 0 },
+        ...(usesV7Metadata ? [{ name: "source_generation", type: "TEXT" as const, notNull: 0 as const, primaryKey: 0 as const }] : []),
         { name: "state", type: "TEXT", notNull: 1, primaryKey: 0 },
       ] });
     }
-    const additional = typeof schemaVersion === "number" && schemaVersion >= 6 ? [...SOURCE_REGISTRY_SCHEMAS, ...storeSchemas] : [];
+    const additional = typeof schemaVersion === "number" && schemaVersion >= 6
+      ? [...SOURCE_REGISTRY_SCHEMAS, ...(usesV7Metadata ? storeSchemasV7 : storeSchemas)]
+      : [];
     const extraSchemas = new Map(additional.map(schema => [schema.name, schema.sql]));
     if (objects.length !== schemas.size + extraSchemas.size) throw new Error("Unsupported memory database schema.");
     for (const object of objects) {
@@ -2824,26 +3368,45 @@ export class SQLiteMemoryStore {
 
   #validateAllRows(includeSessionUsages = true, useLegacyJobColumns = false): void {
     this.#validateMemoryRows();
+    const schemaVersion = this.#database.prepare("PRAGMA user_version").get()?.["user_version"];
+    const usesV7Metadata = schemaVersion === latestSchemaVersion;
     const jobs = this.#database.prepare(
       `SELECT ${useLegacyJobColumns ? legacyJobColumns : jobColumns} FROM consolidation_jobs`,
     ).all().map((row) => parsePersistedJobRow(this.#decodeRow(row)));
     const jobsById = new Map(jobs.map((record) => [record.job.id, record]));
     for (const row of this.#database.prepare(
-      `SELECT ${progressColumns} FROM consolidation_progress`,
+      `SELECT ${usesV7Metadata ? progressColumns : progressColumnsV6} FROM consolidation_progress`,
     ).iterate()) {
-      const progress = parseProgressRow(this.#decodeRow(row));
-      const sourceJob = jobsById.get(progress.jobId);
-      if (sourceJob === undefined || !sourceJob.job.sourceKeys.includes(progress.sourceKey)) {
-        throw new TypeError("Stored source progress does not match its consolidation job.");
+      if (usesV7Metadata) {
+        parseProgressRow(this.#decodeRow(row));
+      } else {
+        const progress = parseProgressRowV6(this.#decodeRow(row));
+        const sourceJob = jobsById.get(progress.jobId);
+        if (sourceJob === undefined || !sourceJob.job.sourceKeys.includes(progress.sourceKey)) {
+          throw new TypeError("Stored source progress does not match its consolidation job.");
+        }
+      }
+    }
+    const evidence = new Map<string, MemoryEvidence>();
+    if (usesV7Metadata) {
+      for (const row of this.#database.prepare(`SELECT ${evidenceColumns} FROM memory_evidence`).iterate()) {
+        const record = parseEvidenceRow(this.#decodeRow(row));
+        if (evidence.has(record.evidenceId)) throw new TypeError("Stored memory evidence ID is duplicated.");
+        evidence.set(record.evidenceId, record);
       }
     }
     for (const row of this.#database.prepare(
-      `SELECT ${originColumns} FROM memory_origins`,
+      `SELECT ${usesV7Metadata ? originColumns : originColumnsV6} FROM memory_origins`,
     ).iterate()) {
-      const origin = parseMemoryOriginRow(this.#decodeRow(row));
-      const sourceJob = jobsById.get(origin.jobId);
-      if (sourceJob === undefined || sourceJob.status !== "complete") {
-        throw new TypeError("Stored memory origin does not match a completed consolidation job.");
+      if (usesV7Metadata) {
+        const origin = parseMemoryOriginRow(this.#decodeRow(row));
+        if (!evidence.has(origin.evidenceId)) throw new TypeError("Stored memory origin references missing evidence.");
+      } else {
+        const origin = parseMemoryOriginRowV6(this.#decodeRow(row));
+        const sourceJob = jobsById.get(origin.jobId);
+        if (sourceJob === undefined || sourceJob.status !== "complete") {
+          throw new TypeError("Stored memory origin does not match a completed consolidation job.");
+        }
       }
     }
     for (const row of this.#database.prepare(
@@ -2871,7 +3434,8 @@ export class SQLiteMemoryStore {
           }
         }
         for (const raw of this.#database.prepare(
-          "SELECT id, trigger_id AS triggerId, job_id AS jobId " +
+          `SELECT ${textColumn("id")}, ${textColumn("trigger_id", "triggerId")}, ` +
+          `${textColumn("job_id", "jobId")} ` +
           "FROM distill_trigger_jobs ORDER BY rowid",
         ).iterate()) {
           const link = fields(this.#decodeRow(raw), ["id", "triggerId", "jobId"]);

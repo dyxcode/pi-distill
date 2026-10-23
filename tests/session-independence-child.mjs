@@ -3,6 +3,7 @@ import { existsSync } from 'node:fs';
 import { mkdir } from 'node:fs/promises';
 import { join, sep } from 'node:path';
 import { stripVTControlCharacters } from 'node:util';
+import { DatabaseSync } from 'node:sqlite';
 
 const [root, agentDir, sessionDir, cwd, extensionPath] = process.argv.slice(2);
 assert.ok(root && agentDir && sessionDir && cwd && extensionPath);
@@ -205,6 +206,23 @@ try {
   const cleanupDeadline = Date.now() + 5_000;
   while (existsSync(originalSessionFile) && Date.now() < cleanupDeadline) await new Promise(resolve => setTimeout(resolve, 20));
   assert.equal(existsSync(originalSessionFile), false, "extension cleanup must remove the processed inactive source: " + JSON.stringify(readState()));
+
+  const collectionDeadline = Date.now() + 5_000;
+  let sourceJobs;
+  do {
+    const raw = new DatabaseSync(databasePath);
+    try {
+      sourceJobs = raw.prepare("SELECT count(*) AS count FROM consolidation_jobs WHERE json_extract(job_json, '$.sessionFile') = ?").get(originalSessionFile).count;
+    } finally { raw.close(); }
+    if (sourceJobs === 0) break;
+    await new Promise(resolve => setTimeout(resolve, 20));
+  } while (Date.now() < collectionDeadline);
+  assert.equal(sourceJobs, 0, 'automatic maintenance must reclaim completed source jobs before fresh recall');
+  const afterCollection = new SQLiteMemoryStore(databasePath);
+  try {
+    assert.deepEqual(afterCollection.get(memoryId), originalState.memory);
+    assert.equal(afterCollection.memoryOrigin(memoryId).sessionId, originalSessionId);
+  } finally { afterCollection.close(); }
 
   setScript();
   const freshSessionId = runtime.session.sessionManager.getSessionId();

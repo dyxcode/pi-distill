@@ -54,6 +54,12 @@ test('v5 migration preserves pending work and memories while rebuilding source d
  const {DatabaseSync}=await import('node:sqlite');
  a.close();b.close();
  const raw=new DatabaseSync(path);raw.exec(`
+  PRAGMA foreign_keys = OFF;
+  DROP INDEX IF EXISTS memory_origins_evidence; DROP INDEX IF EXISTS session_deletions_generation;
+  DROP TABLE memory_origins; CREATE TABLE memory_origins (memory_id TEXT PRIMARY KEY NOT NULL, job_id TEXT NOT NULL, revision INTEGER NOT NULL) STRICT;
+  DROP TABLE consolidation_progress; CREATE TABLE consolidation_progress (source_key TEXT PRIMARY KEY NOT NULL, job_id TEXT NOT NULL, processed_at INTEGER NOT NULL) STRICT;
+  DROP TABLE session_deletions; CREATE TABLE session_deletions (session_file TEXT PRIMARY KEY NOT NULL, session_id TEXT NOT NULL, intent_id TEXT NOT NULL, file_version TEXT NOT NULL, state TEXT NOT NULL CHECK (state IN ('deleting', 'complete'))) STRICT;
+  DROP TABLE memory_evidence; DROP TABLE metadata_gc_state;
   DROP INDEX clean_source; DROP INDEX jobs_source_status; DROP INDEX observations_source;
   DROP INDEX triggers_source_status; DROP INDEX trigger_links_job; DROP INDEX usages_source;
   DROP INDEX managed_sources_header; DROP INDEX managed_sources_page; DROP INDEX managed_sources_parent;
@@ -68,5 +74,44 @@ test('v5 migration preserves pending work and memories while rebuilding source d
   assert.equal(upgraded.sources.get(task.sessionFile,task.sessionId).headerState,'unknown');
   assert.deepEqual(upgraded.listKnownSessionFiles(),[task.sessionFile]);
   const access=upgraded.acquireSourceAccess();assert.ok(access);upgraded.releaseSourceAccess(access);
+ } finally {upgraded.close();}
+});
+
+test('v6 migration binds a completed deletion receipt to its existing source generation',async t=>{
+ const {a,b,task,path}=await fixture(t);
+ const expectedGeneration=a.sources.get(task.sessionFile,task.sessionId).generation;
+ const owner='legacy-delete-owner';
+ const access=a.acquireSourceAccess();assert.ok(access);
+ assert.equal(a.claimCleanTask(task.id,owner,Date.now(),60_000),true);
+ assert.equal(a.prepareDeletion(task.id,owner,access,a.retentionVersion(),'1:2:3:4:5'),true);
+ assert.equal(a.finishDeletion(task.id,owner,access,a.retentionVersion(),()=>true),true);
+ a.releaseSourceAccess(access);a.close();b.close();
+
+ const {DatabaseSync}=await import('node:sqlite');
+ const raw=new DatabaseSync(path);raw.exec('PRAGMA foreign_keys = OFF');
+ assert.equal(raw.prepare('SELECT COUNT(*) AS count FROM memory_origins').get().count,0);
+ assert.equal(raw.prepare('SELECT COUNT(*) AS count FROM consolidation_progress').get().count,0);
+ const receipts=raw.prepare('SELECT session_file,session_id,intent_id,file_version,state FROM session_deletions').all();
+ raw.exec(`
+  DROP INDEX IF EXISTS memory_origins_evidence; DROP INDEX IF EXISTS session_deletions_generation;
+  DROP TABLE memory_origins; CREATE TABLE memory_origins (memory_id TEXT PRIMARY KEY NOT NULL, job_id TEXT NOT NULL, revision INTEGER NOT NULL) STRICT;
+  DROP TABLE consolidation_progress; CREATE TABLE consolidation_progress (source_key TEXT PRIMARY KEY NOT NULL, job_id TEXT NOT NULL, processed_at INTEGER NOT NULL) STRICT;
+  DROP TABLE session_deletions; CREATE TABLE session_deletions (session_file TEXT PRIMARY KEY NOT NULL, session_id TEXT NOT NULL, intent_id TEXT NOT NULL, file_version TEXT NOT NULL, state TEXT NOT NULL CHECK (state IN ('deleting', 'complete'))) STRICT;
+  DROP TABLE memory_evidence; DROP TABLE metadata_gc_state;
+  PRAGMA user_version = 6;
+ `);
+ const insert=raw.prepare('INSERT INTO session_deletions VALUES (?, ?, ?, ?, ?)');
+ for(const receipt of receipts) insert.run(receipt.session_file,receipt.session_id,receipt.intent_id,receipt.file_version,receipt.state);
+ raw.close();
+
+ const upgraded=new SQLiteMemoryStore(path);
+ try {
+  const receipt=upgraded.getDeletion(task.sessionFile);
+  assert.equal(receipt.state,'complete');
+  assert.equal(receipt.sessionId,task.sessionId);
+  assert.equal(receipt.sourceGeneration,expectedGeneration,
+    'the migration resolves the existing generation before any metadata can be reclaimed');
+  assert.equal(upgraded.sources.get(task.sessionFile,task.sessionId).generation,expectedGeneration);
+  assert.equal(upgraded.sources.get(task.sessionFile,task.sessionId).deleted,true);
  } finally {upgraded.close();}
 });

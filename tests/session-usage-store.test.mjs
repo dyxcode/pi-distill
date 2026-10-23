@@ -359,7 +359,10 @@ test("schema v2 migration preserves memories, jobs, progress, origins and observ
   store.close();
 
   const downgrade = database(f.path);
-  restoreV2Schema(downgrade);
+  restoreV2Schema(downgrade, {
+    origins: [{ memoryId: generated.id, jobId: complete.id, revision: 1 }],
+    progress: complete.sourceKeys.map(sourceKey => ({ sourceKey, jobId: complete.id, processedAt: 100 })),
+  });
   downgrade.close();
 
   const upgraded = f.open();
@@ -373,6 +376,8 @@ test("schema v2 migration preserves memories, jobs, progress, origins and observ
     revision: 1,
     updatedAt: generated.createdAt,
   });
+  assert.deepEqual(upgraded.memoryOrigin(generated.id)?.sourceKeys, complete.sourceKeys,
+    "legacy job-backed origins migrate to independent durable evidence");
   assert.deepEqual(upgraded.listConsolidationJobs(), [pending]);
   assert.deepEqual(upgraded.processedSources(complete.sourceKeys), complete.sourceKeys);
   assert.deepEqual(upgraded.observedSessions(), [observation]);
@@ -384,7 +389,7 @@ test("schema v2 migration preserves memories, jobs, progress, origins and observ
 
   const verify = database(f.path);
   try {
-    assert.equal(verify.prepare("PRAGMA user_version").get()["user_version"], 6);
+    assert.equal(verify.prepare("PRAGMA user_version").get()["user_version"], 7);
     assert.deepEqual(verify.prepare("SELECT name FROM sqlite_schema WHERE name = 'session_usages'").all()
       .map(row => row["name"]), ["session_usages"]);
   } finally {
@@ -449,8 +454,32 @@ test("v2 migration rejects an unexpected schema object without changing existing
 });
 
 // Reconstruct the historical fixture rather than relabeling current schema as v2.
-function restoreV2Schema(db) {
-  dropV6Objects(db);
+function restoreV2Schema(db, legacy = {}) {
+  db.exec("PRAGMA foreign_keys = OFF");
+  dropV7Objects(db);
+  db.exec(`
+    DROP TABLE memory_origins;
+    CREATE TABLE memory_origins (
+      memory_id TEXT PRIMARY KEY NOT NULL,
+      job_id TEXT NOT NULL,
+      revision INTEGER NOT NULL
+    ) STRICT;
+    DROP TABLE consolidation_progress;
+    CREATE TABLE consolidation_progress (
+      source_key TEXT PRIMARY KEY NOT NULL,
+      job_id TEXT NOT NULL,
+      processed_at INTEGER NOT NULL
+    ) STRICT;
+    DROP TABLE memory_evidence;
+  `);
+  const insertOrigin = db.prepare("INSERT INTO memory_origins VALUES (?, ?, ?)");
+  for (const origin of legacy.origins ?? []) {
+    insertOrigin.run(origin.memoryId, origin.jobId, origin.revision);
+  }
+  const insertProgress = db.prepare("INSERT INTO consolidation_progress VALUES (?, ?, ?)");
+  for (const progress of legacy.progress ?? []) {
+    insertProgress.run(progress.sourceKey, progress.jobId, progress.processedAt);
+  }
   db.exec(`
     DROP TABLE source_access;
     DROP TABLE session_deletions;
@@ -467,8 +496,11 @@ function restoreV2Schema(db) {
   `);
 }
 
-function dropV6Objects(db) {
+function dropV7Objects(db) {
   db.exec(`
+    DROP INDEX IF EXISTS memory_origins_evidence;
+    DROP INDEX IF EXISTS session_deletions_generation;
+    DROP TABLE IF EXISTS metadata_gc_state;
     DROP INDEX IF EXISTS clean_source;
     DROP INDEX IF EXISTS jobs_source_status;
     DROP INDEX IF EXISTS observations_source;

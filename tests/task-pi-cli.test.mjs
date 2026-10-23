@@ -188,6 +188,19 @@ test('Pi CLI Ctrl+D queues the source without a shutdown model call, then a fres
     try { await readFile(queued[0].sessionFile); } catch (error) { if (error.code !== "ENOENT") throw error; removed = true; }
     if (!removed) await pause(25);
   }
-  assert.equal(removed, true, "the fresh CLI must clean the fully processed source after its owner exited");
+  let cleanupState;
+  if (!removed) {
+    const diagnostics = new SQLiteMemoryStore(memoryPath);
+    try {
+      cleanupState = {
+        tasks: diagnostics.listCleanTasks({ limit: 100 }),
+        sources: diagnostics.sources.listPage({ limit: 100 }),
+        topologyComplete: diagnostics.sources.isTopologyComplete(),
+        progress: diagnostics.readConsolidationStatus([], [queued[0].sessionFile]),
+        receipt: diagnostics.getDeletion(queued[0].sessionFile),
+      };
+    } finally { diagnostics.close(); }
+  }
+  assert.equal(removed, true, "the fresh CLI must clean the fully processed source after its owner exited: " + JSON.stringify(cleanupState));
   await quitWithCtrlD(second);
 });

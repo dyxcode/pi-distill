@@ -73,28 +73,34 @@ export class CleanupCoordinator {
     const store = this.#store ??= this.#options.openStore();
     store.backfillSources(128);
 
-    // Header discovery must use the same inter-process source reservation as a
-    // retention assessment. A failed read leaves the registry unknown and blocks
-    // deletion until a later bounded page can establish its parent edge.
-    const headerAccess = store.acquireSourceAccess();
-    if (!headerAccess) return;
-    try { this.#discoverHeaders(store); }
-    finally { store.releaseSourceAccess(headerAccess); }
+    try {
+      // Header discovery must use the same inter-process source reservation as a
+      // retention assessment. A failed read leaves the registry unknown and blocks
+      // deletion until a later bounded page can establish its parent edge.
+      const headerAccess = store.acquireSourceAccess();
+      if (!headerAccess) return;
+      try { this.#discoverHeaders(store); }
+      finally { store.releaseSourceAccess(headerAccess); }
 
-    const legacyCursor = store.sources.readCursor("legacy");
-    const reconciled = store.reconcileLegacyCleanTasks(32, legacyCursor ?? undefined);
-    store.sources.writeCursor("legacy", reconciled.nextCursor ?? null);
+      const legacyCursor = store.sources.readCursor("legacy");
+      const reconciled = store.reconcileLegacyCleanTasks(32, legacyCursor ?? undefined);
+      store.sources.writeCursor("legacy", reconciled.nextCursor ?? null);
 
-    const cursor = store.sources.readCursor("clean");
-    const page = store.listCleanTasks({ limit: cleanPageSize,
-      ...(cursor === null ? {} : { cursor }),
-      ...(force ? {} : { now: Date.now() }),
-    });
-    for (const task of page.items) {
-      if (this.#closed) return;
-      await this.#processTask(store, task, force);
+      const cursor = store.sources.readCursor("clean");
+      const page = store.listCleanTasks({ limit: cleanPageSize,
+        ...(cursor === null ? {} : { cursor }),
+        ...(force ? {} : { now: Date.now() }),
+      });
+      for (const task of page.items) {
+        if (this.#closed) return;
+        await this.#processTask(store, task, force);
+      }
+      if (!this.#closed) store.sources.writeCursor("clean", page.nextCursor ?? null);
+    } finally {
+      // Reclamation is independent of clean-task availability and header reads.
+      // The store rechecks source references inside each bounded transaction.
+      if (!this.#closed) store.collectMetadata(128);
     }
-    if (!this.#closed) store.sources.writeCursor("clean", page.nextCursor ?? null);
   }
 
   #discoverHeaders(store: SQLiteMemoryStore): void {

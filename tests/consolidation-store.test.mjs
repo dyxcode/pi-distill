@@ -484,7 +484,170 @@ test("a failed SQLite COMMIT rolls back memory writes, progress, and job complet
   }
 });
 
-test("schema v0 and v1 migrations preserve memory fields and create the v6 metadata registry", async (t) => {
+test("v6 migration preserves a current origin and deletion receipt for an already cleaned source", async (t) => {
+  const f = await fixture(t);
+  const store = f.open();
+  const source = job("deleted-origin-source", {
+    sessionId: "deleted-origin-session",
+    sessionFile: join(f.root, "deleted-origin-session.jsonl"),
+    cwd: f.root,
+    sourceKeys: ["deleted-origin:entry-1", "deleted-origin:entry-2"],
+    lineageSessionIds: ["root-session", "deleted-origin-session"],
+    sourceTime: "2026-10-22T07:30:00.000Z",
+    branchAnchor: "b".repeat(64),
+  });
+  const created = memory("origin-survives-v6-migration");
+  store.enqueueConsolidation(source);
+  assert.equal(store.claimConsolidation(source.id, "origin-worker", 100, 100), true);
+  assert.equal(store.commitConsolidation(commit(source.id, "origin-worker", { creates: [created] })), true);
+
+  const expectedMemory = { ...created, revision: 1, updatedAt: created.createdAt };
+  const expectedOrigin = {
+    sessionId: source.sessionId,
+    sourceKeys: source.sourceKeys,
+    lineageSessionIds: source.lineageSessionIds,
+    sourceTime: source.sourceTime,
+    branchAnchor: source.branchAnchor,
+  };
+  assert.deepEqual(store.get(created.id), expectedMemory);
+  assert.deepEqual(store.memoryOrigin(created.id), expectedOrigin);
+  const expectedGeneration = store.sources.get(source.sessionFile, source.sessionId)?.generation;
+  assert.ok(expectedGeneration);
+
+  const clean = store.listCleanTasks({ limit: 128 }).items.find(item => item.sessionFile === source.sessionFile);
+  assert.ok(clean);
+  const owner = "origin-source-cleaner";
+  const deletionStartedAt = Date.now();
+  assert.equal(store.claimCleanTask(clean.id, owner, deletionStartedAt, 60_000), true);
+  const access = store.acquireSourceAccess();
+  assert.ok(access);
+  try {
+    assert.equal(store.prepareDeletion(clean.id, owner, access, store.retentionVersion(), "1:2:3:4:5"), true);
+    assert.equal(store.finishDeletion(clean.id, owner, access, store.retentionVersion(), () => true), true);
+  } finally {
+    store.releaseSourceAccess(access);
+  }
+  const expectedReceipt = store.getDeletion(source.sessionFile);
+  assert.ok(expectedReceipt);
+  assert.equal(expectedReceipt.state, "complete");
+  assert.equal(expectedReceipt.sourceGeneration, expectedGeneration);
+  store.close();
+
+  // Rebuild the actual v6 relation and receipt tables. The v6 database has no
+  // evidence table or GC cursor, and its origin/progress rows point to jobs.
+  let expectedProgress;
+  const legacy = database(f.path);
+  try {
+    legacy.exec("PRAGMA foreign_keys = OFF");
+    const origins = legacy.prepare(
+      "SELECT memory_id, evidence_id, revision FROM memory_origins ORDER BY rowid",
+    ).all();
+    const progress = legacy.prepare(
+      "SELECT source_key, processed_at FROM consolidation_progress ORDER BY source_key",
+    ).all();
+    const receipts = legacy.prepare(
+      "SELECT session_file, session_id, intent_id, file_version, state FROM session_deletions ORDER BY rowid",
+    ).all();
+    assert.deepEqual(origins.map(row => ({ ...row })), [
+      { memory_id: created.id, evidence_id: source.id, revision: 1 },
+    ]);
+    assert.deepEqual(progress.map(row => row.source_key), source.sourceKeys);
+    expectedProgress = progress.map(row => ({ source_key: row.source_key, processed_at: row.processed_at }));
+    assert.deepEqual(receipts.map(row => row.session_file), [source.sessionFile]);
+    assert.equal(legacy.prepare("SELECT status FROM consolidation_jobs WHERE id = ?").get(source.id).status, "complete");
+    legacy.exec(`
+      DROP INDEX IF EXISTS memory_origins_evidence;
+      DROP INDEX IF EXISTS session_deletions_generation;
+      DROP TABLE memory_origins;
+      CREATE TABLE memory_origins (
+        memory_id TEXT PRIMARY KEY NOT NULL,
+        job_id TEXT NOT NULL,
+        revision INTEGER NOT NULL
+      ) STRICT;
+      DROP TABLE consolidation_progress;
+      CREATE TABLE consolidation_progress (
+        source_key TEXT PRIMARY KEY NOT NULL,
+        job_id TEXT NOT NULL,
+        processed_at INTEGER NOT NULL
+      ) STRICT;
+      DROP TABLE session_deletions;
+      CREATE TABLE session_deletions (
+        session_file TEXT PRIMARY KEY NOT NULL,
+        session_id TEXT NOT NULL,
+        intent_id TEXT NOT NULL,
+        file_version TEXT NOT NULL,
+        state TEXT NOT NULL CHECK (state IN ('deleting', 'complete'))
+      ) STRICT;
+      DROP TABLE memory_evidence;
+      DROP TABLE metadata_gc_state;
+    `);
+    const insertOrigin = legacy.prepare("INSERT INTO memory_origins VALUES (?, ?, ?)");
+    for (const origin of origins) insertOrigin.run(origin.memory_id, origin.evidence_id, origin.revision);
+    const insertProgress = legacy.prepare("INSERT INTO consolidation_progress VALUES (?, ?, ?)");
+    for (const row of progress) insertProgress.run(row.source_key, source.id, row.processed_at);
+    const insertReceipt = legacy.prepare("INSERT INTO session_deletions VALUES (?, ?, ?, ?, ?)");
+    for (const row of receipts) {
+      insertReceipt.run(row.session_file, row.session_id, row.intent_id, row.file_version, row.state);
+    }
+    legacy.exec("PRAGMA user_version = 6");
+  } finally {
+    legacy.close();
+  }
+
+  const upgraded = f.open();
+  assert.deepEqual(upgraded.get(created.id), expectedMemory);
+  assert.deepEqual(upgraded.memoryOrigin(created.id), expectedOrigin);
+  assert.equal(upgraded.getDeletion(source.sessionFile)?.state, "complete");
+  assert.equal(upgraded.getDeletion(source.sessionFile)?.sourceGeneration, expectedGeneration);
+  assert.equal(upgraded.sources.get(source.sessionFile, source.sessionId)?.generation, expectedGeneration);
+  assert.equal(upgraded.sources.get(source.sessionFile, source.sessionId)?.deleted, true);
+  assert.equal(upgraded.listConsolidationJobs().length, 0);
+
+  const migrated = database(f.path);
+  try {
+    assert.equal(migrated.prepare("PRAGMA user_version").get().user_version, 7);
+    assert.deepEqual(migrated.prepare(
+      "SELECT memory_id, evidence_id, revision FROM memory_origins",
+    ).all().map(row => ({ ...row })), [
+      { memory_id: created.id, evidence_id: source.id, revision: 1 },
+    ]);
+    const evidence = migrated.prepare(
+      "SELECT evidence_id, session_id, session_file, source_generation, cwd, leaf_id, source_keys, " +
+      "lineage_session_ids, source_time, branch_anchor FROM memory_evidence WHERE evidence_id = ?",
+    ).get(source.id);
+    assert.deepEqual({ ...evidence }, {
+      evidence_id: source.id,
+      session_id: source.sessionId,
+      session_file: source.sessionFile,
+      source_generation: expectedGeneration,
+      cwd: source.cwd,
+      leaf_id: source.leafId,
+      source_keys: JSON.stringify(source.sourceKeys),
+      lineage_session_ids: JSON.stringify(source.lineageSessionIds),
+      source_time: source.sourceTime,
+      branch_anchor: source.branchAnchor,
+    });
+    assert.deepEqual(migrated.prepare(
+      "SELECT source_key, processed_at FROM consolidation_progress ORDER BY source_key",
+    ).all().map(row => ({ ...row })), expectedProgress);
+    assert.equal(migrated.prepare(
+      "SELECT status FROM consolidation_jobs WHERE id = ?",
+    ).get(source.id).status, "complete", "migration preserves the completed v6 work record");
+    const receipt = migrated.prepare(
+      "SELECT session_file, session_id, source_generation, state FROM session_deletions",
+    ).get();
+    assert.deepEqual({ ...receipt }, {
+      session_file: source.sessionFile,
+      session_id: source.sessionId,
+      source_generation: expectedGeneration,
+      state: "complete",
+    });
+  } finally {
+    migrated.close();
+  }
+});
+
+test("schema v0 and v1 migrations preserve memory fields and create the v7 evidence registry", async (t) => {
   for (const version of [0, 1]) {
     const f = await fixture(t);
     const records = [memory("v" + version + "-a"), memory("v" + version + "-b", {
@@ -521,7 +684,7 @@ test("schema v0 and v1 migrations preserve memory fields and create the v6 metad
     }
     const check = database(f.path);
     try {
-      assert.equal(check.prepare("PRAGMA user_version").get()["user_version"], 6);
+      assert.equal(check.prepare("PRAGMA user_version").get()["user_version"], 7);
       const names = check.prepare("SELECT name FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*' ORDER BY name")
         .all().map((row) => row["name"]);
       assert.deepEqual(names, [
@@ -541,9 +704,13 @@ test("schema v0 and v1 migrations preserve memory fields and create the v6 metad
         "managed_sources_physical",
         "managed_sources_session_id",
         "memories",
+        "memory_evidence",
         "memory_origins",
+        "memory_origins_evidence",
+        "metadata_gc_state",
         "observations_source",
         "session_deletions",
+        "session_deletions_generation",
         "session_observations",
         "session_usages",
         "source_access",
@@ -556,8 +723,37 @@ test("schema v0 and v1 migrations preserve memory fields and create the v6 metad
       ]);
       assert.deepEqual(check.prepare("PRAGMA table_info(memory_origins)").all().map((row) => row["name"]), [
         "memory_id",
-        "job_id",
+        "evidence_id",
         "revision",
+      ]);
+      assert.deepEqual(check.prepare("PRAGMA table_info(memory_evidence)").all().map((row) => row["name"]), [
+        "evidence_id",
+        "session_id",
+        "session_file",
+        "source_generation",
+        "cwd",
+        "leaf_id",
+        "source_keys",
+        "lineage_session_ids",
+        "source_time",
+        "branch_anchor",
+      ]);
+      assert.deepEqual(check.prepare("PRAGMA table_info(consolidation_progress)").all().map((row) => row["name"]), [
+        "source_key",
+        "processed_at",
+      ]);
+      assert.deepEqual(check.prepare("PRAGMA table_info(session_deletions)").all().map((row) => row["name"]), [
+        "session_file",
+        "session_id",
+        "intent_id",
+        "file_version",
+        "source_generation",
+        "state",
+      ]);
+      assert.deepEqual(check.prepare("PRAGMA table_info(metadata_gc_state)").all().map((row) => row["name"]), [
+        "singleton",
+        "phase",
+        "cursor_row",
       ]);
       const observationColumns = check.prepare("PRAGMA table_info(session_observations)").all();
       assert.deepEqual(observationColumns.map((row) => row["name"]), [
@@ -617,18 +813,23 @@ test("a version-three database with an unrecognized object is rejected and prese
 test("current memory origins reject unexpected content columns", async (t) => {
   const f = await fixture(t);
   const store = f.open();
+  const source = job("origin-content-source");
+  const created = memory("metadata-only");
+  store.enqueueConsolidation(source);
+  assert.equal(store.claimConsolidation(source.id, "origin-content-worker", 100, 100), true);
+  assert.equal(store.commitConsolidation(commit(source.id, "origin-content-worker", { creates: [created] })), true);
   store.close();
   const raw = database(f.path);
   raw.exec("ALTER TABLE memory_origins ADD COLUMN content TEXT");
-  raw.prepare("INSERT INTO memory_origins (memory_id, job_id, revision, content) VALUES (?, ?, ?, ?)")
-    .run("metadata-only", "job", 1, "must not persist content here");
+  raw.prepare("UPDATE memory_origins SET content = ? WHERE memory_id = ?")
+    .run("must not persist content here", created.id);
   raw.close();
 
   assert.throws(() => new SQLiteMemoryStore(f.path), /unsupported memory database schema/i);
   const verify = database(f.path);
   try {
     assert.equal(verify.prepare("SELECT content FROM memory_origins WHERE memory_id = ?")
-      .get("metadata-only")["content"], "must not persist content here");
+      .get(created.id)["content"], "must not persist content here");
   } finally {
     verify.close();
   }

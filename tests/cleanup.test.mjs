@@ -170,7 +170,9 @@ test('real process usage and source access survive pause, then recover after con
  child.kill('SIGSTOP');c.wake();await c.whenIdle();assert.ok(await readFile(f.file));
  const exited=once(child,'exit');child.kill('SIGKILL');await exited;
  c.wake();await c.whenIdle();await assert.rejects(readFile(f.file),{code:'ENOENT'});
- assert.equal(f.store.listSessionUsages().find(owner=>owner.ownerId==='child').state,'released');
+ assert.equal(f.store.listSessionUsages().find(owner=>owner.ownerId==='child'),undefined,
+   'confirmed release and deletion allow maintenance to reclaim the departed owner');
+ assert.equal(f.store.getDeletion(f.file).state,'complete');
 });
 
 test('actual process death after unlink recovers completion without recreating the source',async t=>{
@@ -248,6 +250,18 @@ test('a child with a valid header but damaged body still protects its parent',as
  f.store.enqueueCleanTask(f.input());const c=f.worker();c.wake();await c.whenIdle();
  assert.ok(await readFile(f.file));assert.equal(f.task().waitReason,'dependencies');
  assert.deepEqual(f.store.sources.reverseDependencies(f.file),[child]);
+});
+
+test('an unrelated oversized body does not consume the clean target source budget',async t=>{
+ const f=await fixture(t);await f.complete();await releaseFixture(f);
+ const unrelated=join(f.root,'oversized.jsonl');
+ await writeFile(unrelated,JSON.stringify({type:'session',id:'oversized',timestamp:'2026-10-23T00:00:00.000Z',cwd:f.root})+'\n'+
+   JSON.stringify({type:'message',id:'too-large',payload:'x'.repeat(17*1024*1024)})+'\n');
+ f.store.sources.register({sessionId:'oversized',sessionFile:unrelated,cwd:f.root});
+ const c=f.worker();c.wake();await c.whenIdle();
+ await assert.rejects(readFile(f.file),{code:'ENOENT'});
+ assert.ok((await readFile(unrelated)).length>16*1024*1024);
+ assert.equal(f.store.getDeletion(unrelated),undefined);
 });
 
 test('a manager-reserved missing fork still protects its registered parent',async t=>{
