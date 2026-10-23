@@ -73,7 +73,7 @@ test('v10 upgrade preserves an indexed source and pending work while adding incr
  const f=await fixture(t);const v=await f.view('left');const expected=(await v.page()).items.map(i=>i.part.key);
  f.store.save({id:'before-upgrade',content:'Retain this synthetic memory.',createdAt:at});f.store.close();
  const {SOURCE_COVERAGE_SCHEMAS}=await import('../src/source-coverage.ts');const {DatabaseSync}=await import('node:sqlite');const raw=new DatabaseSync(join(f.root,'memory.sqlite'));
- for(const schema of [...SOURCE_COVERAGE_SCHEMAS].reverse()){const type=schema.sql.split(' ')[1];raw.exec(`DROP ${type} ${schema.name}`);}raw.exec('PRAGMA user_version=10');raw.close();
+ for(const schema of [...SOURCE_COVERAGE_SCHEMAS,...(await import('../src/distill-schedule.ts')).DISTILL_SCHEDULE_SCHEMAS].reverse()){const type=schema.sql.split(' ')[1];raw.exec(`DROP ${type} ${schema.name}`);}raw.exec('PRAGMA user_version=10');raw.close();
  const upgraded=f.open();assert.equal(upgraded.get('before-upgrade').content,'Retain this synthetic memory.');
  const result=await upgraded.sourceViews.advance(f.file,'left');assert.ok(result.ready);assert.deepEqual((await result.view.page()).items.map(i=>i.part.key),expected);
  assert.ok(upgraded.listCleanTasks({limit:10}).items.length);assert.doesNotThrow(()=>upgraded.retentionVersion([f.file]));

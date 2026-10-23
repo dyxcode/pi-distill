@@ -310,7 +310,7 @@ test('dead-source recovery gets its own bounded page even behind many completed 
   after.close();
 });
 
-test('a new source range links its overlapping queued batch before it can complete', async t => {
+test('a new source range waits for its already prepared work and does not replay committed evidence', async t => {
   let started;
   const requestStarted = new Promise(resolve => { started = resolve; });
   let calls = 0;
@@ -333,8 +333,9 @@ test('a new source range links its overlapping queued batch before it can comple
     runModel: async (batch, _ctx, store) => {
       calls++;
       const close = store.listDistillTriggers({ limit: 20 }).items.find(item => item.reason === 'close');
-      assert.equal(close?.status, 'prepared');
-      assert.ok(close?.jobIds.includes(batch.id));
+      assert.equal(close?.status, 'pending');
+      assert.deepEqual(store.processedSources(batch.sourceKeys), []);
+      assert.ok(store.readConsolidationStatus([]).pendingTriggers.some(item => item.id === close.id));
       return { creates: [], updates: [], deletes: [] };
     },
     retryDelayMs: 100_000,

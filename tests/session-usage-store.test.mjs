@@ -389,7 +389,7 @@ test("schema v2 migration preserves memories, jobs, progress, origins and observ
 
   const verify = database(f.path);
   try {
-    assert.equal(verify.prepare("PRAGMA user_version").get()["user_version"], 11);
+    assert.equal(verify.prepare("PRAGMA user_version").get()["user_version"], 12);
     assert.deepEqual(verify.prepare("SELECT name FROM sqlite_schema WHERE name = 'session_usages'").all()
       .map(row => row["name"]), ["session_usages"]);
   } finally {
@@ -481,7 +481,7 @@ function restoreV2Schema(db, legacy = {}) {
     insertProgress.run(progress.sourceKey, progress.jobId, progress.processedAt);
   }
   db.exec(`
-    DROP TRIGGER source_fence_session_observations_insert; DROP TRIGGER source_fence_session_observations_update; DROP TRIGGER source_fence_session_observations_delete; DROP TRIGGER source_fence_session_usages_insert; DROP TRIGGER source_fence_session_usages_update; DROP TRIGGER source_fence_session_usages_delete; DROP TRIGGER source_fence_consolidation_jobs_insert; DROP TRIGGER source_fence_consolidation_jobs_update; DROP TRIGGER source_fence_consolidation_jobs_delete; DROP TRIGGER source_fence_distill_triggers_insert; DROP TRIGGER source_fence_distill_triggers_update; DROP TRIGGER source_fence_distill_triggers_delete; DROP TRIGGER source_fence_clean_tasks_insert; DROP TRIGGER source_fence_clean_tasks_update; DROP TRIGGER source_fence_clean_tasks_delete; DROP INDEX source_index_parents; DROP TABLE source_coverage; DROP TABLE source_fences; DROP TABLE source_derived_gc; DROP TABLE source_view_parts; DROP TABLE source_view_edits; DROP TABLE source_view_entries; DROP TABLE source_preparation; DROP TABLE source_views; DROP TABLE source_index_entries; DROP TABLE source_index_files;
+    DROP TRIGGER source_fence_session_observations_insert; DROP TRIGGER source_fence_session_observations_update; DROP TRIGGER source_fence_session_observations_delete; DROP TRIGGER source_fence_session_usages_insert; DROP TRIGGER source_fence_session_usages_update; DROP TRIGGER source_fence_session_usages_delete; DROP TRIGGER source_fence_consolidation_jobs_insert; DROP TRIGGER source_fence_consolidation_jobs_update; DROP TRIGGER source_fence_consolidation_jobs_delete; DROP TRIGGER source_fence_distill_triggers_insert; DROP TRIGGER source_fence_distill_triggers_update; DROP TRIGGER source_fence_distill_triggers_delete; DROP TRIGGER source_fence_clean_tasks_insert; DROP TRIGGER source_fence_clean_tasks_update; DROP TRIGGER source_fence_clean_tasks_delete; DROP INDEX source_index_parents; DROP INDEX distill_schedule_probe; DROP INDEX jobs_session_status; DROP INDEX triggers_session_status; DROP TABLE distill_schedule; DROP TABLE distill_schedule_state; DROP TABLE source_coverage; DROP TABLE source_fences; DROP TABLE source_derived_gc; DROP TABLE source_view_parts; DROP TABLE source_view_edits; DROP TABLE source_view_entries; DROP TABLE source_preparation; DROP TABLE source_views; DROP TABLE source_index_entries; DROP TABLE source_index_files;
     DROP TABLE source_access;
     DROP TABLE session_deletions;
     DROP TABLE session_usages;

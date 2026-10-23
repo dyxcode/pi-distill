@@ -1,3 +1,4 @@
+import { DistillSchedule, DISTILL_SCHEDULE_SCHEMAS, type ScheduledDistill } from "./distill-schedule.ts";
 import { SourceCoverage, SOURCE_COVERAGE_SCHEMAS, collectDerivedSources } from "./source-coverage.ts";
 import { SourceViews, SOURCE_VIEW_SCHEMAS } from "./source-view.ts";
 import { SourceIndex, SOURCE_INDEX_SCHEMAS } from "./source-index.ts";
@@ -230,7 +231,7 @@ const storeSchemasV7 = [...storeSchemas, ...[metadataGcSchema, ...storeIndexesV7
   return {name:match[2],sql};
 })];
 const storeSchemasV8 = [...storeSchemasV7, { name: "distill_failures", sql: distillFailuresSchema }];
-const latestSchemaVersion = 11;
+const latestSchemaVersion = 12;
 
 export interface SessionDeletion {
   readonly sessionFile: string;
@@ -1522,6 +1523,7 @@ export class SQLiteMemoryStore {
         }
         return;
       }
+      if (status === "pending") this.#schedule().enqueue(record.sessionId);
       this.#database.prepare(
         "INSERT INTO distill_triggers " +
         "(id, trigger_json, status, compaction_record_id, retry_category, retry_at) " +
@@ -1546,6 +1548,7 @@ export class SQLiteMemoryStore {
         if (current.compactionRecordId === compactionRecordId) return true;
         throw new ConsolidationConflictError(id, "has already been confirmed by a different compaction record");
       }
+      this.#schedule().enqueue(current.trigger.sessionId);
       this.#database.prepare(
         "UPDATE distill_triggers SET status = 'pending', compaction_record_id = ? " +
         "WHERE id = ? AND status = 'candidate'",
@@ -1635,54 +1638,143 @@ export class SQLiteMemoryStore {
     return task.status === "pending" && this.#distillTaskCanAttempt(taskKind, id, retryContext, now, task.retryAt);
   }
 
+  #schedule(): DistillSchedule { return new DistillSchedule(this.#database); }
+
+  /** Bounded shared session rotation; actual claim/retry state remains authoritative. */
+  listScheduledDistill(now: number, force = false, after = 0, through?: number) {
+    this.#ensureOpen();
+    return this.#transaction(() => {
+      const backfilled = this.#schedule().backfill();
+      return { ...this.#schedule().page(now, force, after, through), backfilled };
+    });
+  }
+
+  readyDistillWork(now: number): boolean {
+    this.#ensureOpen(); validateNow(now, "Scheduling time");
+    return this.#schedule().hasReady(now);
+  }
+
+  distillWakeDelay(now: number): number {
+    this.#ensureOpen(); validateNow(now, "Scheduling time");
+    return this.#schedule().delay(now);
+  }
+
+  claimScheduledDistill(candidate: ScheduledDistill, input: DistillClaimInput):
+    | { kind: "job"; claim: DistillJobClaim; position: number }
+    | { kind: "trigger"; claim: DistillTriggerClaim; position: number }
+    | { kind: "changed" | "waiting" | "ready" | "busy" } {
+    this.#ensureOpen();
+    const request = parseDistillClaimInput(input);
+    const raw = fields(candidate, ["sessionId", "position", "waiting", "kind", "id", "sessionFile"]);
+    validateText(raw.sessionId, "scheduling session"); validateNow(raw.position, "Scheduling position");
+    validateText(raw.id, "scheduling task");
+    if ((raw.kind !== "job" && raw.kind !== "trigger") || typeof raw.waiting !== "boolean") throw new TypeError("Invalid scheduling candidate.");
+    if (raw.sessionFile !== null) validateText(raw.sessionFile, "scheduling file");
+    return this.#transaction(() => {
+      const schedule = this.#schedule();
+      const front = schedule.front(candidate.sessionId);
+      if (schedule.position(candidate.sessionId) !== candidate.position || front?.kind !== candidate.kind || front.id !== candidate.id) return { kind: "changed" };
+      if (!this.canAttemptDistill(front.kind, front.id, request.retryContext, request.now)) {
+        this.#deferScheduled(candidate.sessionId, candidate.position, request.now);
+        return { kind: "waiting" };
+      }
+      const lease = this.#readDistillLease();
+      if (lease.leaseUntil !== null && lease.leaseUntil > request.now) return { kind: "busy" };
+      if (candidate.waiting) {
+        schedule.turn(candidate.sessionId);
+        return { kind: "ready" };
+      }
+      if (front.kind === "job") {
+        const claim = this.#claimConsolidationJob(front.id, request, randomUUID());
+        if (!claim) return { kind: "busy" };
+        return { kind: "job", claim, position: this.#schedulePosition(candidate.sessionId) };
+      }
+      const claim = this.#claimDistillTrigger({ ...request, id: front.id });
+      if (!claim) return { kind: "busy" };
+      return { kind: "trigger", claim, position: this.#schedulePosition(candidate.sessionId) };
+    });
+  }
+
+  #schedulePosition(sessionId: string): number {
+    const position = this.#schedule().position(sessionId);
+    if (position === undefined) throw new Error("Missing claimed scheduling position.");
+    return position;
+  }
+
+  #deferScheduled(sessionId: string, position: number, now: number): void {
+    const schedule = this.#schedule();
+    if (schedule.position(sessionId) !== position) return;
+    const front = schedule.front(sessionId);
+    if (!front) return;
+    const failure = this.#readDistillFailure(front.kind, front.id);
+    const table = front.kind === "job" ? "consolidation_jobs" : "distill_triggers";
+    const retryAt = this.#database.prepare(`SELECT retry_at FROM ${table} WHERE id=?`).get(front.id)?.["retry_at"];
+    const next = failure?.nextAttemptAt ?? retryAt;
+    const probeAt = typeof next === "number" && next > now ? Math.min(next, now + 30_000) : now + 30_000;
+    // Move examined waiters behind unexamined sessions too, so bounded probing
+    // cannot repeatedly inspect the same first page after a host wake/restart.
+    schedule.defer(sessionId, schedule.turn(sessionId), probeAt);
+  }
+
+  settleScheduledDistill(sessionId: string, position: number, context: DistillRetryContext | undefined, now: number): void {
+    this.#ensureOpen(); validateText(sessionId, "scheduling session"); validateNow(position, "Scheduling position"); validateNow(now, "Scheduling time");
+    const retryContext = context === undefined ? undefined : parseDistillRetryContext(context);
+    this.#transaction(() => {
+      const front = this.#schedule().front(sessionId);
+      if (front && !this.canAttemptDistill(front.kind, front.id, retryContext, now)) this.#deferScheduled(sessionId, position, now);
+    });
+  }
+
   claimDistillTrigger(input: DistillTriggerClaimInput): DistillTriggerClaim | undefined {
     this.#ensureOpen();
     const request = parseDistillTriggerClaimInput(input);
-    return this.#transaction(() => {
-      let rows: Record<string, unknown>[];
-      if (request.id === undefined) {
-        rows = this.#database.prepare(
-          `SELECT ${triggerColumns} FROM distill_triggers ` +
-          "WHERE status = 'pending' AND (retry_at IS NULL OR retry_at <= ?) " +
-          "AND NOT EXISTS (SELECT 1 FROM distill_failures AS f WHERE f.task_kind = 'trigger' AND f.task_id = distill_triggers.id) " +
-          "ORDER BY rowid LIMIT 32",
-        ).all(request.now);
-      } else {
-        rows = [];
-        const row = this.#database.prepare(
-          `SELECT ${triggerColumns} FROM distill_triggers WHERE id = ?`,
-        ).get(request.id);
-        if (row !== undefined) rows.push(row);
+    return this.#transaction(() => this.#claimDistillTrigger(request));
+  }
+
+  #claimDistillTrigger(request: ReturnType<typeof parseDistillTriggerClaimInput>): DistillTriggerClaim | undefined {
+    let rows: Record<string, unknown>[];
+    if (request.id === undefined) {
+      rows = this.#database.prepare(
+        `SELECT ${triggerColumns} FROM distill_triggers ` +
+        "WHERE status = 'pending' AND (retry_at IS NULL OR retry_at <= ?) " +
+        "AND NOT EXISTS (SELECT 1 FROM distill_failures AS f WHERE f.task_kind = 'trigger' AND f.task_id = distill_triggers.id) " +
+        "ORDER BY rowid LIMIT 32",
+      ).all(request.now);
+    } else {
+      rows = [];
+      const row = this.#database.prepare(
+        `SELECT ${triggerColumns} FROM distill_triggers WHERE id = ?`,
+      ).get(request.id);
+      if (row !== undefined) rows.push(row);
+    }
+    for (const row of rows) {
+      const current = this.#readDistillTrigger(this.#decodeRow(row));
+      if (current.status !== "pending" && !(request.allowCandidate && current.status === "candidate")) continue;
+      if (request.id !== undefined && !this.#distillTaskCanAttempt(
+        "trigger", request.id, request.retryContext, request.now, current.retryAt,
+      )) continue;
+      if (!this.#acquireDistillSlot({
+        claimToken: randomUUID(),
+        workerId: request.workerId,
+        taskKind: "trigger",
+        taskId: current.trigger.id,
+        now: request.now,
+        leaseMs: request.leaseMs,
+      })) return undefined;
+      const lease = this.#readDistillLease();
+      if (lease.claimToken === null || lease.leaseUntil === null) {
+        throw new Error("Distill claim was not persisted.");
       }
-      for (const row of rows) {
-        const current = this.#readDistillTrigger(this.#decodeRow(row));
-        if (current.status !== "pending" && !(request.allowCandidate && current.status === "candidate")) continue;
-        if (request.id !== undefined && !this.#distillTaskCanAttempt(
-          "trigger", request.id, request.retryContext, request.now, current.retryAt,
-        )) continue;
-        if (!this.#acquireDistillSlot({
-          claimToken: randomUUID(),
-          workerId: request.workerId,
-          taskKind: "trigger",
-          taskId: current.trigger.id,
-          now: request.now,
-          leaseMs: request.leaseMs,
-        })) return undefined;
-        const lease = this.#readDistillLease();
-        if (lease.claimToken === null || lease.leaseUntil === null) {
-          throw new Error("Distill claim was not persisted.");
-        }
-        this.#database.prepare(
-          "UPDATE distill_triggers SET retry_category = NULL, retry_at = NULL WHERE id = ? AND status = 'pending'",
-        ).run(current.trigger.id);
-        return {
-          trigger: this.#distillTriggerItem({ ...current, retryCategory: null, retryAt: null }),
-          claimToken: lease.claimToken,
-          leaseUntil: lease.leaseUntil,
-        };
-      }
-      return undefined;
-    });
+      this.#database.prepare(
+        "UPDATE distill_triggers SET retry_category = NULL, retry_at = NULL WHERE id = ? AND status = 'pending'",
+      ).run(current.trigger.id);
+      return {
+        trigger: this.#distillTriggerItem({ ...current, retryCategory: null, retryAt: null }),
+        claimToken: lease.claimToken,
+        leaseUntil: lease.leaseUntil,
+      };
+    }
+    return undefined;
   }
 
   readSourcePreparation(triggerId: string, viewId: string): number {
@@ -3218,6 +3310,13 @@ export class SQLiteMemoryStore {
       "UPDATE distill_lease SET claim_token = ?, worker_id = ?, task_kind = ?, task_id = ?, lease_until = ? " +
       "WHERE singleton = 1",
     ).run(input.claimToken, input.workerId, input.taskKind, input.taskId, input.now + input.leaseMs);
+    const table = input.taskKind === "job" ? "consolidation_jobs" : "distill_triggers";
+    const column = input.taskKind === "job" ? "job_json" : "trigger_json";
+    const row = this.#database.prepare(`SELECT json_quote(json_extract(${column}, '$.sessionId')) AS session FROM ${table} WHERE id=?`).get(input.taskId);
+    const value = row?.["session"];
+    if (typeof value !== "string") throw new TypeError("Missing scheduling session.");
+    const sessionId: unknown = JSON.parse(value); validateText(sessionId, "scheduling session");
+    this.#schedule().turn(sessionId);
     return true;
   }
 
@@ -3235,6 +3334,17 @@ export class SQLiteMemoryStore {
   }
 
   #clearDistillLease(): void {
+    const lease = this.#readDistillLease();
+    if (lease.taskKind !== null && lease.taskId !== null) {
+      const table = lease.taskKind === "job" ? "consolidation_jobs" : "distill_triggers";
+      const column = lease.taskKind === "job" ? "job_json" : "trigger_json";
+      const row = this.#database.prepare(`SELECT json_quote(json_extract(${column}, '$.sessionId')) AS session FROM ${table} WHERE id=?`).get(lease.taskId);
+      const key = row?.["session"];
+      if (typeof key === "string") {
+        const sessionId: unknown = JSON.parse(key); validateText(sessionId, "scheduling session");
+        if (!this.#schedule().front(sessionId)) this.#database.prepare("DELETE FROM distill_schedule WHERE session_key=?").run(key);
+      }
+    }
     this.#database.prepare(
       "UPDATE distill_lease SET claim_token = NULL, worker_id = NULL, task_kind = NULL, task_id = NULL, lease_until = NULL " +
       "WHERE singleton = 1",
@@ -3286,6 +3396,7 @@ export class SQLiteMemoryStore {
       }
       return;
     }
+    this.#schedule().enqueue(record.sessionId);
     this.#database.prepare(
       "INSERT INTO consolidation_jobs " +
       "(id, job_json, status, lease_owner, lease_until, retry_category, retry_at) " +
@@ -3389,7 +3500,7 @@ export class SQLiteMemoryStore {
 
   #initializeSchema(): void {
     const version = this.#database.prepare("PRAGMA user_version").get()?.["user_version"];
-    if (version !== 0 && version !== 1 && version !== 2 && version !== 3 && version !== 4 && version !== 5 && version !== 6 && version !== 7 && version !== 8 && version !== 9 && version !== 10 && version !== latestSchemaVersion) {
+    if (version !== 0 && version !== 1 && version !== 2 && version !== 3 && version !== 4 && version !== 5 && version !== 6 && version !== 7 && version !== 8 && version !== 9 && version !== 10 && version !== 11 && version !== latestSchemaVersion) {
       throw new Error("Unsupported memory database schema version: " + String(version) + ".");
     }
     if (version === latestSchemaVersion) {
@@ -3494,8 +3605,12 @@ export class SQLiteMemoryStore {
       for (const schema of SOURCE_VIEW_SCHEMAS) this.#database.exec(schema.sql);
       this.#database.exec("PRAGMA user_version = 10");
     }
-    for (const schema of SOURCE_COVERAGE_SCHEMAS) this.#database.exec(schema.sql);
-    this.#database.exec("INSERT INTO source_derived_gc VALUES (1,0,0,0); PRAGMA user_version = 11");
+    if (version < 11) {
+      for (const schema of SOURCE_COVERAGE_SCHEMAS) this.#database.exec(schema.sql);
+      this.#database.exec("INSERT INTO source_derived_gc VALUES (1,0,0,0); PRAGMA user_version = 11");
+    }
+    for (const schema of DISTILL_SCHEDULE_SCHEMAS) this.#database.exec(schema.sql);
+    this.#database.exec("INSERT INTO distill_schedule_state VALUES (1,0,0,0); PRAGMA user_version = 12");
     this.#validateLatestSchema();
     this.#validateAllRows();
     this.#sourceAccess();
@@ -3797,7 +3912,7 @@ export class SQLiteMemoryStore {
       ] });
     }
     const additional = typeof schemaVersion === "number" && schemaVersion >= 6
-      ? [...SOURCE_REGISTRY_SCHEMAS, ...(schemaVersion >= 9 ? SOURCE_INDEX_SCHEMAS : []), ...(schemaVersion >= 10 ? SOURCE_VIEW_SCHEMAS : []), ...(schemaVersion >= 11 ? SOURCE_COVERAGE_SCHEMAS : []), ...(usesV8Metadata ? storeSchemasV8 : usesV7Metadata ? storeSchemasV7 : storeSchemas)]
+      ? [...SOURCE_REGISTRY_SCHEMAS, ...(schemaVersion >= 9 ? SOURCE_INDEX_SCHEMAS : []), ...(schemaVersion >= 10 ? SOURCE_VIEW_SCHEMAS : []), ...(schemaVersion >= 11 ? SOURCE_COVERAGE_SCHEMAS : []), ...(schemaVersion >= 12 ? DISTILL_SCHEDULE_SCHEMAS : []), ...(usesV8Metadata ? storeSchemasV8 : usesV7Metadata ? storeSchemasV7 : storeSchemas)]
       : [];
     const extraSchemas = new Map(additional.map(schema => [schema.name, schema.sql]));
     if (objects.length !== schemas.size + extraSchemas.size) throw new Error("Unsupported memory database schema.");

@@ -60,7 +60,7 @@ const MAX_RECOVERY_ITEMS_PER_PASS = 4;
 const MAX_OBSERVATIONS_PER_PASS = 4;
 const MAX_PENDING_SCAN_PAGES = 4;
 const PENDING_SCAN_PAGE_SIZE = 32;
-const MAX_MODEL_BATCHES_PER_PASS = 2;
+const MAX_WORK_TURNS_PER_PASS = 2;
 const SOURCE_EVIDENCE_BYTES = 24 * 1024;
 const CONTEXT_BYTES = 8 * 1024;
 const DEFAULT_CLAIM_LEASE_MS = 60_000;
@@ -96,16 +96,14 @@ export class ConsolidationCoordinator {
   #unobservedCursor = 0;
   #unobservedSweepEnd: number | undefined;
   #pendingTriggerCursor = 0;
-  #jobCursor = 0;
-  #jobSweepEnd: number | undefined;
-  #preparationCursor = 0;
-  #preparationSweepEnd: number | undefined;
+  #probeWaiting = false;
 
   constructor(options: Options) { this.#options = options; }
 
   async start(ctx: Context): Promise<void> {
     if (this.#closed) return;
     this.#context = ctx;
+    this.#probeWaiting = true;
     try {
       if (this.#options.hasStore && !this.#options.hasStore() && !this.#store) {
         return;
@@ -443,10 +441,14 @@ export class ConsolidationCoordinator {
 
   #retry(): void {
     if (this.#closed || this.#timer || !this.#context?.model) return;
+    let delay = this.#sourceWorkPending ? 100 : 30_000;
+    if (!this.#sourceWorkPending) {
+      try { delay = this.#database().distillWakeDelay(this.#now()); } catch { /* Retry storage availability on the normal bounded poll. */ }
+    }
     this.#timer = setTimeout(() => {
       this.#timer = undefined;
       this.#kick();
-    }, this.#options.retryDelayMs ?? (this.#sourceWorkPending ? 100 : 30_000));
+    }, this.#options.retryDelayMs ?? delay);
     this.#timer.unref();
   }
 
@@ -485,35 +487,54 @@ export class ConsolidationCoordinator {
     }
     if (signal.aborted || !this.#canRun(context)) return;
 
-    // Preparation is bounded separately from the two model batches below. The
-    // global SQLite claim prevents another Pi process from preparing or distilling
-    // at the same time.
-    await this.#prepareOneTrigger(signal);
-    if (signal.aborted || !this.#canRun(context)) return;
-
     const store = this.#database();
-    const page = store.listPendingConsolidationJobs({ limit: PENDING_SCAN_PAGE_SIZE,
-      ...(this.#jobSweepEnd === undefined ? {} : { throughCursor: this.#jobSweepEnd }),
-      ...(this.#jobCursor === 0 ? {} : { cursor: this.#jobCursor }) });
-    this.#jobCursor = page.nextCursor ?? 0;
-    this.#jobSweepEnd = page.nextCursor === undefined ? undefined : page.throughCursor;
-    let batches = 0;
-    for (const job of page.items) {
-      if (signal.aborted || batches >= MAX_MODEL_BATCHES_PER_PASS || !this.#canRun(context)) break;
-      const retryContext = await this.#retryContext(job.sessionFile ?? "", context);
-      const claim = store.claimDistillJob({
-        retryContext,
-        id: job.id,
-        workerId: this.#workerId,
-        now: this.#now(),
-        leaseMs: this.#options.claimLeaseMs ?? DEFAULT_CLAIM_LEASE_MS,
-      });
-      if (!claim) continue;
-      batches++;
-      this.#startClaim(store, claim.claimToken);
-      await this.#processJob(claim.job, claim.claimToken, context, signal, store, retryContext);
-      this.#finishClaim();
+    const recoveryWorkPending = this.#sourceWorkPending;
+    const visited = new Set<string>();
+    let turns = 0, after = 0, through: number | undefined, busy = false, backfilled = false;
+    let force = this.#probeWaiting;
+    this.#probeWaiting = false;
+    // A finite sweep excludes newly rotated/appended positions. Wrap only after
+    // reaching its end; both candidate inspection and useful work are bounded.
+    for (let pages = 0; pages < MAX_PENDING_SCAN_PAGES && turns < MAX_WORK_TURNS_PER_PASS; pages++) {
+      const page = store.listScheduledDistill(this.#now(), force, after, through);
+      backfilled = page.backfilled;
+      through = page.through;
+      for (const candidate of page.items) {
+        if (signal.aborted || !this.#canRun(context)) return;
+        const key = JSON.stringify([candidate.kind, candidate.id]);
+        if (visited.has(key)) continue;
+        const retryContext = await this.#retryContext(candidate.sessionFile ?? "", context);
+        if (signal.aborted || !this.#canRun(context)) return;
+        const selected = store.claimScheduledDistill(candidate, {
+          retryContext, workerId: this.#workerId, now: this.#now(),
+          leaseMs: this.#options.claimLeaseMs ?? DEFAULT_CLAIM_LEASE_MS,
+        });
+        if (selected.kind === "busy") { busy = true; break; }
+        if (selected.kind !== "job" && selected.kind !== "trigger") continue;
+        visited.add(key);
+        turns++;
+        this.#startClaim(store, selected.claim.claimToken);
+        try {
+          if (selected.kind === "job") {
+            await this.#processJob(selected.claim.job, selected.claim.claimToken, context, signal, store, retryContext);
+          } else {
+            await this.#prepareTrigger(selected.claim.trigger, selected.claim.claimToken, retryContext, signal);
+          }
+        } finally {
+          this.#finishClaim();
+        }
+        if (signal.aborted || this.#closed) return;
+        store.settleScheduledDistill(candidate.sessionId, selected.position, retryContext, this.#now());
+        if (turns >= MAX_WORK_TURNS_PER_PASS) break;
+      }
+      if (busy) break;
+      if (page.more) after = page.cursor;
+      else { after = 0; through = undefined; force = false; }
+      if (!page.more && page.items.length === 0 && backfilled) break;
     }
+    // Failed/held work has a bounded probe deadline. Only actual ready work
+    // requests the short continuation wake, including successful partial jobs.
+    this.#sourceWorkPending = !busy && (recoveryWorkPending || !backfilled || store.readyDistillWork(this.#now()));
   }
 
   async #recover(signal: AbortSignal): Promise<void> {
@@ -627,53 +648,23 @@ export class ConsolidationCoordinator {
     this.#recoveryNeeded = unresolved || this.#triggerCursor !== 0 || this.#observationCursor !== 0;
   }
 
-  async #prepareOneTrigger(signal: AbortSignal): Promise<boolean> {
-    if (signal.aborted || !this.#canRun(this.#context)) return false;
+  async #prepareTrigger(trigger: DistillTrigger, claimToken: string, retryContext: DistillRetryContext, signal: AbortSignal): Promise<void> {
     const store = this.#database();
-    const page = store.listDistillTriggers({ limit: PENDING_SCAN_PAGE_SIZE,
-      ...(this.#preparationSweepEnd === undefined ? {} : { throughCursor: this.#preparationSweepEnd }),
-      ...(this.#preparationCursor === 0 ? {} : { cursor: this.#preparationCursor }) });
-    this.#preparationCursor = page.nextCursor ?? 0;
-    this.#preparationSweepEnd = page.nextCursor === undefined ? undefined : page.throughCursor;
-    for (const candidate of page.items) {
-      if (signal.aborted || !this.#canRun(this.#context)) return false;
-      if (candidate.status !== "pending") continue;
-      const retryContext = await this.#retryContext(candidate.sessionFile);
-      const claim = store.claimDistillTrigger({
-        id: candidate.id, retryContext,
-        workerId: this.#workerId,
-        now: this.#now(),
-        leaseMs: this.#options.claimLeaseMs ?? DEFAULT_CLAIM_LEASE_MS,
-      });
-      if (!claim) continue;
-      this.#startClaim(store, claim.claimToken);
-      try {
-        const trigger = claim.trigger;
-        const snapshot = await this.#load(trigger.sessionFile, trigger.leafId);
-        assertSnapshotMatches(snapshot, trigger);
-        if (!validSnapshot(snapshot)) throw new DistillFailure("source_invalid", "The frozen source boundary failed validation or exceeds its bounded preparation budget.");
-        if (snapshot.indexed) {
-          await this.#prepareIndexed(snapshot.indexed, trigger, claim.claimToken, store, signal);
-          return true;
-        }
-        const jobs = this.#prepareJobs(snapshot, trigger, store);
-        store.prepareDistillTrigger({
-          id: trigger.id,
-          claimToken: claim.claimToken,
-          now: this.#now(),
-          jobs,
-        });
-        if (jobs.length === 0) this.#notifyProgress();
-        return true;
-      } catch (error) {
-        this.#releaseClaim(store, claim.claimToken, error, retryContext, signal);
-        this.#recoveryNeeded = true;
-        return true;
-      } finally {
-        this.#finishClaim();
+    try {
+      const snapshot = await this.#load(trigger.sessionFile, trigger.leafId);
+      assertSnapshotMatches(snapshot, trigger);
+      if (!validSnapshot(snapshot)) throw new DistillFailure("source_invalid", "The frozen source boundary failed validation or exceeds its bounded preparation budget.");
+      if (snapshot.indexed) {
+        await this.#prepareIndexed(snapshot.indexed, trigger, claimToken, store, signal);
+        return;
       }
+      const jobs = this.#prepareJobs(snapshot, trigger, store);
+      store.prepareDistillTrigger({ id: trigger.id, claimToken, now: this.#now(), jobs });
+      if (jobs.length === 0) this.#notifyProgress();
+    } catch (error) {
+      this.#releaseClaim(store, claimToken, error, retryContext, signal);
+      this.#recoveryNeeded = true;
     }
-    return false;
   }
 
   async #prepareIndexed(view: PagedSourceView, trigger: DistillTrigger, token: string, store: SQLiteMemoryStore, signal: AbortSignal): Promise<void> {
