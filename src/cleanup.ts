@@ -2,7 +2,7 @@ import { dirname, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import { closeSync, fsyncSync, lstatSync, openSync, unlinkSync } from "node:fs";
 import type { SQLiteMemoryStore } from "./memory-store.js";
-import { assessSessionRetention, type SessionRetentionAssessment } from "./session-retention.ts";
+import { SourceWorkPending } from "./source-view.ts";
 import { readSessionHeader } from "./session-header.ts";
 import type { CleanTask, WaitReason } from "./task-types.ts";
 
@@ -23,6 +23,7 @@ export class CleanupCoordinator {
   #working: Promise<void> | undefined;
   #timer: ReturnType<typeof setTimeout> | undefined;
   #closed = false;
+  #moreSourceWork = false;
   #wakeAgain = false;
   #claim: { id: string; owner: string } | undefined;
 
@@ -62,12 +63,13 @@ export class CleanupCoordinator {
       this.#working = undefined;
       if (this.#closed) { this.#store?.close(); this.#store = undefined; return; }
       if (this.#wakeAgain) { this.#wakeAgain = false; this.#run(true); return; }
-      this.#timer = setTimeout(() => this.#run(false), this.#options.retryDelayMs ?? 30_000);
+      this.#timer = setTimeout(() => this.#run(false), this.#options.retryDelayMs ?? (this.#moreSourceWork ? 100 : 30_000));
       this.#timer.unref();
     });
   }
 
   async #pass(force: boolean): Promise<void> {
+    this.#moreSourceWork = false;
     if (this.#closed) return;
     if (!this.#store && this.#options.hasStore && !this.#options.hasStore()) return;
     const store = this.#store ??= this.#options.openStore();
@@ -178,9 +180,12 @@ export class CleanupCoordinator {
         if (!topologyComplete || store.sources.topologyVersion() !== topologyVersion) {
           reason = "dependencies";
         } else {
-          const report = await assessSessionRetention(scope.paths, store);
-          const assessment = report.sessions.find(source => source.sessionFile === task.sessionFile);
-          reason = assessmentReason(assessment, report.dependenciesComplete);
+          const report = await store.sourceCoverage.advance(task.sessionFile, scope.paths, version);
+          const current = store.sourceRetentionState(task.sessionFile, task.sessionId);
+          if (report.sessionId !== task.sessionId) reason = "unavailable";
+          else if (report.status !== "processed" || current.pending) reason = "unprocessed";
+          else reason = current.released ? "host_coordination" : "usage";
+          if (report.status === "building") this.#moreSourceWork = true;
           if (store.hasUncapturedObservation(scope.paths)) reason = "unprocessed";
           if (scope.hasDependents) reason = "dependencies";
 
@@ -204,11 +209,14 @@ export class CleanupCoordinator {
           }
         }
       }
-    } catch { reason = "unavailable"; /* Keep failed or changed evidence for a later wake. */ }
+    } catch (error) {
+      if (error instanceof SourceWorkPending) { reason = "unprocessed"; this.#moreSourceWork = true; }
+      else reason = "unavailable";
+    }
     finally { store.releaseSourceAccess(access); }
     if (this.#closed) return;
     const now = Date.now();
-    store.recordCleanAssessment(task.id, owner, now, reason, now + (this.#options.retryDelayMs ?? 30_000));
+    store.recordCleanAssessment(task.id, owner, now, reason, now + (this.#options.retryDelayMs ?? (this.#moreSourceWork ? 100 : 30_000)));
     this.#claim = undefined;
   }
 
@@ -241,15 +249,6 @@ export class CleanupCoordinator {
     }
     return { paths, hasDependents: store.sources.hasDependents(task.sessionFile) };
   }
-}
-
-function assessmentReason(source: SessionRetentionAssessment | undefined, dependenciesComplete: boolean): WaitReason {
-  if (!source || source.status === "unknown") return "unavailable";
-  if (source.status === "pending") return "unprocessed";
-  if (!dependenciesComplete) return "dependencies";
-  if (source.usage !== "released") return "usage";
-  if (source.requiredBy.length > 0) return "dependencies";
-  return "host_coordination";
 }
 
 function missing(path: string): boolean {

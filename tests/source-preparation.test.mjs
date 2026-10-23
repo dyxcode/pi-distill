@@ -30,3 +30,15 @@ test('preparation cursors are atomic and a stale worker cannot advance them',asy
  assert.equal(store.readSourcePreparation('trigger','a'.repeat(64)),128);
  assert.equal(store.readDistillTrigger('trigger').status,'pending');
 });
+
+test('paged preparation preserves embedded-NUL task identities and pending backpressure',async t=>{
+ const {store,trigger}=await fixture(t);
+ const id='trigger\0tail',jobId='job\0tail';store.enqueueDistillTrigger({...trigger,id});
+ const c=store.claimDistillTrigger({id,workerId:'worker',now:1,leaseMs:100});
+ const job={id:jobId,sessionId:trigger.sessionId,sessionFile:trigger.sessionFile,leafId:trigger.leafId,cwd:trigger.cwd,sourceKeys:['key-nul']};
+ store.prepareDistillPage({id,claimToken:c.claimToken,now:2,viewId:'b'.repeat(64),after:0,cursor:128,jobs:[job],complete:false});
+ assert.equal(store.pendingTriggerJob(id)?.id,jobId);
+ for(let i=0;i<20;i++)store.collectMetadata(8);
+ assert.equal(store.readSourcePreparation(id,'b'.repeat(64)),128);
+ assert.equal(store.pendingTriggerJob(id)?.id,jobId);
+});

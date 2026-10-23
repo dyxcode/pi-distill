@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { existsSync } from 'node:fs';
+import { existsSync, statSync } from 'node:fs';
 import { mkdtemp, mkdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -86,6 +86,15 @@ try{
   runtime=await pi.createAgentSessionRuntime(factory,{cwd,agentDir,sessionManager:manager});
   session=runtime.session;
   if(!['close-recover','crash-recover'].includes(mode))await session.prompt('For fictional Cedar, our tests live only on this computer.' + (mode==='auto' ? ' The fictional Cedar convention applies to its tests.'.repeat(40) : ''));
+  let longSource;
+  if(mode==='long'){
+    for(let i=0;i<20_010;i++)manager.appendSessionInfo('synthetic padding '+ 'x'.repeat(850));
+    await session.prompt('The fictional Cedar convention still applies.');
+    longSource=manager.getSessionFile();assert.ok(statSync(longSource).size>16*1024*1024);
+    const start=Date.now();await runtime.newSession();assert.ok(Date.now()-start<1000,'closing a long session must only capture work');
+    assert.equal(extractionCalls,0,'session close must not wait for model work');
+    session=runtime.session;
+  }
   if(mode==='crash-capture'){
     const sessionFile=session.sessionManager.getSessionFile();
     assert.ok(sessionFile);
@@ -220,7 +229,7 @@ try{
   }
   if(mode!=='reload'&&mode!=='close-capture'&&mode!=='late-reply'){
     if(mode==='roundtrip')await runtime.newSession();
-    const deadline=Date.now()+8000;
+    const deadline=Date.now()+(mode==='long'?60000:8000);
     let found;
     while(Date.now()<deadline){
       try{const db=new SQLiteMemoryStore(join(agentDir,'distill','memories.sqlite'));
@@ -246,7 +255,17 @@ try{
       assert.ok(extractionCalls>=1);
     }
     if(mode==='update'){const db=new SQLiteMemoryStore(join(agentDir,'distill','memories.sqlite'));assert.equal(db.get('keep')?.content,'Cedar uses local tests.');assert.equal(db.get('keep')?.revision,2);assert.equal(db.get('remove'),undefined);db.close();}
-    if(mode==='roundtrip'){
+    if(mode==='roundtrip'||mode==='long'){
+      if(mode==='long'){
+        const deadline=Date.now()+30000;
+        while(existsSync(longSource)&&Date.now()<deadline)await new Promise(resolve=>setTimeout(resolve,20));
+        if(existsSync(longSource)){const diagnostic=new SQLiteMemoryStore(memoryPath);console.error(JSON.stringify({clean:diagnostic.listCleanTasks({limit:10}).items,coverage:diagnostic.sourceCoverage.current(longSource),triggers:diagnostic.listDistillTriggers({limit:10}).items,usage:diagnostic.listSessionUsages()}));diagnostic.close();}
+        assert.equal(existsSync(longSource),false,'complete long source should be cleaned independently of model work');
+        const db=new SQLiteMemoryStore(memoryPath);
+        const origin=db.memoryOrigin(found.id);assert.ok(origin?.sourceKeys.length);
+        for(let pass=0;pass<5000;pass++){const collected=db.collectMetadata(128);assert.ok(collected.removed<=128);if(!collected.hasMore)break;}
+        assert.deepEqual(db.memoryOrigin(found.id),origin,'memory provenance must survive source/index reclamation');db.close();
+      }
       const events=[];runtime.session.subscribe(e=>{if(e.type==='tool_execution_end')events.push(e);});
       faux.setResponses([ai.fauxAssistantMessage(ai.fauxToolCall('memory_search',{terms:['Cedar']}),{stopReason:'toolUse'}),ai.fauxAssistantMessage(ai.fauxToolCall('memory_read',{id:found.id,expectedRevision:found.revision}),{stopReason:'toolUse'}),ai.fauxAssistantMessage('Cedar uses local tests.')]);
       await runtime.session.prompt('What testing convention applies to Cedar?');

@@ -199,6 +199,8 @@ test('Pi CLI Ctrl+D queues the source without a shutdown model call, then a fres
         progress: diagnostics.readConsolidationStatus([], [queued[0].sessionFile]),
         receipt: diagnostics.getDeletion(queued[0].sessionFile),
       };
+      try { cleanupState.coverage = await diagnostics.sourceCoverage.advance(queued[0].sessionFile,[queued[0].sessionFile],diagnostics.retentionVersion([queued[0].sessionFile])); }
+      catch(error) { cleanupState.coverageError = String(error.stack); }
     } finally { diagnostics.close(); }
   }
   assert.equal(removed, true, "the fresh CLI must clean the fully processed source after its owner exited: " + JSON.stringify(cleanupState));

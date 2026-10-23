@@ -84,3 +84,20 @@ test('paged projection matches original semantics for repeated edits and compact
  const parentView=await view(f,store,'end');const last=(await parts(parentView)).at(-1);
  assert.equal(v.isSibling({sessionId:'view',sourceKeys:[last.key],...parentView.boundary([last])}),false);
 });
+
+test('an ancestry path without copied branch evidence does not create shared conversational lineage',async t=>{
+ const f=await fixture(t,[message('base',null,'Parent fact.')]),store=f.open();
+ const path=join(f.root,'independent.jsonl');await writeFile(path,[{type:'session',id:'independent',cwd:f.root,timestamp:at,version:3,parentSession:f.path},message('new',null,'Independent fact.')].map(JSON.stringify).join('\n')+'\n');
+ const v=await view({...f,path},store,'new');
+ assert.deepEqual(v.lineageSessionIds,['independent']);
+ assert.equal(v.isSibling({sessionId:'view',sourceKeys:['unrelated']}),false);
+});
+
+test('combined fork ancestry can exceed the former aggregate byte limit while preserving shared evidence',async t=>{
+ const entries=[message('base',null,'Shared synthetic ancestry fact.')];
+ for(let i=0;i<10000;i++)entries.push({type:'session_info',id:`meta${i}`,parentId:i?`meta${i-1}`:'base',timestamp:at,name:'x'.repeat(850)});
+ const f=await fixture(t,entries),store=f.open();const parent=await view(f,store,'meta9999');
+ const child=join(f.root,'large-child.jsonl');await writeFile(child,[{type:'session',id:'child',cwd:f.root,timestamp:at,version:3,parentSession:f.path},...entries,message('child-tail','meta9999','Child-specific fact.')].map(JSON.stringify).join('\n')+'\n');
+ const childView=await view({...f,path:child},store,'child-tail');const result=await parts(childView);
+ assert.deepEqual(result.slice(0,1),await parts(parent));assert.equal(result.at(-1).text,'Child-specific fact.');
+});

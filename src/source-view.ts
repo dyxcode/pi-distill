@@ -212,7 +212,13 @@ export class PagedSourceView {
   constructor(owner: SourceViews, id: string) { this.owner = owner; this.id = id; }
   get state(): ViewState { const state = this.owner.state(this.id); if (state.phase !== "ready") return fail("Source view is not ready."); return state; }
   get source(): SourceIndexState { const source = this.state.sources[0]; if (!source) return fail("Missing source."); return source; }
-  get lineageSessionIds(): string[] { return this.state.sources.flatMap(source => source.header ? [source.header.id] : []); }
+  get lineageSessionIds(): string[] {
+    const root = this.source.header;
+    if (!root) return fail("Missing lineage source identity.");
+    const origins = this.state.sources.flatMap(source => source.header ? [source.header.id] : []).filter(id =>
+      this.owner.database.prepare("SELECT 1 FROM source_view_entries WHERE view_id=? AND origin_key=? LIMIT 1").get(this.id, JSON.stringify(id)) !== undefined);
+    return [...new Set([root.id, ...origins])];
+  }
   async unchanged(): Promise<void> { await this.owner.unchanged(this.state); }
   position(key: string): number | undefined {
     const row = this.owner.database.prepare("SELECT seq FROM source_view_parts WHERE view_id=? AND source_key=?").get(this.id, key);

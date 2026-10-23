@@ -1,3 +1,4 @@
+import { SourceCoverage, SOURCE_COVERAGE_SCHEMAS, collectDerivedSources } from "./source-coverage.ts";
 import { SourceViews, SOURCE_VIEW_SCHEMAS } from "./source-view.ts";
 import { SourceIndex, SOURCE_INDEX_SCHEMAS } from "./source-index.ts";
 import { dirname, isAbsolute } from "node:path";
@@ -229,7 +230,7 @@ const storeSchemasV7 = [...storeSchemas, ...[metadataGcSchema, ...storeIndexesV7
   return {name:match[2],sql};
 })];
 const storeSchemasV8 = [...storeSchemasV7, { name: "distill_failures", sql: distillFailuresSchema }];
-const latestSchemaVersion = 10;
+const latestSchemaVersion = 11;
 
 export interface SessionDeletion {
   readonly sessionFile: string;
@@ -1240,6 +1241,7 @@ export class SQLiteMemoryStore {
   #sources: SourceRegistry | undefined;
   #sourceIndex: SourceIndex | undefined;
   #sourceViews: SourceViews | undefined;
+  get sourceCoverage(): SourceCoverage { this.#ensureOpen(); return new SourceCoverage(this.#database, this); }
   get sourceViews(): SourceViews { return this.#sourceViews ??= new SourceViews(this.#database, this.sourceIndex); }
   get sourceIndex(): SourceIndex { return this.#sourceIndex ??= new SourceIndex(this.#database); }
   get sources(): SourceRegistry { return this.#sources ??= new SourceRegistry(this.#database); }
@@ -1694,9 +1696,9 @@ export class SQLiteMemoryStore {
 
   pendingTriggerJob(triggerId: string): ConsolidationJob | undefined {
     validateText(triggerId, "trigger ID");
-    const row = this.#database.prepare("SELECT jobs.id FROM consolidation_jobs jobs JOIN distill_trigger_jobs links ON links.job_id=jobs.id WHERE links.trigger_id=? AND jobs.status='pending' LIMIT 1").get(triggerId);
+    const row = this.#database.prepare(`SELECT ${textColumn("jobs.id", "id")} FROM consolidation_jobs jobs JOIN distill_trigger_jobs links ON links.job_id=jobs.id WHERE links.trigger_id=? AND jobs.status='pending' LIMIT 1`).get(triggerId);
     if (!row) return undefined;
-    const id = row["id"]; validateText(id, "pending job ID");
+    const id = this.#decodeRow(row)["id"]; validateText(id, "pending job ID");
     const job = this.#database.prepare(`SELECT ${jobColumns} FROM consolidation_jobs WHERE id=?`).get(id);
     return job ? parsePersistedJobRow(this.#decodeRow(job)).job : undefined;
   }
@@ -2591,6 +2593,19 @@ export class SQLiteMemoryStore {
 
   /** Reclaim terminal metadata in a restartable sweep; receipts, origins, and progress survive. */
   collectMetadata(limit = maxMetadataGcPageSize): { readonly removed: number; readonly hasMore: boolean } {
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > maxMetadataGcPageSize) throw new TypeError("Invalid metadata collection page size.");
+    const coreBudget = Math.max(1, Math.floor(limit / 2));
+    const core = this.#collectOperationalMetadata(coreBudget);
+    if (limit === 1 && (core.hasMore || core.removed > 0)) return core;
+    const access = this.acquireSourceAccess();
+    if (!access) return core;
+    try {
+      const derived = collectDerivedSources(this.#database, this, Math.max(1, limit - coreBudget));
+      return { removed: core.removed + derived.removed, hasMore: core.hasMore || derived.hasMore };
+    } finally { this.releaseSourceAccess(access); }
+  }
+
+  #collectOperationalMetadata(limit: number): { readonly removed: number; readonly hasMore: boolean } {
     this.#ensureOpen();
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > maxMetadataGcPageSize) {
       throw new TypeError("Metadata collection limit must be an integer from 1 through 128.");
@@ -2881,24 +2896,25 @@ export class SQLiteMemoryStore {
   }
 
   /** Compare on this connection only; includes other connections and local mutations. */
+  sourceRetentionState(path: string, sessionId: string): { pending: boolean; released: boolean } {
+    validateAbsolutePath(path, "source path"); validateText(sessionId, "session ID");
+    const pending = this.#database.prepare("SELECT 1 FROM consolidation_jobs WHERE status='pending' AND (json_extract(job_json,'$.sessionFile')=? OR json_extract(job_json,'$.sessionId')=?) LIMIT 1").get(path, sessionId) !== undefined ||
+      this.#database.prepare("SELECT 1 FROM distill_triggers WHERE status<>'complete' AND (json_extract(trigger_json,'$.sessionFile')=? OR json_extract(trigger_json,'$.sessionId')=?) LIMIT 1").get(path, sessionId) !== undefined;
+    const known = this.#database.prepare("SELECT 1 FROM session_usages WHERE session_file=? OR session_id=? LIMIT 1").get(path, sessionId) !== undefined;
+    const outstanding = this.#database.prepare("SELECT 1 FROM session_usages WHERE (session_file=? OR session_id=?) AND state<>'released' LIMIT 1").get(path, sessionId) !== undefined;
+    return { pending, released: known && !outstanding };
+  }
+
   retentionVersion(scope?: readonly string[]): string {
     this.#ensureOpen();
     if (scope !== undefined) {
       const filter = this.#scopeFilter(scope);
       const digest = createHash("sha256").update(String(this.sources.topologyVersion()));
-      for (const [table, columns, path, condition] of [
-        ["session_observations", observationColumns, "session_file", "1"],
-        ["session_usages", sessionUsageColumns, "session_file", "1"],
-        ["consolidation_jobs", "job_json, status", "json_extract(job_json, '$.sessionFile')", "status = 'pending'"],
-        ["distill_triggers", "trigger_json, status, compaction_record_id", "json_extract(trigger_json, '$.sessionFile')", "status <> 'complete'"],
-        ["clean_tasks", "task_json", "json_extract(task_json, '$.sessionFile')", "1"],
-      ]) {
-        let count = 0;
-        for (const raw of this.#database.prepare(`SELECT ${columns} FROM ${table} WHERE ${condition} AND ${filter.sql(path!)} ORDER BY rowid LIMIT ?`)
-          .iterate(...filter.values, maxSessionMetadataRows + 1)) {
-          if (++count > maxSessionMetadataRows) throw new RangeError("Source metadata exceeds its fence budget.");
-          digest.update(JSON.stringify(this.#decodeRow(raw)));
-        }
+      for (const path of filter.values) {
+        const row = this.#database.prepare("SELECT revision FROM source_fences WHERE path=?").get(path);
+        const revision = row?.["revision"] ?? 0;
+        if (typeof revision !== "number" || !Number.isSafeInteger(revision) || revision < 0) throw new TypeError("Invalid source fence.");
+        digest.update(JSON.stringify([path, revision]));
       }
       return digest.digest("hex");
     }
@@ -3373,7 +3389,7 @@ export class SQLiteMemoryStore {
 
   #initializeSchema(): void {
     const version = this.#database.prepare("PRAGMA user_version").get()?.["user_version"];
-    if (version !== 0 && version !== 1 && version !== 2 && version !== 3 && version !== 4 && version !== 5 && version !== 6 && version !== 7 && version !== 8 && version !== 9 && version !== latestSchemaVersion) {
+    if (version !== 0 && version !== 1 && version !== 2 && version !== 3 && version !== 4 && version !== 5 && version !== 6 && version !== 7 && version !== 8 && version !== 9 && version !== 10 && version !== latestSchemaVersion) {
       throw new Error("Unsupported memory database schema version: " + String(version) + ".");
     }
     if (version === latestSchemaVersion) {
@@ -3474,8 +3490,12 @@ export class SQLiteMemoryStore {
       for (const schema of SOURCE_INDEX_SCHEMAS) this.#database.exec(schema.sql);
       this.#database.exec("PRAGMA user_version = 9");
     }
-    for (const schema of SOURCE_VIEW_SCHEMAS) this.#database.exec(schema.sql);
-    this.#database.exec("PRAGMA user_version = 10");
+    if (version < 10) {
+      for (const schema of SOURCE_VIEW_SCHEMAS) this.#database.exec(schema.sql);
+      this.#database.exec("PRAGMA user_version = 10");
+    }
+    for (const schema of SOURCE_COVERAGE_SCHEMAS) this.#database.exec(schema.sql);
+    this.#database.exec("INSERT INTO source_derived_gc VALUES (1,0,0,0); PRAGMA user_version = 11");
     this.#validateLatestSchema();
     this.#validateAllRows();
     this.#sourceAccess();
@@ -3777,7 +3797,7 @@ export class SQLiteMemoryStore {
       ] });
     }
     const additional = typeof schemaVersion === "number" && schemaVersion >= 6
-      ? [...SOURCE_REGISTRY_SCHEMAS, ...(schemaVersion >= 9 ? SOURCE_INDEX_SCHEMAS : []), ...(schemaVersion >= 10 ? SOURCE_VIEW_SCHEMAS : []), ...(usesV8Metadata ? storeSchemasV8 : usesV7Metadata ? storeSchemasV7 : storeSchemas)]
+      ? [...SOURCE_REGISTRY_SCHEMAS, ...(schemaVersion >= 9 ? SOURCE_INDEX_SCHEMAS : []), ...(schemaVersion >= 10 ? SOURCE_VIEW_SCHEMAS : []), ...(schemaVersion >= 11 ? SOURCE_COVERAGE_SCHEMAS : []), ...(usesV8Metadata ? storeSchemasV8 : usesV7Metadata ? storeSchemasV7 : storeSchemas)]
       : [];
     const extraSchemas = new Map(additional.map(schema => [schema.name, schema.sql]));
     if (objects.length !== schemas.size + extraSchemas.size) throw new Error("Unsupported memory database schema.");

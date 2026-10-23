@@ -140,7 +140,7 @@ function oldV6Schema(path) {
       ) STRICT;
       DROP TABLE memory_evidence;
       DROP TABLE metadata_gc_state;
-      DROP TABLE source_view_parts; DROP TABLE source_view_edits; DROP TABLE source_view_entries; DROP TABLE source_preparation; DROP TABLE source_views; DROP TABLE source_index_entries; DROP TABLE source_index_files; DROP TABLE distill_failures;
+      DROP TRIGGER source_fence_session_observations_insert; DROP TRIGGER source_fence_session_observations_update; DROP TRIGGER source_fence_session_observations_delete; DROP TRIGGER source_fence_session_usages_insert; DROP TRIGGER source_fence_session_usages_update; DROP TRIGGER source_fence_session_usages_delete; DROP TRIGGER source_fence_consolidation_jobs_insert; DROP TRIGGER source_fence_consolidation_jobs_update; DROP TRIGGER source_fence_consolidation_jobs_delete; DROP TRIGGER source_fence_distill_triggers_insert; DROP TRIGGER source_fence_distill_triggers_update; DROP TRIGGER source_fence_distill_triggers_delete; DROP TRIGGER source_fence_clean_tasks_insert; DROP TRIGGER source_fence_clean_tasks_update; DROP TRIGGER source_fence_clean_tasks_delete; DROP INDEX source_index_parents; DROP TABLE source_coverage; DROP TABLE source_fences; DROP TABLE source_derived_gc; DROP TABLE source_view_parts; DROP TABLE source_view_edits; DROP TABLE source_view_entries; DROP TABLE source_preparation; DROP TABLE source_views; DROP TABLE source_index_entries; DROP TABLE source_index_files; DROP TABLE distill_failures;
       DELETE FROM managed_sources WHERE row_id > 128;
       UPDATE source_registry_state SET backfill_complete = 0 WHERE singleton = 1;
       UPDATE source_registry_cursors SET cursor_row = NULL;
@@ -197,7 +197,7 @@ test(`v${legacyVersion} legacy source backfill resumes in bounded passes across 
   store = f.open();
   const version = new DatabaseSync(f.path);
   try {
-    assert.equal(version.prepare("PRAGMA user_version").get().user_version, 10);
+    assert.equal(version.prepare("PRAGMA user_version").get().user_version, 11);
   } finally {
     version.close();
   }

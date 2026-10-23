@@ -46,3 +46,9 @@ test('a clean quit leaves only a durable source trigger for the next process to 
  const second=JSON.parse(reopened.stdout.trim().split('\n').at(-1));
  assert.equal(second.passed,true);assert.ok(second.extractionCalls>=1);
 });
+
+test('real Pi SDK distills and cleans a long closed session, then recalls its memory from a fresh session',()=>{
+ const result=spawnSync(process.execPath,['tests/consolidation-pi-child.mjs','long'],{encoding:'utf8',timeout:90000});
+ assert.ifError(result.error);assert.equal(result.status,0,result.stderr||result.stdout);
+ const report=JSON.parse(result.stdout.trim().split('\n').at(-1));assert.equal(report.passed,true);assert.ok(report.extractionCalls>0);
+});

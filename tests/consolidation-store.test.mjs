@@ -587,7 +587,7 @@ test("v6 migration preserves shared current origins and the deletion receipt for
       ) STRICT;
       DROP TABLE memory_evidence;
       DROP TABLE metadata_gc_state;
-      DROP TABLE source_view_parts; DROP TABLE source_view_edits; DROP TABLE source_view_entries; DROP TABLE source_preparation; DROP TABLE source_views; DROP TABLE source_index_entries; DROP TABLE source_index_files; DROP TABLE distill_failures;
+      DROP TRIGGER source_fence_session_observations_insert; DROP TRIGGER source_fence_session_observations_update; DROP TRIGGER source_fence_session_observations_delete; DROP TRIGGER source_fence_session_usages_insert; DROP TRIGGER source_fence_session_usages_update; DROP TRIGGER source_fence_session_usages_delete; DROP TRIGGER source_fence_consolidation_jobs_insert; DROP TRIGGER source_fence_consolidation_jobs_update; DROP TRIGGER source_fence_consolidation_jobs_delete; DROP TRIGGER source_fence_distill_triggers_insert; DROP TRIGGER source_fence_distill_triggers_update; DROP TRIGGER source_fence_distill_triggers_delete; DROP TRIGGER source_fence_clean_tasks_insert; DROP TRIGGER source_fence_clean_tasks_update; DROP TRIGGER source_fence_clean_tasks_delete; DROP INDEX source_index_parents; DROP TABLE source_coverage; DROP TABLE source_fences; DROP TABLE source_derived_gc; DROP TABLE source_view_parts; DROP TABLE source_view_edits; DROP TABLE source_view_entries; DROP TABLE source_preparation; DROP TABLE source_views; DROP TABLE source_index_entries; DROP TABLE source_index_files; DROP TABLE distill_failures;
     `);
     const insertOrigin = legacy.prepare("INSERT INTO memory_origins VALUES (?, ?, ?)");
     for (const origin of origins) insertOrigin.run(origin.memory_id, source.id, origin.revision);
@@ -615,7 +615,7 @@ test("v6 migration preserves shared current origins and the deletion receipt for
 
   const migrated = database(f.path);
   try {
-    assert.equal(migrated.prepare("PRAGMA user_version").get().user_version, 10);
+    assert.equal(migrated.prepare("PRAGMA user_version").get().user_version, 11);
     assert.deepEqual(migrated.prepare(
       "SELECT o.memory_id AS memory_id, e.session_id AS session_id, e.source_keys AS source_keys " +
       "FROM memory_origins AS o JOIN memory_evidence AS e ON e.evidence_id = o.evidence_id ORDER BY o.rowid",
@@ -695,7 +695,7 @@ test("schema v0 and v1 migrations preserve memory fields and create the current 
     }
     const check = database(f.path);
     try {
-      assert.equal(check.prepare("PRAGMA user_version").get()["user_version"], 10);
+      assert.equal(check.prepare("PRAGMA user_version").get()["user_version"], 11);
       const names = check.prepare("SELECT name FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*' ORDER BY name")
         .all().map((row) => row["name"]);
       assert.deepEqual(names, [
@@ -727,15 +727,35 @@ test("schema v0 and v1 migrations preserve memory fields and create the current 
         "session_usages",
         "source_access",
         "source_backfill",
+        "source_coverage",
+        "source_derived_gc",
+        "source_fence_clean_tasks_delete",
+        "source_fence_clean_tasks_insert",
+        "source_fence_clean_tasks_update",
+        "source_fence_consolidation_jobs_delete",
+        "source_fence_consolidation_jobs_insert",
+        "source_fence_consolidation_jobs_update",
+        "source_fence_distill_triggers_delete",
+        "source_fence_distill_triggers_insert",
+        "source_fence_distill_triggers_update",
+        "source_fence_session_observations_delete",
+        "source_fence_session_observations_insert",
+        "source_fence_session_observations_update",
+        "source_fence_session_usages_delete",
+        "source_fence_session_usages_insert",
+        "source_fence_session_usages_update",
+        "source_fences",
         "source_index_compactions",
         "source_index_entries",
         "source_index_files",
+        "source_index_parents",
         "source_preparation",
         "source_registry_cursors",
         "source_registry_state",
         "source_view_anchors",
         "source_view_edits",
         "source_view_entries",
+        "source_view_origins",
         "source_view_parts",
         "source_views",
         "trigger_links_job",
