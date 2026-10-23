@@ -97,6 +97,7 @@ export default function piDistill(pi: ExtensionAPI): void {
     consolidation.start(ctx);
     cleanup.wake();
   });
+  pi.on("model_select", (_event, ctx) => consolidation.start(ctx));
   pi.on("message_end", (_event, ctx) => { usage.observe(ctx); consolidation.observe(ctx); });
   pi.on("agent_end", (_event, ctx) => { usage.observe(ctx); consolidation.observe(ctx); });
   pi.on("session_tree", (_event, ctx) => { usage.observe(ctx); consolidation.observe(ctx); cleanup.wake(); });

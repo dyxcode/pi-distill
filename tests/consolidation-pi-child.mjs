@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { existsSync } from 'node:fs';
 import { mkdtemp, mkdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -30,18 +31,23 @@ const assertQueuedClose=(sessionId,sessionFile,leafId,{pending=false}={})=>{
   if(pending){assert.equal(trigger.status,'pending');assert.deepEqual(trigger.jobIds,[]);}
   return trigger;
 };
-const faux=ai.fauxProvider({tokensPerSecond:100000,models:[{id:'synthetic',contextWindow:32768,maxTokens:8192}]});
+const faux=ai.fauxProvider({tokensPerSecond:100000,models:[
+  {id:'synthetic',contextWindow:32768,maxTokens:8192},
+  ...(mode==='modeltwo'?[{id:'modeltwo',contextWindow:32768,maxTokens:8192}]:[]),
+]});
 let extractionCalls=0;
+const extractionModels=[];
 let extractionSignal;
 let resolveExtractionStarted;
 const extractionStarted=new Promise(resolve=>{resolveExtractionStarted=resolve;});
 let resolveLateReply;
 const lateReply=new Promise(resolve=>{resolveLateReply=resolve;});
 const slowModes=new Set(['quit','new','resume','fork']);
-const response=(context,streamOptions)=>{
+const response=(context,streamOptions,_state,model)=>{
   const text=context.messages.flatMap(message=>typeof message.content==='string'?[message.content]:message.content?.filter(block=>block.type==='text').map(block=>block.text)??[]).join('\n');
   const key=text.match(/"key"\s*:\s*"([^"\n]+)"/u)?.[1];
-  if(key){extractionCalls++;extractionSignal=streamOptions?.signal;resolveExtractionStarted();
+  if(key){extractionCalls++;extractionModels.push(model.id);extractionSignal=streamOptions?.signal;resolveExtractionStarted();
+    if(mode==='modeltwo'&&model.id==='synthetic')return ai.fauxAssistantMessage('This is not valid structured output.');
     if(mode==='late-reply')return lateReply.then(()=>ai.fauxAssistantMessage(JSON.stringify({operations:[{action:'create',content:'For fictional Cedar, keep tests local.',sourceKeys:[key]}]})));
     if(mode==='foreground'&&extractionCalls===1)return lateReply.then(()=>ai.fauxAssistantMessage(JSON.stringify({operations:[{action:'create',content:'For fictional Cedar, keep tests local.',sourceKeys:[key]}]})));
     if(mode==='update'){
@@ -113,6 +119,50 @@ try{
     assert.notEqual(trigger.status,'candidate','a saved compaction record should confirm the durable source trigger');
     assert.doesNotMatch(JSON.stringify(trigger),/transcript|newEvidence|message content/iu);
     assert.ok(trigger.compactionRecordId,'a compact trigger is ready only with its saved compaction record');
+  }else if(mode==='modeltwo'){
+    const source={sessionId:session.sessionManager.getSessionId(),sessionFile:session.sessionManager.getSessionFile(),leafId:session.sessionManager.getLeafId()};
+    await session.compact();
+    const readFailedJob=()=>{
+      const db=new SQLiteMemoryStore(memoryPath);
+      try{
+        const job=db.listConsolidationJobs().find(item=>item.sessionId===source.sessionId);
+        if(!job)return undefined;
+        const failure=db.readDistillFailure('job',job.id);
+        return failure?{
+          job,
+          failure,
+          processed:db.processedSources(job.sourceKeys),
+          trigger:db.listDistillTriggers({limit:100}).items.find(item=>item.sessionId===source.sessionId&&item.reason==='compact'),
+        }:undefined;
+      }finally{db.close();}
+    };
+    const failedDeadline=Date.now()+8000;
+    let failed;
+    while(Date.now()<failedDeadline){failed=readFailedJob();if(failed)break;await new Promise(resolve=>setTimeout(resolve,20));}
+    assert.ok(failed,'the selected first model should leave durable retry state after its malformed result');
+    assert.equal(failed.failure.reason,'model_invalid');
+    assert.deepEqual(extractionModels,['synthetic'],'the first background request should use the selected model');
+    assert.deepEqual(failed.processed,[],'failed model output must not mark source evidence processed');
+    assert.notEqual(failed.trigger?.status,'complete','the source trigger must remain incomplete while model work has failed');
+    assert.ok(existsSync(source.sessionFile),'cleanup must retain the source session while its failed distillation is pending');
+    const retained=new SQLiteMemoryStore(memoryPath);
+    try{assert.equal(retained.searchBatch({terms:['Cedar'],match:'any'}).length,0,'malformed output must not create a memory');}
+    finally{retained.close();}
+
+    const replacement=faux.getModel('modeltwo');
+    assert.ok(replacement,'the faux provider should expose the second model through Pi runtime');
+    await session.setModel(replacement,{persist:false});
+    const successDeadline=Date.now()+8000;
+    let found;
+    while(Date.now()<successDeadline){
+      const db=new SQLiteMemoryStore(memoryPath);
+      try{found=db.searchBatch({terms:['Cedar'],match:'any'}).map(row=>row.memory).find(memory=>memory.content==='For fictional Cedar, keep tests local.');}
+      finally{db.close();}
+      if(found)break;
+      await new Promise(resolve=>setTimeout(resolve,20));
+    }
+    assert.ok(found,'changing models in the live Pi session should wake and complete failed distillation without a restart');
+    assert.ok(extractionModels.includes('modeltwo'),'the retry must use the newly selected model');
   }else if(mode==='reload'){
     await session.reload();
     assert.equal(extractionCalls,0,'reload must not create a consolidation trigger');
@@ -206,5 +256,5 @@ try{
     assertQueuedClose(session.sessionManager.getSessionId(),session.sessionManager.getSessionFile(),session.sessionManager.getLeafId());
     assert.ok(extractionCalls>=1,'a new Pi runtime should process the source recovered from the crashed owner');
   }
-  console.log(JSON.stringify({mode,extractionCalls,calls:faux.state.callCount,passed:true}));
+  console.log(JSON.stringify({mode,extractionCalls,extractionModels,calls:faux.state.callCount,passed:true}));
 }finally{if(runtime)await runtime.dispose();if(!externalRoot)await rm(root,{recursive:true,force:true});}

@@ -6,6 +6,7 @@ import type {
   JsonObject,
   JsonValue,
   Message,
+  ProviderResponse,
   StopReason,
   Tool,
   ToolCall,
@@ -19,6 +20,8 @@ import type {
 } from "./consolidation-types.js";
 import type { MemoryForget, MemoryInput, MemoryOrigin, MemoryUpdate, SQLiteMemoryStore } from "./memory-store.js";
 import { MemoryTools, memorySearchDescription, memorySearchGuidance, memorySearchTermsDescription, type MemoryToolResult } from "./memory-tools.ts";
+import { DistillFailure, type DistillFailureOptions } from "./distill-failure.ts";
+import type { DistillFailureReason } from "./distill-retry.ts";
 
 const MAX_INPUT_BYTES = 64 * 1024;
 const MAX_CUMULATIVE_INPUT_BYTES = 256 * 1024;
@@ -77,10 +80,13 @@ type ProposedOperation =
   | { action: "update"; id: string; expectedRevision: number; content: string; sourceKeys: string[] }
   | { action: "delete"; id: string; expectedRevision: number; sourceKeys: string[] };
 
-class ConsolidationError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "ConsolidationError";
+class ConsolidationError extends DistillFailure {
+  constructor(
+    message: string,
+    reason: DistillFailureReason = "model_invalid",
+    options: DistillFailureOptions = {},
+  ) {
+    super(reason, message, options);
   }
 }
 
@@ -93,15 +99,20 @@ function isRecord(value: unknown): value is RecordValue {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function exactRecord(value: unknown, allowedFields: readonly string[], requiredFields = allowedFields): RecordValue {
-  if (!isRecord(value)) throw new ConsolidationError("Expected a JSON object.");
+function exactRecord(
+  value: unknown,
+  allowedFields: readonly string[],
+  requiredFields = allowedFields,
+  reason: DistillFailureReason = "model_invalid",
+): RecordValue {
+  if (!isRecord(value)) throw new ConsolidationError("Expected a JSON object.", reason);
   for (const key of Reflect.ownKeys(value)) {
     if (typeof key !== "string" || !allowedFields.includes(key)) {
-      throw new ConsolidationError("The model returned an unsupported field.");
+      throw new ConsolidationError("The model returned an unsupported field.", reason);
     }
   }
   for (const field of requiredFields) {
-    if (!Object.hasOwn(value, field)) throw new ConsolidationError(`The model omitted ${field}.`);
+    if (!Object.hasOwn(value, field)) throw new ConsolidationError(`The model omitted ${field}.`, reason);
   }
   return value;
 }
@@ -110,12 +121,18 @@ function validUnicode(value: string): boolean {
   return !/[\uD800-\uDFFF]/u.test(value);
 }
 
-function text(value: unknown, field: string, maxBytes = Number.MAX_SAFE_INTEGER): string {
-  if (
-    typeof value !== "string" || value.trim().length === 0 || !validUnicode(value) ||
-    Buffer.byteLength(value, "utf8") > maxBytes
-  ) {
-    throw new ConsolidationError(`${field} must be nonempty, well-formed Unicode within its byte limit.`);
+function text(
+  value: unknown,
+  field: string,
+  maxBytes = Number.MAX_SAFE_INTEGER,
+  reason: DistillFailureReason = "model_invalid",
+  oversizedReason: DistillFailureReason = reason,
+): string {
+  if (typeof value !== "string" || value.trim().length === 0 || !validUnicode(value)) {
+    throw new ConsolidationError(`${field} must be nonempty, well-formed Unicode within its byte limit.`, reason);
+  }
+  if (Buffer.byteLength(value, "utf8") > maxBytes) {
+    throw new ConsolidationError(`${field} must be nonempty, well-formed Unicode within its byte limit.`, oversizedReason);
   }
   return value;
 }
@@ -166,47 +183,47 @@ interface ValidatedBatch {
 }
 
 function validateBatch(batch: SourceBatch): ValidatedBatch {
-  text(batch.cwd, "Project context", MAX_INPUT_BYTES);
+  text(batch.cwd, "Project context", MAX_INPUT_BYTES, "source_invalid");
   if (!Array.isArray(batch.evidence) || !Array.isArray(batch.context)) {
-    throw new ConsolidationError("Source batch evidence and context must be arrays.");
+    throw new ConsolidationError("Source batch evidence and context must be arrays.", "source_invalid");
   }
   const evidenceKeys = new Set<string>();
   const validatePart = (part: SourcePart, evidence: boolean): void => {
-    exactRecord(part, ["key", "entryId", "role", "text"]);
-    const key = text(part.key, "Source key", MAX_INPUT_BYTES);
-    text(part.entryId, "Source entry ID", MAX_INPUT_BYTES);
-    text(part.role, "Source role", MAX_INPUT_BYTES);
+    exactRecord(part, ["key", "entryId", "role", "text"], undefined, "source_invalid");
+    const key = text(part.key, "Source key", MAX_INPUT_BYTES, "source_invalid");
+    text(part.entryId, "Source entry ID", MAX_INPUT_BYTES, "source_invalid");
+    text(part.role, "Source role", MAX_INPUT_BYTES, "source_invalid");
     if (typeof part.text !== "string" || !part.text.length || !validUnicode(part.text) ||
       Buffer.byteLength(part.text, "utf8") > MAX_INPUT_BYTES) {
-      throw new ConsolidationError("Source text must contain well-formed Unicode within its byte limit.");
+      throw new ConsolidationError("Source text must contain well-formed Unicode within its byte limit.", "source_invalid");
     }
-    if (evidence && evidenceKeys.has(key)) throw new ConsolidationError("Evidence source keys must be unique.");
+    if (evidence && evidenceKeys.has(key)) throw new ConsolidationError("Evidence source keys must be unique.", "source_invalid");
     if (evidence) evidenceKeys.add(key);
   };
   for (const part of batch.evidence) validatePart(part, true);
   for (const part of batch.context) validatePart(part, false);
   const timing: { sourceTime?: string } = {};
   if (batch.sourceTime !== undefined) {
-    const timestamp = text(batch.sourceTime, "Source timestamp");
+    const timestamp = text(batch.sourceTime, "Source timestamp", Number.MAX_SAFE_INTEGER, "source_invalid");
     const parsed = new Date(timestamp);
     if (Number.isNaN(parsed.getTime()) || parsed.toISOString() !== timestamp) {
-      throw new ConsolidationError("Source timestamp must use canonical UTC.");
+      throw new ConsolidationError("Source timestamp must use canonical UTC.", "source_invalid");
     }
     timing.sourceTime = timestamp;
   }
   const hasLineageKeys = Object.hasOwn(batch, "lineageKeys");
   const hasLineageSessions = Object.hasOwn(batch, "lineageSessionIds");
   if (hasLineageKeys !== hasLineageSessions) {
-    throw new ConsolidationError("Source lineage keys and session IDs must be supplied together.");
+    throw new ConsolidationError("Source lineage keys and session IDs must be supplied together.", "source_invalid");
   }
   if (!hasLineageKeys) return { evidenceKeys, ...timing };
 
   const parseUniqueTextList = (value: unknown, field: string): Set<string> => {
-    if (!Array.isArray(value)) throw new ConsolidationError(`${field} must be an array.`);
+    if (!Array.isArray(value)) throw new ConsolidationError(`${field} must be an array.`, "source_invalid");
     const values = new Set<string>();
     for (const rawValue of value) {
-      const item = text(rawValue, field, MAX_INPUT_BYTES);
-      if (values.has(item)) throw new ConsolidationError(`${field} must not contain duplicates.`);
+      const item = text(rawValue, field, MAX_INPUT_BYTES, "source_invalid");
+      if (values.has(item)) throw new ConsolidationError(`${field} must not contain duplicates.`, "source_invalid");
       values.add(item);
     }
     return values;
@@ -304,8 +321,20 @@ function addToolResult(messages: Message[], call: ToolCall, result: MemoryToolRe
 }
 
 function resultBody(result: MemoryToolResult): RecordValue {
-  if (!isRecord(result.details)) throw new ConsolidationError("Memory retrieval returned malformed data.");
+  if (!isRecord(result.details)) {
+    throw new ConsolidationError("Memory retrieval returned malformed data.", "transient");
+  }
   return result.details;
+}
+
+function retrievalFailureReason(body: RecordValue, isError: boolean): DistillFailureReason | undefined {
+  const status = body["status"];
+  if (status === "ok" && !isError) return undefined;
+  if (status === "cancelled") return undefined;
+  if (status === "stale" || status === "not_found") return "conflict";
+  if (status === "budget_exhausted" || status === "result_too_large") return "model_budget";
+  if (status === "invalid_input") return "model_invalid";
+  return "transient";
 }
 
 function resultWithDetails(result: MemoryToolResult, details: RecordValue, isError = result.isError === true): MemoryToolResult {
@@ -353,7 +382,7 @@ function parseOperations(
   fullyRead: ReadonlyMap<string, number>,
 ): ProposedOperation[] {
   if (Buffer.byteLength(json, "utf8") > MAX_OUTPUT_BYTES) {
-    throw new ConsolidationError("The model output exceeded the response size limit.");
+    throw new ConsolidationError("The model output exceeded the response size limit.", "model_budget");
   }
   let parsed: unknown;
   try {
@@ -362,8 +391,11 @@ function parseOperations(
     throw new ConsolidationError("The model did not return valid JSON.");
   }
   const root = exactRecord(parsed, ["operations"]);
-  if (!Array.isArray(root.operations) || root.operations.length > MAX_OPERATIONS) {
+  if (!Array.isArray(root.operations)) {
     throw new ConsolidationError("The model returned too many or malformed operations.");
+  }
+  if (root.operations.length > MAX_OPERATIONS) {
+    throw new ConsolidationError("The model returned too many operations.", "model_budget");
   }
   const operations: ProposedOperation[] = [];
   const targets = new Set<string>();
@@ -375,7 +407,7 @@ function parseOperations(
       const operation = exactRecord(rawOperation, ["action", "content", "sourceKeys"]);
       operations.push({
         action: "create",
-        content: text(operation.content, "Memory content", MAX_CONTENT_BYTES),
+        content: text(operation.content, "Memory content", MAX_CONTENT_BYTES, "model_invalid", "model_budget"),
         sourceKeys: parseSourceKeys(operation.sourceKeys, evidenceKeys),
       });
       continue;
@@ -393,7 +425,7 @@ function parseOperations(
         action: "update",
         id,
         expectedRevision,
-        content: text(operation.content, "Memory content", MAX_CONTENT_BYTES),
+        content: text(operation.content, "Memory content", MAX_CONTENT_BYTES, "model_invalid", "model_budget"),
         sourceKeys: parseSourceKeys(operation.sourceKeys, evidenceKeys),
       });
       continue;
@@ -433,15 +465,74 @@ function toChanges(operations: readonly ProposedOperation[]): ConsolidationChang
 }
 
 function raceAbort<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
-  if (signal.aborted) return Promise.reject(signal.reason ?? new ConsolidationError("Consolidation was cancelled."));
+  if (signal.aborted) return Promise.reject(signal.reason ?? new DOMException("Consolidation was cancelled.", "AbortError"));
   return new Promise<T>((resolve, reject) => {
-    const onAbort = (): void => reject(signal.reason ?? new ConsolidationError("Consolidation was cancelled."));
+    const onAbort = (): void => reject(signal.reason ?? new DOMException("Consolidation was cancelled.", "AbortError"));
     signal.addEventListener("abort", onAbort, { once: true });
     promise.then(
       (value) => { signal.removeEventListener("abort", onAbort); resolve(value); },
       (error: unknown) => { signal.removeEventListener("abort", onAbort); reject(error); },
     );
   });
+}
+
+function boundedDelayMs(value: number): number | undefined {
+  if (!Number.isFinite(value) || value < 0 || value > Number.MAX_SAFE_INTEGER) return undefined;
+  const rounded = Math.ceil(value);
+  return Number.isSafeInteger(rounded) ? rounded : undefined;
+}
+
+function delayFromHeader(value: string | null, multiplier: number): number | undefined {
+  if (value === null) return undefined;
+  const trimmed = value.trim();
+  if (/^\d+$/u.test(trimmed)) return boundedDelayMs(Number(trimmed) * multiplier);
+  if (multiplier !== 1_000 ||
+    !/^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun), \d{2} (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) \d{4} \d{2}:\d{2}:\d{2} GMT$/u.test(trimmed)) {
+    return undefined;
+  }
+  const retryAt = Date.parse(trimmed);
+  if (!Number.isFinite(retryAt) || new Date(retryAt).toUTCString() !== trimmed) return undefined;
+  return boundedDelayMs(Math.max(0, retryAt - Date.now()));
+}
+
+function providerHeader(value: unknown, name: string): string | null {
+  if (value instanceof Headers) return value.get(name);
+  if (!isRecord(value)) return null;
+  for (const key of Object.keys(value)) {
+    if (key.toLowerCase() !== name) continue;
+    const field = value[key];
+    return typeof field === "string" ? field : null;
+  }
+  return null;
+}
+
+function retryAfterFromHeaders(value: unknown): number | undefined {
+  return delayFromHeader(providerHeader(value, "retry-after-ms"), 1) ??
+    delayFromHeader(providerHeader(value, "retry-after"), 1_000);
+}
+
+/** Read only structured retry fields; provider message text is deliberately ignored. */
+function structuredRetryAfterMs(error: unknown): number | undefined {
+  let current: unknown = error;
+  const seen = new Set<object>();
+  for (let depth = 0; depth < 8 && isRecord(current); depth += 1) {
+    if (seen.has(current)) return undefined;
+    seen.add(current);
+    try {
+      const explicit = current["retryAfterMs"];
+      if (typeof explicit === "number" && Number.isSafeInteger(explicit) && explicit >= 0) return explicit;
+      const headerDelay = retryAfterFromHeaders(current["headers"]);
+      if (headerDelay !== undefined) return headerDelay;
+      current = current["cause"];
+    } catch {
+      return undefined;
+    }
+  }
+  return undefined;
+}
+
+function callerAbortReason(signal: AbortSignal): unknown {
+  return signal.reason ?? new DOMException("Consolidation was cancelled.", "AbortError");
 }
 
 /**
@@ -456,12 +547,14 @@ export async function consolidateWithModel(
   options: ConsolidationModelOptions = {},
 ): Promise<ConsolidationChanges> {
   const model = context.model;
-  if (model === undefined) throw new ConsolidationError("No Pi chat model is selected for consolidation.");
+  if (model === undefined) {
+    throw new ConsolidationError("No Pi chat model is selected for consolidation.", "model_unavailable");
+  }
   if (!Number.isSafeInteger(model.contextWindow) || model.contextWindow <= CONTEXT_OUTPUT_RESERVE) {
-    throw new ConsolidationError("The selected model context window is too small for consolidation.");
+    throw new ConsolidationError("The selected model context window is too small for consolidation.", "model_unavailable");
   }
   if (!Number.isSafeInteger(model.maxTokens) || model.maxTokens < 1) {
-    throw new ConsolidationError("The selected model has an invalid output limit.");
+    throw new ConsolidationError("The selected model has an invalid output limit.", "model_unavailable");
   }
 
   const validatedBatch = validateBatch(batch);
@@ -487,7 +580,7 @@ export async function consolidateWithModel(
   const contextByteLimit = Math.min(MAX_INPUT_BYTES, model.contextWindow - CONTEXT_OUTPUT_RESERVE);
   const memoryTools = new MemoryTools(() => store);
   const fullyRead = new Map<string, number>();
-  let retrievalFailed = false;
+  let retrievalFailure: DistillFailureReason | undefined;
   let cumulativeInputBytes = 0;
   let cumulativeOutputBytes = 0;
   let cumulativeOutputTokens = 0;
@@ -496,58 +589,91 @@ export async function consolidateWithModel(
 
   for (let modelCall = 0; modelCall < MAX_MODEL_CALLS; modelCall += 1) {
     await options.waitUntilIdle?.(signal);
-    if (signal.aborted) throw signal.reason ?? new ConsolidationError("Consolidation was cancelled.");
+    if (signal.aborted) throw callerAbortReason(signal);
     let serializedRequest: string;
     try {
       serializedRequest = JSON.stringify({ systemPrompt, messages, tools });
     } catch {
-      throw new ConsolidationError("The model input could not be serialized.");
+      throw new ConsolidationError("The model input could not be serialized.", "source_invalid");
     }
     const requestBytes = Buffer.byteLength(serializedRequest, "utf8");
-    if (requestBytes > contextByteLimit || cumulativeInputBytes + requestBytes > MAX_CUMULATIVE_INPUT_BYTES) {
-      throw new ConsolidationError("The serialized model input exceeded its bounded context allowance.");
+    if (requestBytes > contextByteLimit) {
+      const reason = modelCall === 0 ? "model_unavailable" : "model_budget";
+      throw new ConsolidationError("The serialized model input exceeded its bounded context allowance.", reason);
+    }
+    if (cumulativeInputBytes + requestBytes > MAX_CUMULATIVE_INPUT_BYTES) {
+      throw new ConsolidationError("The cumulative serialized model input exceeded its bounded allowance.", "model_budget");
     }
     cumulativeInputBytes += requestBytes;
 
     const remainingOutputTokens = MAX_OUTPUT_TOKENS - cumulativeOutputTokens;
-    if (remainingOutputTokens < 1) throw new ConsolidationError("The model output token budget was exhausted.");
+    if (remainingOutputTokens < 1) {
+      throw new ConsolidationError("The model output token budget was exhausted.", "model_budget");
+    }
     const remainingModelWorkMs = MAX_JOB_MS - cumulativeModelWorkMs;
-    if (remainingModelWorkMs <= 0) throw new ConsolidationError("The consolidation model-work budget was exhausted.");
-    const requestSignal = AbortSignal.any([signal, AbortSignal.timeout(remainingModelWorkMs)]);
+    if (remainingModelWorkMs <= 0) {
+      throw new ConsolidationError("The consolidation model-work budget was exhausted.", "model_budget");
+    }
+    const timeoutSignal = AbortSignal.timeout(remainingModelWorkMs);
+    const requestSignal = AbortSignal.any([signal, timeoutSignal]);
     const requestStartedAt = Date.now();
-    const request = context.modelRegistry.complete(model, modelRequest, {
-      maxTokens: Math.min(remainingOutputTokens, model.maxTokens),
-      signal: requestSignal,
-    });
+    let providerRetryAfterMs: number | undefined;
     let response: unknown;
     try {
+      const request = context.modelRegistry.complete(model, modelRequest, {
+        maxTokens: Math.min(remainingOutputTokens, model.maxTokens),
+        signal: requestSignal,
+        onResponse: (providerResponse: ProviderResponse) => {
+          const retryAfterMs = retryAfterFromHeaders(providerResponse.headers);
+          if (retryAfterMs !== undefined) providerRetryAfterMs = retryAfterMs;
+        },
+      });
       response = await raceAbort(request, requestSignal);
+    } catch (error) {
+      if (signal.aborted) throw callerAbortReason(signal);
+      if (timeoutSignal.aborted) {
+        throw new ConsolidationError("The consolidation model-work budget was exhausted.", "model_budget", { cause: error });
+      }
+      const retryAfterMs = providerRetryAfterMs ?? structuredRetryAfterMs(error);
+      if (retryAfterMs !== undefined) {
+        throw new ConsolidationError("The model provider request failed.", "transient", { cause: error, retryAfterMs });
+      }
+      throw error;
     } finally {
       cumulativeModelWorkMs += Date.now() - requestStartedAt;
     }
+    if (signal.aborted) throw callerAbortReason(signal);
     const assistant = validateAssistantMessage(response);
     cumulativeOutputTokens += assistant.usage.output;
     cumulativeOutputBytes += Buffer.byteLength(JSON.stringify(assistant.content), "utf8");
     if (cumulativeOutputTokens > MAX_OUTPUT_TOKENS || cumulativeOutputBytes > MAX_OUTPUT_BYTES) {
-      throw new ConsolidationError("The model output exceeded its bounded budget.");
+      throw new ConsolidationError("The model output exceeded its bounded budget.", "model_budget");
     }
     messages.push(assistant);
 
     if (assistant.stopReason === "stop") {
       if (hasToolCalls(assistant)) throw new ConsolidationError("The model stopped with unfinished tool calls.");
-      if (retrievalFailed) {
-        throw new ConsolidationError("The model finished with incomplete memory retrieval.");
+      if (retrievalFailure !== undefined) {
+        throw new ConsolidationError("The model finished with incomplete memory retrieval.", retrievalFailure);
       }
       return toChanges(parseOperations(responseText(assistant), evidenceKeys, fullyRead));
     }
     if (assistant.stopReason !== "toolUse") {
+      if (assistant.stopReason === "length") {
+        throw new ConsolidationError("The model output ended at its token limit.", "model_budget");
+      }
+      if (assistant.stopReason === "error" || assistant.stopReason === "aborted" || assistant.stopReason === "deferred") {
+        throw new ConsolidationError(`The model request ended with ${assistant.stopReason}.`, "transient", {
+          ...(providerRetryAfterMs === undefined ? {} : { retryAfterMs: providerRetryAfterMs }),
+        });
+      }
       throw new ConsolidationError(`The model ended before completing consolidation (${assistant.stopReason}).`);
     }
 
     const calls = toolCalls(assistant);
     if (calls.length === 0) throw new ConsolidationError("The model requested tools without returning a tool call.");
     if (toolCallCount + calls.length > MAX_TOOL_CALLS) {
-      throw new ConsolidationError("The consolidation tool-call budget was exhausted.");
+      throw new ConsolidationError("The consolidation tool-call budget was exhausted.", "model_budget");
     }
     for (const call of calls) {
       toolCallCount += 1;
@@ -560,7 +686,7 @@ export async function consolidateWithModel(
       if (call.name === "memory_search") {
         result = await memoryTools.search(argumentsValue, signal);
         const body = resultBody(result);
-        if (body.status !== "ok" || result.isError === true) retrievalFailed = true;
+        retrievalFailure ??= retrievalFailureReason(body, result.isError === true);
       } else {
         const id = argumentsValue["id"];
         const expectedRevision = argumentsValue["expectedRevision"];
@@ -569,7 +695,7 @@ export async function consolidateWithModel(
         }
         result = await memoryTools.read(argumentsValue, signal);
         const body = resultBody(result);
-        if (body.status !== "ok" || result.isError === true) retrievalFailed = true;
+        retrievalFailure ??= retrievalFailureReason(body, result.isError === true);
         if (body.status === "ok" && body.id === id && body.revision === expectedRevision) {
           if (body.hasMore === false && !Object.hasOwn(body, "nextCursor")) {
             try {
@@ -583,18 +709,18 @@ export async function consolidateWithModel(
                 fullyRead.set(id, expectedRevision);
               }
             } catch {
-              retrievalFailed = true;
+              retrievalFailure ??= "transient";
               result = resultWithDetails(result, { status: "origin_unavailable", incomplete: true }, true);
             }
           } else if (body.hasMore !== true || typeof body.nextCursor !== "string") {
-            retrievalFailed = true;
+            retrievalFailure ??= "transient";
           }
         } else if (body.status === "ok") {
-          retrievalFailed = true;
+          retrievalFailure ??= "transient";
         }
       }
       addToolResult(messages, call, result);
     }
   }
-  throw new ConsolidationError("The model-call budget was exhausted before a complete change set was returned.");
+  throw new ConsolidationError("The model-call budget was exhausted before a complete change set was returned.", "model_budget");
 }

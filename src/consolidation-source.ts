@@ -10,6 +10,7 @@ import {
   type SessionProjection,
 } from "@earendil-works/pi-coding-agent";
 import type { SessionObservation, SourceBatch, SourcePart } from "./consolidation-types.js";
+import { DistillFailure } from "./distill-failure.ts";
 
 const MAX_PART_TEXT_BYTES = 1024;
 const MAX_PART_JSON_BYTES = 2 * 1024;
@@ -93,6 +94,10 @@ interface ProjectionContent {
 
 const projections = new WeakMap<SourceSnapshot, SessionProjection>();
 
+function invalidSource(message: string): DistillFailure {
+  return new DistillFailure("source_invalid", message);
+}
+
 export function snapshotSession(manager: ReadonlySessionManager): SourceSnapshot {
   const sessionId = manager.getSessionId();
   const header = manager.getHeader();
@@ -111,7 +116,7 @@ export function snapshotSession(manager: ReadonlySessionManager): SourceSnapshot
 
   const branch = manager.getBranch();
   if (leafId === null && branch.length > 0) {
-    throw new Error("Pi returned session entries without a leaf checkpoint");
+    throw invalidSource("Pi returned session entries without a leaf checkpoint");
   }
   if (leafId !== null) validateBranch(branch, leafId);
 
@@ -140,6 +145,9 @@ export function snapshotSession(manager: ReadonlySessionManager): SourceSnapshot
 
 /** Read and validate a persisted Pi session without changing the source file. */
 export async function loadSnapshot(sessionFile: string, leafId?: string | null): Promise<SourceSnapshot> {
+  if (typeof sessionFile !== "string" || sessionFile.trim().length === 0) {
+    throw invalidSource("Session file path must be a nonempty string.");
+  }
   const budget: AggregateBudget = { bytes: 0, entries: 0 };
   const graph = await loadSessionGraph(resolve(sessionFile), new Set(), 0, budget);
   return snapshotFromGraph(graph, sessionFile, leafId);
@@ -152,9 +160,14 @@ export async function findCompactionRecord(
   cwd: string,
   leafId: string | null,
 ): Promise<string | undefined> {
+  if (typeof sessionFile !== "string" || sessionFile.trim().length === 0 ||
+    !validNonEmptyString(sessionId, MAX_SESSION_ID_LENGTH) || typeof cwd !== "string" ||
+    (leafId !== null && !validNonEmptyString(leafId, MAX_ENTRY_ID_LENGTH))) {
+    throw invalidSource("Compaction recovery source identity is invalid.");
+  }
   const graph = await loadSessionGraph(resolve(sessionFile), new Set(), 0, { bytes: 0, entries: 0 });
   if (graph.header.id !== sessionId || graph.header.cwd !== cwd || graph.pending || graph.parentSessionPending) {
-    throw new Error("Compaction recovery requires the complete original session and ancestry.");
+    throw invalidSource("Compaction recovery requires the complete original session and ancestry.");
   }
   return graph.entries.find(entry => entry.type === "compaction" && entry.parentId === leafId)?.id;
 }
@@ -183,7 +196,7 @@ function snapshotFromGraph(
   const branch = selectedLeaf === null ? [] : branchForLeaf(graph.entriesById, selectedLeaf);
   if (budget && !consumeAggregateBudget(budget,
     [graph.header.id, resolve(sessionFile), graph.header.cwd, branch], branch.length)) {
-    throw new Error("Session branch coverage exceeds the aggregate size or entry limit.");
+    throw invalidSource("Session branch coverage exceeds the aggregate size or entry limit.");
   }
   const editStatus = validateContextEdits(branch);
   const projection = buildSessionProjection(branch, selectedLeaf, graph.entriesById);
@@ -230,13 +243,13 @@ export async function loadSessionCoverage(
   const checkpoints = observations.filter(observation =>
     observation.sessionId === graph.header.id || resolve(observation.sessionFile) === path);
   if (checkpoints.some(observation => observation.sessionId !== graph.header.id)) {
-    throw new Error("Observed session identity does not match its current file.");
+    throw invalidSource("Observed session identity does not match its current file.");
   }
   const keys = new Set<string>();
   for (const leaf of new Set([...leaves, ...checkpoints.map(observation => observation.leafId)])) {
     // Shared prefixes count again; the caller can share this budget across files.
     const snapshot = snapshotFromGraph(graph, path, leaf, budget);
-    if (snapshot.pending) throw new Error(snapshot.pendingReason ?? "Incomplete session branch.");
+    if (snapshot.pending) throw invalidSource(snapshot.pendingReason ?? "Incomplete session branch.");
     for (const batch of planSources(snapshot, new Set())) {
       for (const key of batch.sourceKeys) keys.add(key);
     }
@@ -258,7 +271,7 @@ export async function sessionCoverageUnchanged(coverage: SessionCoverage): Promi
 
 async function sessionFileVersion(path: string): Promise<string> {
   const info = await lstat(path, { bigint: true });
-  if (!info.isFile()) throw new Error("Session coverage requires a regular file.");
+  if (!info.isFile()) throw invalidSource("Session coverage requires a regular file.");
   return [info.dev, info.ino, info.size, info.mtimeNs, info.ctimeNs].join(":");
 }
 
@@ -444,7 +457,7 @@ function splitText(text: string, entryId: string, role: string): string[] {
   if (text.length === 0) return [];
   const emptyPartBytes = Buffer.byteLength(JSON.stringify({ key: "0".repeat(64), entryId, role, text: "" }), "utf8");
   const maxEncodedTextBytes = Math.min(MAX_PART_JSON_BYTES, MAX_CONTEXT_JSON_BYTES - 8) - emptyPartBytes;
-  if (maxEncodedTextBytes <= 0) throw new Error("Session entry metadata is too large for a bounded source part.");
+  if (maxEncodedTextBytes <= 0) throw invalidSource("Session entry metadata is too large for a bounded source part.");
   const chunks: string[] = [];
   let current = "";
   let rawBytes = 0;
@@ -738,7 +751,7 @@ function jsonStringBytes(value: string, limit: number): number | undefined {
 
 async function readBoundedUtf8(path: string, budget: AggregateBudget): Promise<string> {
   const remaining = MAX_ANCESTRY_JSON_BYTES - budget.bytes;
-  if (remaining < 0) throw new Error("Session ancestry exceeds the aggregate byte limit.");
+  if (remaining < 0) throw invalidSource("Session ancestry exceeds the aggregate byte limit.");
   const buffer = Buffer.allocUnsafe(remaining + 1);
   const file = await open(path, "r");
   let total = 0;
@@ -750,23 +763,23 @@ async function readBoundedUtf8(path: string, budget: AggregateBudget): Promise<s
       if (total > remaining) {
         // Failed reads still consume a shared assessment budget.
         budget.bytes = MAX_ANCESTRY_JSON_BYTES;
-        throw new Error("Session ancestry exceeds the aggregate byte limit.");
+        throw invalidSource("Session ancestry exceeds the aggregate byte limit.");
       }
     }
   } finally {
     await file.close();
   }
-  if (!consumeRawByteBudget(budget, total)) throw new Error("Session ancestry exceeds the aggregate byte limit.");
+  if (!consumeRawByteBudget(budget, total)) throw invalidSource("Session ancestry exceeds the aggregate byte limit.");
   try {
     return utf8Decoder.decode(buffer.subarray(0, total));
   } catch {
-    throw new Error("Session file is not valid UTF-8.");
+    throw invalidSource("Session file is not valid UTF-8.");
   }
 }
 
 function readBoundedUtf8Sync(path: string, budget: AggregateBudget): string {
   const remaining = MAX_ANCESTRY_JSON_BYTES - budget.bytes;
-  if (remaining < 0) throw new Error("Session ancestry exceeds the aggregate byte limit.");
+  if (remaining < 0) throw invalidSource("Session ancestry exceeds the aggregate byte limit.");
   const buffer = Buffer.allocUnsafe(remaining + 1);
   const descriptor = openSync(path, "r");
   let total = 0;
@@ -775,16 +788,16 @@ function readBoundedUtf8Sync(path: string, budget: AggregateBudget): string {
       const bytesRead = readSync(descriptor, buffer, total, buffer.length - total, null);
       if (bytesRead === 0) break;
       total += bytesRead;
-      if (total > remaining) throw new Error("Session ancestry exceeds the aggregate byte limit.");
+      if (total > remaining) throw invalidSource("Session ancestry exceeds the aggregate byte limit.");
     }
   } finally {
     closeSync(descriptor);
   }
-  if (!consumeRawByteBudget(budget, total)) throw new Error("Session ancestry exceeds the aggregate byte limit.");
+  if (!consumeRawByteBudget(budget, total)) throw invalidSource("Session ancestry exceeds the aggregate byte limit.");
   try {
     return utf8Decoder.decode(buffer.subarray(0, total));
   } catch {
-    throw new Error("Session file is not valid UTF-8.");
+    throw invalidSource("Session file is not valid UTF-8.");
   }
 }
 
@@ -803,40 +816,40 @@ function applyContextEdits(entries: readonly SessionEntry[]): ReadonlyMap<string
 }
 
 function validateSessionHeader(value: unknown): asserts value is SessionHeader {
-  if (!isRecord(value) || value.type !== "session") throw new Error("Session JSONL must start with a session header.");
-  if (!validNonEmptyString(value.id, MAX_SESSION_ID_LENGTH)) throw new Error("Session header has an invalid id.");
-  if (typeof value.timestamp !== "string" || value.timestamp.length === 0) throw new Error("Session header has an invalid timestamp.");
-  if (typeof value.cwd !== "string") throw new Error("Session header has an invalid cwd.");
+  if (!isRecord(value) || value.type !== "session") throw invalidSource("Session JSONL must start with a session header.");
+  if (!validNonEmptyString(value.id, MAX_SESSION_ID_LENGTH)) throw invalidSource("Session header has an invalid id.");
+  if (typeof value.timestamp !== "string" || value.timestamp.length === 0) throw invalidSource("Session header has an invalid timestamp.");
+  if (typeof value.cwd !== "string") throw invalidSource("Session header has an invalid cwd.");
   if (value.version !== undefined) {
     if (typeof value.version !== "number" || !Number.isInteger(value.version) || value.version < 1) {
-      throw new Error("Session header has an invalid version.");
+      throw invalidSource("Session header has an invalid version.");
     }
   }
   if (value.parentSession !== undefined && !validNonEmptyString(value.parentSession, 16_384)) {
-    throw new Error("Session header has an invalid parentSession path.");
+    throw invalidSource("Session header has an invalid parentSession path.");
   }
 }
 
 function parseSessionText(text: string, budget: AggregateBudget): ParsedSession {
-  if (text.length === 0) throw new Error("Session file is empty.");
+  if (text.length === 0) throw invalidSource("Session file is empty.");
   const hasFinalNewline = text.endsWith("\n");
   const lines = text.split("\n");
   if (hasFinalNewline) lines.pop();
   let pending = false;
-  if (lines.length === 0 || lines[0]?.length === 0) throw new Error("Session JSONL is missing its header.");
+  if (lines.length === 0 || lines[0]?.length === 0) throw invalidSource("Session JSONL is missing its header.");
 
   let headerValue: unknown;
   try {
     headerValue = JSON.parse(lines[0]!);
   } catch {
-    throw new Error("Session JSONL header is malformed.");
+    throw invalidSource("Session JSONL header is malformed.");
   }
   validateSessionHeader(headerValue);
 
   const entries: SessionEntry[] = [];
   for (let index = 1; index < lines.length; index++) {
     const line = lines[index]!;
-    if (line.length === 0) throw new Error(`Session JSONL contains an empty record at line ${index + 1}.`);
+    if (line.length === 0) throw invalidSource(`Session JSONL contains an empty record at line ${index + 1}.`);
     let value: unknown;
     try {
       value = JSON.parse(line);
@@ -845,7 +858,7 @@ function parseSessionText(text: string, budget: AggregateBudget): ParsedSession 
         pending = true;
         break;
       }
-      throw new Error(`Session JSONL record at line ${index + 1} is malformed.`);
+      throw invalidSource(`Session JSONL record at line ${index + 1} is malformed.`);
     }
     try {
       validateEntryShape(value, index + 1);
@@ -857,7 +870,7 @@ function parseSessionText(text: string, budget: AggregateBudget): ParsedSession 
       throw error;
     }
     if (!consumeEntryBudget(budget, 1)) {
-      throw new Error("Session ancestry exceeds the aggregate entry limit.");
+      throw invalidSource("Session ancestry exceeds the aggregate entry limit.");
     }
     entries.push(value);
   }
@@ -867,7 +880,7 @@ function parseSessionText(text: string, budget: AggregateBudget): ParsedSession 
 
 function validateEntryShape(value: unknown, lineNumber: number): asserts value is SessionEntry {
   const fail = (): never => {
-    throw new Error(`Session JSONL record at line ${lineNumber} has an invalid ${isRecord(value) ? String(value.type) : "entry"} shape.`);
+    throw invalidSource(`Session JSONL record at line ${lineNumber} has an invalid ${isRecord(value) ? String(value.type) : "entry"} shape.`);
   };
   if (!isRecord(value) || !validNonEmptyString(value.id, MAX_ENTRY_ID_LENGTH)) return fail();
   if (value.parentId !== null && !validNonEmptyString(value.parentId, MAX_ENTRY_ID_LENGTH)) return fail();
@@ -919,7 +932,7 @@ function validateSessionEntries(entries: readonly SessionEntry[]): void {
   const indexById = new Map<string, number>();
   for (const [index, value] of entries.entries()) {
     validateEntryShape(value, index + 2);
-    if (byId.has(value.id)) throw new Error(`Session contains duplicate entry id ${value.id}.`);
+    if (byId.has(value.id)) throw invalidSource(`Session contains duplicate entry id ${value.id}.`);
     byId.set(value.id, value);
     indexById.set(value.id, index);
   }
@@ -929,13 +942,13 @@ function validateSessionEntries(entries: readonly SessionEntry[]): void {
       continue;
     }
     const parentIndex = indexById.get(entry.parentId);
-    if (parentIndex === undefined) throw new Error(`Session entry ${entry.id} has missing parent ${entry.parentId}.`);
-    if (parentIndex >= index) throw new Error(`Session entry ${entry.id} points to a later entry ${entry.parentId}.`);
+    if (parentIndex === undefined) throw invalidSource(`Session entry ${entry.id} has missing parent ${entry.parentId}.`);
+    if (parentIndex >= index) throw invalidSource(`Session entry ${entry.id} points to a later entry ${entry.parentId}.`);
   }
   const state = new Map<string, "visiting" | "visited">();
   const visit = (id: string): void => {
     const current = state.get(id);
-    if (current === "visiting") throw new Error(`Session entry graph contains a parent cycle at ${id}.`);
+    if (current === "visiting") throw invalidSource(`Session entry graph contains a parent cycle at ${id}.`);
     if (current === "visited") return;
     state.set(id, "visiting");
     const entry = byId.get(id);
@@ -946,32 +959,32 @@ function validateSessionEntries(entries: readonly SessionEntry[]): void {
 }
 
 function validateBranch(entries: readonly unknown[], leafId: string): SessionEntry[] {
-  if (!validNonEmptyString(leafId, MAX_ENTRY_ID_LENGTH)) throw new Error("Session checkpoint has an invalid leaf id.");
+  if (!validNonEmptyString(leafId, MAX_ENTRY_ID_LENGTH)) throw invalidSource("Session checkpoint has an invalid leaf id.");
   const typed: SessionEntry[] = [];
   const byId = new Map<string, SessionEntry>();
   for (const [index, value] of entries.entries()) {
     validateEntryShape(value, index + 2);
-    if (byId.has(value.id)) throw new Error(`Snapshot contains duplicate entry id ${value.id}.`);
+    if (byId.has(value.id)) throw invalidSource(`Snapshot contains duplicate entry id ${value.id}.`);
     byId.set(value.id, value);
     typed.push(value);
   }
   const leaf = byId.get(leafId);
-  if (!leaf) throw new Error(`Session checkpoint ${leafId} is absent from the snapshot.`);
+  if (!leaf) throw invalidSource(`Session checkpoint ${leafId} is absent from the snapshot.`);
   const reverse: SessionEntry[] = [];
   const seen = new Set<string>();
   let current: SessionEntry | undefined = leaf;
   while (current) {
-    if (seen.has(current.id)) throw new Error(`Session branch contains a parent cycle at ${current.id}.`);
+    if (seen.has(current.id)) throw invalidSource(`Session branch contains a parent cycle at ${current.id}.`);
     seen.add(current.id);
     reverse.push(current);
     if (current.parentId === null) break;
     const parent = byId.get(current.parentId);
-    if (!parent) throw new Error(`Session branch has missing parent ${current.parentId}.`);
+    if (!parent) throw invalidSource(`Session branch has missing parent ${current.parentId}.`);
     current = parent;
   }
   reverse.reverse();
   for (let index = 1; index < reverse.length; index++) {
-    if (reverse[index]!.parentId !== reverse[index - 1]!.id) throw new Error("Session branch is not a contiguous parent chain.");
+    if (reverse[index]!.parentId !== reverse[index - 1]!.id) throw invalidSource("Session branch is not a contiguous parent chain.");
   }
   return reverse;
 }
@@ -980,13 +993,13 @@ function branchForLeaf(entriesById: ReadonlyMap<string, SessionEntry>, leafId: s
   const reverse: SessionEntry[] = [];
   const seen = new Set<string>();
   let current = entriesById.get(leafId);
-  if (!current) throw new Error(`Session checkpoint ${leafId} is missing.`);
+  if (!current) throw invalidSource(`Session checkpoint ${leafId} is missing.`);
   while (current) {
-    if (seen.has(current.id)) throw new Error(`Session branch contains a parent cycle at ${current.id}.`);
+    if (seen.has(current.id)) throw invalidSource(`Session branch contains a parent cycle at ${current.id}.`);
     seen.add(current.id);
     reverse.push(current);
     current = current.parentId === null ? undefined : entriesById.get(current.parentId);
-    if (reverse.at(-1)?.parentId !== null && current === undefined) throw new Error("Session branch has a missing parent.");
+    if (reverse.at(-1)?.parentId !== null && current === undefined) throw invalidSource("Session branch has a missing parent.");
   }
   return reverse.reverse();
 }
@@ -1031,15 +1044,17 @@ async function loadSessionGraph(
   budget: AggregateBudget,
   fileVersions?: Map<string, string>,
 ): Promise<SessionGraph & { readonly parentSessionPending: boolean }> {
-  if (depth > MAX_ANCESTRY_DEPTH) throw new Error("Session parentSession ancestry exceeds the supported depth.");
+  if (depth > MAX_ANCESTRY_DEPTH) throw invalidSource("Session parentSession ancestry exceeds the supported depth.");
   const resolvedPath = resolve(path);
-  if (ancestors.has(resolvedPath)) throw new Error("Session parentSession ancestry contains a file cycle.");
+  if (ancestors.has(resolvedPath)) throw invalidSource("Session parentSession ancestry contains a file cycle.");
   const nextAncestors = new Set(ancestors);
   nextAncestors.add(resolvedPath);
   const before = fileVersions ? await sessionFileVersion(resolvedPath) : undefined;
   const parsed = parseSessionText(await readBoundedUtf8(resolvedPath, budget), budget);
   if (fileVersions && before !== undefined) {
-    if (await sessionFileVersion(resolvedPath) !== before) throw new Error("Session changed while reading.");
+    if (await sessionFileVersion(resolvedPath) !== before) {
+      throw new DistillFailure("conflict", "Session changed while reading.");
+    }
     fileVersions.set(resolvedPath, before);
   }
   const local = entryMaps(parsed.entries, parsed.header.id);
@@ -1048,7 +1063,7 @@ async function loadSessionGraph(
   }
   const parentPath = resolve(dirname(resolvedPath), parsed.header.parentSession);
   const parent = await loadSessionGraph(parentPath, nextAncestors, depth + 1, budget, fileVersions);
-  if (parent.header.id === parsed.header.id) throw new Error("Forked sessions must have distinct session ids.");
+  if (parent.header.id === parsed.header.id) throw invalidSource("Forked sessions must have distinct session ids.");
   const origins = new Map<string, SourceOrigin>();
   const signatures = new Map<string, string>();
   for (const entry of parsed.entries) {
@@ -1077,9 +1092,9 @@ function loadSessionGraphSync(
   depth: number,
   budget: AggregateBudget,
 ): SessionGraph & { readonly parentSessionPending: boolean } {
-  if (depth > MAX_ANCESTRY_DEPTH) throw new Error("Session parentSession ancestry exceeds the supported depth.");
+  if (depth > MAX_ANCESTRY_DEPTH) throw invalidSource("Session parentSession ancestry exceeds the supported depth.");
   const resolvedPath = resolve(path);
-  if (ancestors.has(resolvedPath)) throw new Error("Session parentSession ancestry contains a file cycle.");
+  if (ancestors.has(resolvedPath)) throw invalidSource("Session parentSession ancestry contains a file cycle.");
   const nextAncestors = new Set(ancestors);
   nextAncestors.add(resolvedPath);
   const parsed = parseSessionText(readBoundedUtf8Sync(resolvedPath, budget), budget);
@@ -1089,7 +1104,7 @@ function loadSessionGraphSync(
   }
   const parentPath = resolve(dirname(resolvedPath), parsed.header.parentSession);
   const parent = loadSessionGraphSync(parentPath, nextAncestors, depth + 1, budget);
-  if (parent.header.id === parsed.header.id) throw new Error("Forked sessions must have distinct session ids.");
+  if (parent.header.id === parsed.header.id) throw invalidSource("Forked sessions must have distinct session ids.");
   const origins = new Map<string, SourceOrigin>();
   const signatures = new Map<string, string>();
   for (const entry of parsed.entries) {

@@ -8,21 +8,36 @@ import type {
   SessionObservation,
 } from "./consolidation-types.js";
 import type { SessionUsage } from "./session-usage-types.js";
+import {
+  canRetryDistillFailure,
+  makeDistillFailureRecord,
+  parseDistillFailureInput,
+  parseDistillFailureRecord,
+  parseDistillRetryContext,
+  parseDistillTaskKind,
+  type DistillFailureRecord,
+  type DistillRetryContext,
+  type DistillTaskKind,
+} from "./distill-retry.ts";
 import type {
   CleanTask,
   CleanTaskInput,
   CleanTaskPageOptions,
   DistillClaimInput,
+  DistillFailure,
+  DistillFailureKind,
   DistillJobClaim,
   DistillTrigger,
   DistillTriggerInput,
   DistillTriggerClaim,
+  DistillTriggerClaimInput,
   PrepareDistillTriggerInput,
   ReleaseDistillClaimInput,
   RetryCategory,
   RetryRequest,
   TaskPage,
-  TaskPageOptions,
+  TaskSweepPage,
+  TaskSweepPageOptions,
   WaitReason,
 } from "./task-types.js";
 
@@ -154,6 +169,18 @@ const distillLeaseSchema =
   "(claim_token IS NOT NULL AND worker_id IS NOT NULL AND task_kind IS NOT NULL AND " +
   "task_id IS NOT NULL AND lease_until IS NOT NULL))" +
   ") STRICT";
+const distillFailuresSchema =
+  "CREATE TABLE distill_failures (" +
+  "task_kind TEXT NOT NULL CHECK (task_kind IN ('trigger', 'job')), " +
+  "task_id TEXT NOT NULL, " +
+  "reason TEXT NOT NULL CHECK (reason IN ('source_invalid', 'model_unavailable', 'model_invalid', 'model_budget', 'transient', 'conflict')), " +
+  "source_version TEXT NOT NULL, " +
+  "model_key TEXT NOT NULL, " +
+  "policy_version TEXT NOT NULL, " +
+  "attempts INTEGER NOT NULL CHECK (attempts > 0), " +
+  "next_attempt_at INTEGER, " +
+  "PRIMARY KEY (task_kind, task_id)" +
+  ") STRICT";
 const cleanTasksSchema =
   "CREATE TABLE clean_tasks (" +
   "id TEXT PRIMARY KEY NOT NULL, " +
@@ -198,7 +225,8 @@ const storeSchemasV7 = [...storeSchemas, ...[metadataGcSchema, ...storeIndexesV7
   if (!match?.[2]) throw new Error("Invalid store schema declaration.");
   return {name:match[2],sql};
 })];
-const latestSchemaVersion = 7;
+const storeSchemasV8 = [...storeSchemasV7, { name: "distill_failures", sql: distillFailuresSchema }];
+const latestSchemaVersion = 8;
 
 export interface SessionDeletion {
   readonly sessionFile: string;
@@ -272,6 +300,11 @@ const sessionUsageColumns = [
   textColumn("state"),
 ].join(", ");
 const schemaColumns = [textColumn("name"), textColumn("type"), textColumn("sql")].join(", ");
+const distillFailureColumns = [
+  textColumn("task_kind", "kind"), textColumn("task_id", "id"), textColumn("reason"),
+  textColumn("source_version", "sourceVersion"), textColumn("model_key", "modelKey"),
+  textColumn("policy_version", "policyVersion"), "attempts", "next_attempt_at AS nextAttemptAt",
+].join(", ");
 
 interface PersistedDistillTrigger {
   readonly trigger: DistillTriggerInput;
@@ -326,7 +359,7 @@ interface SchemaColumn {
   readonly name: string;
   readonly type: "TEXT" | "INTEGER";
   readonly notNull: 0 | 1;
-  readonly primaryKey: 0 | 1;
+  readonly primaryKey: 0 | 1 | 2;
 }
 
 export interface MemoryInput {
@@ -891,15 +924,82 @@ function parseTaskPageOptions(value: unknown, allowNow: boolean): {
   return parsed;
 }
 
+function parseTaskSweepPageOptions(value: unknown): {
+  readonly limit: number;
+  readonly cursor?: number;
+  readonly throughCursor?: number;
+} {
+  const allowed = ["limit", "cursor", "throughCursor"];
+  if (!isRecord(value) || Reflect.ownKeys(value).some(key => typeof key !== "string" || !allowed.includes(key)) ||
+    !Object.hasOwn(value, "limit")) {
+    throw new TypeError("Task sweep page requires a limit and only supported cursor fields.");
+  }
+  const base = parseTaskPageOptions({
+    limit: value["limit"],
+    ...(Object.hasOwn(value, "cursor") ? { cursor: value["cursor"] } : {}),
+  }, false);
+  let throughCursor: number | undefined;
+  if (Object.hasOwn(value, "throughCursor")) {
+    validateNow(value["throughCursor"], "Task sweep upper cursor");
+    throughCursor = value["throughCursor"];
+    if ((base.cursor ?? 0) > throughCursor) throw new TypeError("Task sweep cursor cannot exceed its upper cursor.");
+  }
+  return {
+    limit: base.limit,
+    ...(base.cursor === undefined ? {} : { cursor: base.cursor }),
+    ...(throughCursor === undefined ? {} : { throughCursor }),
+  };
+}
+
 function parseDistillClaimInput(value: unknown): DistillClaimInput {
-  const { workerId, now, leaseMs } = fields(value, ["workerId", "now", "leaseMs"]);
+  if (!isRecord(value)) throw new TypeError("Distill claim input must be an object.");
+  const allowed = ["workerId", "now", "leaseMs", "retryContext"];
+  if (Reflect.ownKeys(value).some(key => typeof key !== "string" || !allowed.includes(key)) ||
+    !Object.hasOwn(value, "workerId") || !Object.hasOwn(value, "now") || !Object.hasOwn(value, "leaseMs")) {
+    throw new TypeError("Distill claim requires workerId, now, and leaseMs.");
+  }
+  const { workerId, now, leaseMs } = value;
   validateText(workerId, "distill worker ID");
   validateNow(now, "Distill claim time");
   if (typeof leaseMs !== "number" || !Number.isSafeInteger(leaseMs) || leaseMs < 1) {
     throw new TypeError("Distill lease duration must be a positive safe integer.");
   }
   if (!Number.isSafeInteger(now + leaseMs)) throw new TypeError("Distill lease expiration is outside the safe integer range.");
-  return { workerId, now, leaseMs };
+  return {
+    workerId,
+    now,
+    leaseMs,
+    ...(Object.hasOwn(value, "retryContext") ? { retryContext: parseDistillRetryContext(value["retryContext"]) } : {}),
+  };
+}
+
+function parseDistillTriggerClaimInput(value: unknown): DistillTriggerClaimInput {
+  if (!isRecord(value)) throw new TypeError("Distill trigger claim input must be an object.");
+  const allowed = ["id", "workerId", "now", "leaseMs", "retryContext", "allowCandidate"];
+  if (Reflect.ownKeys(value).some(key => typeof key !== "string" || !allowed.includes(key)) ||
+    !Object.hasOwn(value, "workerId") || !Object.hasOwn(value, "now") || !Object.hasOwn(value, "leaseMs")) {
+    throw new TypeError("Distill trigger claim requires workerId, now, and leaseMs.");
+  }
+  const base = parseDistillClaimInput({
+    workerId: value["workerId"],
+    now: value["now"],
+    leaseMs: value["leaseMs"],
+    ...(Object.hasOwn(value, "retryContext") ? { retryContext: value["retryContext"] } : {}),
+  });
+  let id: string | undefined;
+  if (Object.hasOwn(value, "id")) {
+    const idValue = value["id"];
+    validateText(idValue, "distill trigger ID");
+    id = idValue;
+  }
+  const allowCandidate = Object.hasOwn(value, "allowCandidate") ? value["allowCandidate"] : false;
+  if (typeof allowCandidate !== "boolean") throw new TypeError("Candidate claim flag must be boolean.");
+  if (allowCandidate && id === undefined) throw new TypeError("Candidate claims require a trigger ID.");
+  return {
+    ...base,
+    ...(id === undefined ? {} : { id }),
+    ...(allowCandidate ? { allowCandidate: true } : {}),
+  };
 }
 
 function parseRetryRequest(value: unknown): RetryRequest {
@@ -912,17 +1012,21 @@ function parseRetryRequest(value: unknown): RetryRequest {
 
 function parseReleaseDistillClaimInput(value: unknown): ReleaseDistillClaimInput {
   if (!isRecord(value)) throw new TypeError("Distill claim release must be an object.");
-  const allowed = ["claimToken", "now", "retry"];
+  const allowed = ["claimToken", "now", "retry", "failure"];
   if (Reflect.ownKeys(value).some(key => typeof key !== "string" || !allowed.includes(key))) {
     throw new TypeError("Distill claim release has unsupported fields.");
   }
   const { claimToken, now } = value;
   validateText(claimToken, "distill claim token");
   validateNow(now, "Distill release time");
+  if (Object.hasOwn(value, "retry") && Object.hasOwn(value, "failure")) {
+    throw new TypeError("Distill claim release cannot contain both retry and failure metadata.");
+  }
   return {
     claimToken,
     now,
     ...(Object.hasOwn(value, "retry") ? { retry: parseRetryRequest(value["retry"]) } : {}),
+    ...(Object.hasOwn(value, "failure") ? { failure: parseDistillFailureInput(value["failure"]) } : {}),
   };
 }
 
@@ -1433,18 +1537,20 @@ export class SQLiteMemoryStore {
       const current = this.#readDistillTrigger(row);
       if (current.trigger.reason !== "compact" || current.status !== "candidate") return false;
       this.#database.prepare("DELETE FROM distill_triggers WHERE id = ? AND status = 'candidate'").run(id);
+      this.#clearDistillFailure("trigger", id);
       return true;
     });
   }
 
-  listDistillTriggers(options: TaskPageOptions): TaskPage<DistillTrigger> {
+  listDistillTriggers(options: TaskSweepPageOptions): TaskSweepPage<DistillTrigger> {
     this.#ensureOpen();
-    const page = parseTaskPageOptions(options, false);
+    const page = parseTaskSweepPageOptions(options);
     const cursor = page.cursor ?? 0;
+    const throughCursor = this.#taskSweepThroughCursor("distill_triggers", page.throughCursor);
     const rows = this.#database.prepare(
       `SELECT rowid AS cursorRow, ${triggerColumns} FROM distill_triggers ` +
-      "WHERE rowid > ? ORDER BY rowid LIMIT ?",
-    ).all(cursor, page.limit + 1);
+      "WHERE rowid > ? AND rowid <= ? ORDER BY rowid LIMIT ?",
+    ).all(cursor, throughCursor, page.limit + 1);
     const hasMore = rows.length > page.limit;
     const visible = rows.slice(0, page.limit);
     const items = visible.map(raw => {
@@ -1456,19 +1562,78 @@ export class SQLiteMemoryStore {
     const last = visible.at(-1);
     const nextCursor = hasMore && last !== undefined ? this.#decodeRow(last)["cursorRow"] : undefined;
     if (nextCursor !== undefined) validateNow(nextCursor, "Next distill trigger cursor");
-    return { items, ...(nextCursor === undefined ? {} : { nextCursor }) };
+    return { items, throughCursor, ...(nextCursor === undefined ? {} : { nextCursor }) };
   }
 
-  claimDistillTrigger(input: DistillClaimInput): DistillTriggerClaim | undefined {
+  readDistillTrigger(id: string): DistillTrigger | undefined {
     this.#ensureOpen();
-    const request = parseDistillClaimInput(input);
+    validateText(id, "distill trigger ID");
+    const row = this.#database.prepare(`SELECT ${triggerColumns} FROM distill_triggers WHERE id = ?`).get(id);
+    if (row === undefined) return undefined;
+    return this.#distillTriggerItem(this.#readDistillTrigger(row));
+  }
+
+  readDistillFailure(kind: DistillFailureKind, id: string): DistillFailure | undefined {
+    this.#ensureOpen();
+    const taskKind = parseDistillTaskKind(kind);
+    validateText(id, "distill task ID");
+    return this.#readDistillFailure(taskKind, id);
+  }
+
+  /** Advisory only; the fenced claim methods remain authoritative. */
+  canAttemptDistill(
+    kind: DistillFailureKind,
+    id: string,
+    context: DistillRetryContext | undefined,
+    now: number,
+  ): boolean {
+    this.#ensureOpen();
+    const taskKind = parseDistillTaskKind(kind);
+    validateText(id, "distill task ID");
+    validateNow(now, "Distill eligibility time");
+    const retryContext = context === undefined ? undefined : parseDistillRetryContext(context);
+    if (taskKind === "trigger") {
+      const row = this.#database.prepare(
+        `SELECT ${triggerColumns} FROM distill_triggers WHERE id = ?`,
+      ).get(id);
+      if (row === undefined) return false;
+      const task = this.#readDistillTrigger(this.#decodeRow(row));
+      return (task.status === "pending" || task.status === "candidate") &&
+        this.#distillTaskCanAttempt(taskKind, id, retryContext, now, task.retryAt);
+    }
+    const row = this.#database.prepare(
+      `SELECT ${jobColumns} FROM consolidation_jobs WHERE id = ?`,
+    ).get(id);
+    if (row === undefined) return false;
+    const task = parsePersistedJobRow(this.#decodeRow(row));
+    return task.status === "pending" && this.#distillTaskCanAttempt(taskKind, id, retryContext, now, task.retryAt);
+  }
+
+  claimDistillTrigger(input: DistillTriggerClaimInput): DistillTriggerClaim | undefined {
+    this.#ensureOpen();
+    const request = parseDistillTriggerClaimInput(input);
     return this.#transaction(() => {
-      const rows = this.#database.prepare(
-        `SELECT ${triggerColumns} FROM distill_triggers ` +
-        "WHERE status = 'pending' AND (retry_at IS NULL OR retry_at <= ?) ORDER BY rowid LIMIT 32",
-      ).all(request.now);
+      let rows: Record<string, unknown>[];
+      if (request.id === undefined) {
+        rows = this.#database.prepare(
+          `SELECT ${triggerColumns} FROM distill_triggers ` +
+          "WHERE status = 'pending' AND (retry_at IS NULL OR retry_at <= ?) " +
+          "AND NOT EXISTS (SELECT 1 FROM distill_failures AS f WHERE f.task_kind = 'trigger' AND f.task_id = distill_triggers.id) " +
+          "ORDER BY rowid LIMIT 32",
+        ).all(request.now);
+      } else {
+        rows = [];
+        const row = this.#database.prepare(
+          `SELECT ${triggerColumns} FROM distill_triggers WHERE id = ?`,
+        ).get(request.id);
+        if (row !== undefined) rows.push(row);
+      }
       for (const row of rows) {
         const current = this.#readDistillTrigger(this.#decodeRow(row));
+        if (current.status !== "pending" && !(request.allowCandidate && current.status === "candidate")) continue;
+        if (request.id !== undefined && !this.#distillTaskCanAttempt(
+          "trigger", request.id, request.retryContext, request.now, current.retryAt,
+        )) continue;
         if (!this.#acquireDistillSlot({
           claimToken: randomUUID(),
           workerId: request.workerId,
@@ -1541,6 +1706,7 @@ export class SQLiteMemoryStore {
       this.#database.prepare(
         "UPDATE distill_triggers SET status = ?, retry_category = NULL, retry_at = NULL WHERE id = ? AND status = 'pending'",
       ).run(request.jobs.length === 0 ? "complete" : "prepared", request.id);
+      this.#clearDistillFailure("trigger", request.id);
       this.#clearDistillLease();
       if (request.jobs.length === 0) {
         this.#enqueueCleanTaskInTransaction({
@@ -1559,9 +1725,18 @@ export class SQLiteMemoryStore {
 
   claimDistillJob(input: DistillClaimInput & { readonly id: string }): DistillJobClaim | undefined {
     this.#ensureOpen();
-    const { id, workerId, now, leaseMs } = fields(input, ["id", "workerId", "now", "leaseMs"]);
+    if (!isRecord(input)) throw new TypeError("Distill job claim input must be an object.");
+    const allowed = ["id", "workerId", "now", "leaseMs", "retryContext"];
+    if (Reflect.ownKeys(input).some(key => typeof key !== "string" || !allowed.includes(key)) ||
+      !["id", "workerId", "now", "leaseMs"].every(key => Object.hasOwn(input, key))) {
+      throw new TypeError("Distill job claim requires id, workerId, now, and leaseMs.");
+    }
+    const { id, workerId, now, leaseMs } = input;
     validateText(id, "consolidation job ID");
-    const request = parseDistillClaimInput({ workerId, now, leaseMs });
+    const request = parseDistillClaimInput({
+      workerId, now, leaseMs,
+      ...(Object.hasOwn(input, "retryContext") ? { retryContext: input["retryContext"] } : {}),
+    });
     return this.#transaction(() => this.#claimConsolidationJob(id, request, randomUUID()));
   }
 
@@ -1590,7 +1765,49 @@ export class SQLiteMemoryStore {
     const request = parseReleaseDistillClaimInput(input);
     return this.#transaction(() => {
       const lease = this.#readDistillLease();
-      if (lease.claimToken !== request.claimToken || lease.taskKind === null || lease.taskId === null) return false;
+      if (lease.claimToken !== request.claimToken || lease.taskKind === null || lease.taskId === null ||
+        lease.leaseUntil === null || lease.leaseUntil <= request.now) return false;
+      if (request.failure !== undefined) {
+        const kind = lease.taskKind;
+        const id = lease.taskId;
+        const row = kind === "job"
+          ? this.#database.prepare(`SELECT ${jobColumns} FROM consolidation_jobs WHERE id = ?`).get(id)
+          : this.#database.prepare(`SELECT ${triggerColumns} FROM distill_triggers WHERE id = ?`).get(id);
+        if (row === undefined) return false;
+        if (kind === "job") {
+          const current = parsePersistedJobRow(this.#decodeRow(row));
+          if (current.status !== "pending" || current.leaseOwner !== request.claimToken ||
+            current.leaseUntil === null || current.leaseUntil <= request.now) return false;
+        } else {
+          const current = this.#readDistillTrigger(this.#decodeRow(row));
+          if (current.status !== "pending" && current.status !== "candidate") return false;
+        }
+        const previous = this.#readDistillFailure(kind, id);
+        const failure = makeDistillFailureRecord({
+          kind,
+          id,
+          failure: request.failure,
+          ...(previous === undefined ? {} : { previous }),
+          now: request.now,
+        });
+        this.#persistDistillFailure(failure);
+        const retryCategory = failure.nextAttemptAt === null
+          ? null
+          : failure.reason === "transient" || failure.reason === "conflict" ? "transient"
+            : failure.reason === "model_invalid" || failure.reason === "model_budget" ? "invalid" : "unavailable";
+        if (kind === "job") {
+          this.#database.prepare(
+            "UPDATE consolidation_jobs SET lease_owner = NULL, lease_until = NULL, retry_category = ?, retry_at = ? " +
+            "WHERE id = ? AND status = 'pending' AND lease_owner = ?",
+          ).run(retryCategory, failure.nextAttemptAt, id, request.claimToken);
+        } else {
+          this.#database.prepare(
+            "UPDATE distill_triggers SET retry_category = ?, retry_at = ? WHERE id = ? AND status = 'pending'",
+          ).run(retryCategory, failure.nextAttemptAt, id);
+        }
+        this.#clearDistillLease();
+        return true;
+      }
       if (lease.taskKind === "job") {
         this.#database.prepare(
           "UPDATE consolidation_jobs SET lease_owner = NULL, lease_until = NULL, " +
@@ -1764,6 +1981,31 @@ export class SQLiteMemoryStore {
     return rows.map((row) => parsePersistedJobRow(this.#decodeRow(row)).job);
   }
 
+  listPendingConsolidationJobs(options: TaskSweepPageOptions): TaskSweepPage<ConsolidationJob> {
+    this.#ensureOpen();
+    const page = parseTaskSweepPageOptions(options);
+    const cursor = page.cursor ?? 0;
+    const throughCursor = this.#taskSweepThroughCursor("consolidation_jobs", page.throughCursor);
+    const rows = this.#database.prepare(
+      `SELECT rowid AS cursorRow, ${jobColumns} FROM consolidation_jobs ` +
+      "WHERE status = 'pending' AND rowid > ? AND rowid <= ? ORDER BY rowid LIMIT ?",
+    ).all(cursor, throughCursor, page.limit + 1);
+    const hasMore = rows.length > page.limit;
+    const visible = rows.slice(0, page.limit);
+    const items = visible.map(raw => {
+      const decoded = this.#decodeRow(raw);
+      const { cursorRow, ...jobRow } = decoded;
+      validateNow(cursorRow, "Stored pending consolidation job cursor");
+      const record = parsePersistedJobRow(jobRow);
+      if (record.status !== "pending") throw new TypeError("Pending consolidation job query returned a terminal job.");
+      return record.job;
+    });
+    const last = visible.at(-1);
+    const nextCursor = hasMore && last !== undefined ? this.#decodeRow(last)["cursorRow"] : undefined;
+    if (nextCursor !== undefined) validateNow(nextCursor, "Next pending consolidation job cursor");
+    return { items, throughCursor, ...(nextCursor === undefined ? {} : { nextCursor }) };
+  }
+
   claimConsolidation(id: string, owner: string, now: number, leaseMs: number): boolean {
     this.#ensureOpen();
     validateText(id, "consolidation job ID");
@@ -1894,6 +2136,7 @@ export class SQLiteMemoryStore {
         if (completion.changes !== 1) {
           throw new ConsolidationConflictError(request.jobId, "changed before completion");
         }
+        this.#clearDistillFailure("job", request.jobId);
         this.#finishConsolidationJob(current.job, request.owner);
         return false;
       }
@@ -1969,6 +2212,7 @@ export class SQLiteMemoryStore {
       if (completion.changes !== 1) {
         throw new ConsolidationConflictError(request.jobId, "changed before completion");
       }
+      this.#clearDistillFailure("job", request.jobId);
       this.#finishConsolidationJob(current.job, request.owner);
       return true;
     });
@@ -2062,14 +2306,15 @@ export class SQLiteMemoryStore {
   }
 
   /** Returns a bounded stable rowid page of uncaptured session observations. */
-  listObservedSessions(options: TaskPageOptions): TaskPage<SessionObservation> {
+  listObservedSessions(options: TaskSweepPageOptions): TaskSweepPage<SessionObservation> {
     this.#ensureOpen();
-    const page = parseTaskPageOptions(options, false);
+    const page = parseTaskSweepPageOptions(options);
     const cursor = page.cursor ?? 0;
+    const throughCursor = this.#taskSweepThroughCursor("session_observations", page.throughCursor);
     const rows = this.#database.prepare(
       `SELECT rowid AS cursorRow, ${observationColumns} FROM session_observations ` +
-      "WHERE captured = 0 AND rowid > ? ORDER BY rowid LIMIT ?",
-    ).all(cursor, page.limit + 1);
+      "WHERE captured = 0 AND rowid > ? AND rowid <= ? ORDER BY rowid LIMIT ?",
+    ).all(cursor, throughCursor, page.limit + 1);
     const hasMore = rows.length > page.limit;
     const visible = rows.slice(0, page.limit);
     const items = visible.map(raw => {
@@ -2081,18 +2326,19 @@ export class SQLiteMemoryStore {
     const last = visible.at(-1);
     const nextCursor = hasMore && last !== undefined ? this.#decodeRow(last)["cursorRow"] : undefined;
     if (nextCursor !== undefined) validateNow(nextCursor, "Next session observation cursor");
-    return { items, ...(nextCursor === undefined ? {} : { nextCursor }) };
+    return { items, throughCursor, ...(nextCursor === undefined ? {} : { nextCursor }) };
   }
 
   /** Startup recovery also covers a crash between the first file write and message_end. */
-  listUnobservedSessionUsages(options: TaskPageOptions): TaskPage<SessionUsage> {
-    const page = parseTaskPageOptions(options, false);
+  listUnobservedSessionUsages(options: TaskSweepPageOptions): TaskSweepPage<SessionUsage> {
+    const page = parseTaskSweepPageOptions(options);
+    const throughCursor = this.#taskSweepThroughCursor("session_usages", page.throughCursor);
     const rows = this.#database.prepare(
       `SELECT rowid AS cursorRow, ${sessionUsageColumns} FROM session_usages ` +
-      "WHERE rowid > ? AND NOT EXISTS (SELECT 1 FROM session_observations o WHERE o.session_id = session_usages.session_id) " +
+      "WHERE rowid > ? AND rowid <= ? AND NOT EXISTS (SELECT 1 FROM session_observations o WHERE o.session_id = session_usages.session_id) " +
       "AND NOT EXISTS (SELECT 1 FROM session_deletions d WHERE d.session_file = session_usages.session_file AND d.state = 'complete') " +
       "ORDER BY rowid LIMIT ?",
-    ).all(page.cursor ?? 0, page.limit + 1);
+    ).all(page.cursor ?? 0, throughCursor, page.limit + 1);
     const visible = rows.slice(0, page.limit);
     const items = visible.map(raw => {
       const {cursorRow, ...owner} = this.#decodeRow(raw);
@@ -2101,7 +2347,7 @@ export class SQLiteMemoryStore {
     });
     const nextCursor = rows.length > page.limit ? visible.at(-1)?.["cursorRow"] : undefined;
     if (nextCursor !== undefined) validateNow(nextCursor, "Next session usage cursor");
-    return {items, ...(nextCursor === undefined ? {} : {nextCursor})};
+    return {items, throughCursor, ...(nextCursor === undefined ? {} : {nextCursor})};
   }
 
   listSessionUsages(): readonly SessionUsage[] {
@@ -2323,14 +2569,18 @@ export class SQLiteMemoryStore {
       const trigger = this.#readDistillTrigger(this.#metadataPayload(row));
       if (trigger.status !== "complete" || trigger.jobIds.length > 0 || trigger.trigger.sessionFile === null ||
         !this.#metadataSourceEligible(trigger.trigger.sessionFile, trigger.trigger.sessionId)) return false;
-      return this.#database.prepare("DELETE FROM distill_triggers WHERE rowid = ?").run(rowId).changes === 1;
+      const removed = this.#database.prepare("DELETE FROM distill_triggers WHERE rowid = ?").run(rowId).changes === 1;
+      if (removed) this.#clearDistillFailure("trigger", trigger.trigger.id);
+      return removed;
     }
     if (phase === 3) {
       const job = parsePersistedJobRow(this.#metadataPayload(row));
       if (job.status !== "complete" || job.job.sessionFile === null ||
         this.#database.prepare("SELECT 1 AS present FROM distill_trigger_jobs WHERE job_id = ? LIMIT 1").get(job.job.id) !== undefined ||
         !this.#metadataSourceEligible(job.job.sessionFile, job.job.sessionId)) return false;
-      return this.#database.prepare("DELETE FROM consolidation_jobs WHERE rowid = ?").run(rowId).changes === 1;
+      const removed = this.#database.prepare("DELETE FROM consolidation_jobs WHERE rowid = ?").run(rowId).changes === 1;
+      if (removed) this.#clearDistillFailure("job", job.job.id);
+      return removed;
     }
     if (phase === 4) {
       const stored = parseStoredSessionObservation(this.#metadataPayload(row));
@@ -2545,7 +2795,7 @@ export class SQLiteMemoryStore {
   getDeletion(path: string): SessionDeletion | undefined {
     validateAbsolutePath(path, "Deletion path");
     const schemaVersion = this.#database.prepare("PRAGMA user_version").get()?.["user_version"];
-    const columns = schemaVersion === latestSchemaVersion
+    const columns = typeof schemaVersion === "number" && schemaVersion >= 7
       ? deletionColumns
       : [textColumn("session_file", "sessionFile"), textColumn("session_id", "sessionId"),
         textColumn("intent_id", "intentId"), textColumn("file_version", "fileVersion"),
@@ -2634,6 +2884,82 @@ export class SQLiteMemoryStore {
     const id = row["id"];
     validateText(id, "stored distill trigger ID");
     return parsePersistedDistillTrigger(row, this.#triggerJobIds(id));
+  }
+
+  #readDistillFailure(kind: DistillTaskKind, id: string): DistillFailureRecord | undefined {
+    const raw = this.#database.prepare(
+      `SELECT ${distillFailureColumns} FROM distill_failures WHERE task_kind = ? AND task_id = ?`,
+    ).get(kind, id);
+    if (raw === undefined) return undefined;
+    return this.#parseDistillFailureRow(raw);
+  }
+
+  #parseDistillFailureRow(value: unknown): DistillFailureRecord {
+    const row = this.#decodeRow(fields(value, [
+      "kind", "id", "reason", "sourceVersion", "modelKey", "policyVersion", "attempts", "nextAttemptAt",
+    ]));
+    return parseDistillFailureRecord({
+      kind: row["kind"],
+      id: row["id"],
+      reason: row["reason"],
+      context: {
+        sourceVersion: row["sourceVersion"],
+        modelKey: row["modelKey"],
+        policyVersion: row["policyVersion"],
+      },
+      attempts: row["attempts"],
+      nextAttemptAt: row["nextAttemptAt"],
+    });
+  }
+
+  #taskSweepThroughCursor(
+    table: "distill_triggers" | "consolidation_jobs" | "session_observations" | "session_usages",
+    requested: number | undefined,
+  ): number {
+    if (requested !== undefined) return requested;
+    const row = this.#database.prepare(`SELECT COALESCE(MAX(rowid), 0) AS throughCursor FROM ${table}`).get();
+    if (row === undefined) throw new Error("Task sweep upper cursor could not be read.");
+    const throughCursor = row["throughCursor"];
+    validateNow(throughCursor, "Stored task sweep upper cursor");
+    return throughCursor;
+  }
+
+  #distillTaskCanAttempt(
+    kind: DistillTaskKind,
+    id: string,
+    context: DistillRetryContext | undefined,
+    now: number,
+    retryAt: number | null,
+  ): boolean {
+    const failure = this.#readDistillFailure(kind, id);
+    if (failure !== undefined) return canRetryDistillFailure(failure, context, now);
+    return retryAt === null || retryAt <= now;
+  }
+
+  #persistDistillFailure(value: DistillFailureRecord): void {
+    const failure = parseDistillFailureRecord(value);
+    this.#database.prepare(
+      "INSERT INTO distill_failures " +
+      "(task_kind, task_id, reason, source_version, model_key, policy_version, attempts, next_attempt_at) " +
+      "VALUES (?, ?, ?, ?, ?, ?, ?, ?) " +
+      "ON CONFLICT(task_kind, task_id) DO UPDATE SET reason = excluded.reason, " +
+      "source_version = excluded.source_version, model_key = excluded.model_key, " +
+      "policy_version = excluded.policy_version, attempts = excluded.attempts, " +
+      "next_attempt_at = excluded.next_attempt_at",
+    ).run(
+      failure.kind,
+      failure.id,
+      failure.reason,
+      failure.context.sourceVersion,
+      failure.context.modelKey,
+      failure.context.policyVersion,
+      failure.attempts,
+      failure.nextAttemptAt,
+    );
+  }
+
+  #clearDistillFailure(kind: DistillTaskKind, id: string): void {
+    this.#database.prepare("DELETE FROM distill_failures WHERE task_kind = ? AND task_id = ?").run(kind, id);
   }
 
   #distillTriggerItem(record: PersistedDistillTrigger): DistillTrigger {
@@ -2783,7 +3109,8 @@ export class SQLiteMemoryStore {
     const row = this.#database.prepare(`SELECT ${jobColumns} FROM consolidation_jobs WHERE id = ?`).get(id);
     if (row === undefined) return undefined;
     const current = parsePersistedJobRow(this.#decodeRow(row));
-    if (current.status !== "pending" || (current.retryAt !== null && current.retryAt > request.now)) return undefined;
+    if (current.status !== "pending" ||
+      !this.#distillTaskCanAttempt("job", id, request.retryContext, request.now, current.retryAt)) return undefined;
     if (current.leaseUntil !== null && current.leaseUntil > request.now) return undefined;
     const earlierPending = this.#database.prepare(
       "SELECT 1 FROM consolidation_jobs AS earlier " +
@@ -2922,7 +3249,7 @@ export class SQLiteMemoryStore {
 
   #initializeSchema(): void {
     const version = this.#database.prepare("PRAGMA user_version").get()?.["user_version"];
-    if (version !== 0 && version !== 1 && version !== 2 && version !== 3 && version !== 4 && version !== 5 && version !== 6 && version !== latestSchemaVersion) {
+    if (version !== 0 && version !== 1 && version !== 2 && version !== 3 && version !== 4 && version !== 5 && version !== 6 && version !== 7 && version !== latestSchemaVersion) {
       throw new Error("Unsupported memory database schema version: " + String(version) + ".");
     }
     if (version === latestSchemaVersion) {
@@ -2996,7 +3323,7 @@ export class SQLiteMemoryStore {
       this.#validateSchema(true, true);
       this.#validateAllRows(true, true);
     }
-    if (version !== 4 && version !== 5 && version !== 6) this.#migrateV3ToV4();
+    if (version <= 3) this.#migrateV3ToV4();
     if (version < 5) {
       this.#validateSchema(true);
       this.#validateAllRows();
@@ -3017,7 +3344,8 @@ export class SQLiteMemoryStore {
       this.#validateAllRows();
       initializeSourceRegistry(this.#database);
     }
-    this.#migrateV6ToV7();
+    if (version <= 6) this.#migrateV6ToV7();
+    this.#migrateV7ToV8();
     this.#validateLatestSchema();
     this.#validateAllRows();
     this.#sourceAccess();
@@ -3108,6 +3436,14 @@ export class SQLiteMemoryStore {
     );
   }
 
+  #migrateV7ToV8(): void {
+    const currentVersion = this.#database.prepare("PRAGMA user_version").get()?.["user_version"];
+    if (currentVersion !== 7) throw new Error("Memory schema migration expected version 7.");
+    this.#validateSchema(true);
+    this.#validateAllRows();
+    this.#database.exec(`${distillFailuresSchema}; PRAGMA user_version = 8`);
+  }
+
   #migrateV3ToV4(): void {
     const currentVersion = this.#database.prepare("PRAGMA user_version").get()?.["user_version"];
     if (currentVersion !== 3) throw new Error("Memory schema migration expected version 3.");
@@ -3151,7 +3487,8 @@ export class SQLiteMemoryStore {
       `SELECT ${schemaColumns} FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*'`,
     ).all().map((row) => this.#decodeRow(row));
     const schemaVersion = this.#database.prepare("PRAGMA user_version").get()?.["user_version"];
-    const usesV7Metadata = schemaVersion === latestSchemaVersion;
+    const usesV7Metadata = typeof schemaVersion === "number" && schemaVersion >= 7;
+    const usesV8Metadata = schemaVersion === 8;
     const schemas = new Map<string, { readonly sql: string; readonly columns: readonly SchemaColumn[] }>([
       ["memories", {
         sql: currentSchema,
@@ -3310,7 +3647,7 @@ export class SQLiteMemoryStore {
       ] });
     }
     const additional = typeof schemaVersion === "number" && schemaVersion >= 6
-      ? [...SOURCE_REGISTRY_SCHEMAS, ...(usesV7Metadata ? storeSchemasV7 : storeSchemas)]
+      ? [...SOURCE_REGISTRY_SCHEMAS, ...(usesV8Metadata ? storeSchemasV8 : usesV7Metadata ? storeSchemasV7 : storeSchemas)]
       : [];
     const extraSchemas = new Map(additional.map(schema => [schema.name, schema.sql]));
     if (objects.length !== schemas.size + extraSchemas.size) throw new Error("Unsupported memory database schema.");
@@ -3369,7 +3706,7 @@ export class SQLiteMemoryStore {
   #validateAllRows(includeSessionUsages = true, useLegacyJobColumns = false): void {
     this.#validateMemoryRows();
     const schemaVersion = this.#database.prepare("PRAGMA user_version").get()?.["user_version"];
-    const usesV7Metadata = schemaVersion === latestSchemaVersion;
+    const usesV7Metadata = typeof schemaVersion === "number" && schemaVersion >= 7;
     const jobs = this.#database.prepare(
       `SELECT ${useLegacyJobColumns ? legacyJobColumns : jobColumns} FROM consolidation_jobs`,
     ).all().map((row) => parsePersistedJobRow(this.#decodeRow(row)));
@@ -3433,6 +3770,17 @@ export class SQLiteMemoryStore {
             }
           }
         }
+        if (schemaVersion === 8) {
+          for (const raw of this.#database.prepare(`SELECT ${distillFailureColumns} FROM distill_failures`).iterate()) {
+            const failure = this.#parseDistillFailureRow(raw);
+            const status = failure.kind === "job"
+              ? jobsById.get(failure.id)?.status
+              : triggers.get(failure.id)?.status;
+            if (status !== "pending" && !(failure.kind === "trigger" && status === "candidate")) {
+              throw new TypeError("Stored distill failure does not match pending work.");
+            }
+          }
+        }
         for (const raw of this.#database.prepare(
           `SELECT ${textColumn("id")}, ${textColumn("trigger_id", "triggerId")}, ` +
           `${textColumn("job_id", "jobId")} ` +
@@ -3460,7 +3808,7 @@ export class SQLiteMemoryStore {
             ) throw new TypeError("Stored global distill lease does not match its consolidation job.");
           } else {
             const leasedTrigger = triggers.get(globalLease.taskId);
-            if (leasedTrigger === undefined || leasedTrigger.status !== "pending") {
+            if (leasedTrigger === undefined || (leasedTrigger.status !== "pending" && leasedTrigger.status !== "candidate")) {
               throw new TypeError("Stored global distill lease does not match its trigger.");
             }
           }

@@ -144,9 +144,9 @@ test('a transient source-read failure during startup recovery retries without re
  const f=await fixture(t,async()=>({creates:[],updates:[],deletes:[]}));
  const db=new SQLiteMemoryStore(f.path);db.observeSession({sessionId:'closed',sessionFile:join(f.root,'closed.jsonl'),cwd:f.root,leafId:'a',ownerPid:2147483647});db.close();
  const closed={...f.s,sessionId:'closed',sessionFile:join(f.root,'closed.jsonl')};
- let loads=0,calls=0;
- const c=new ConsolidationCoordinator({openStore:()=>new SQLiteMemoryStore(f.path),loadSnapshot:async()=>{loads++;if(loads===1)throw new Error('transient read');return closed;},runModel:async()=>{calls++;return {creates:[],updates:[],deletes:[]};},retryDelayMs:10});
- await c.start(f.ctx);
+ let loads=0,calls=0,now=Date.now();
+ const c=new ConsolidationCoordinator({openStore:()=>new SQLiteMemoryStore(f.path),loadSnapshot:async()=>{loads++;if(loads===1)throw new Error('transient read');return closed;},runModel:async()=>{calls++;return {creates:[],updates:[],deletes:[]};},retryDelayMs:10,now:()=>now});
+ await c.start(f.ctx);await c.whenIdle();assert.equal(calls,0);now+=30000;
  for(let i=0;i<30&&calls===0;i++)await new Promise(resolve=>setTimeout(resolve,10));
  await c.shutdown(f.ctx,'reload');assert.equal(calls,1);assert.ok(loads>=2);
 });
@@ -170,7 +170,7 @@ test('recovery uses the observed branch checkpoint instead of the last appended 
  const f=await fixture(t,async()=>({creates:[],updates:[],deletes:[]}));
  const db=new SQLiteMemoryStore(f.path);db.observeSession({sessionId:'closed',sessionFile:join(f.root,'closed.jsonl'),cwd:f.root,leafId:'a',ownerPid:2147483647});db.close();
  const closed={...f.s,sessionId:'closed',sessionFile:join(f.root,'closed.jsonl')};let calls=0;
- const c=new ConsolidationCoordinator({openStore:()=>new SQLiteMemoryStore(f.path),loadSnapshot:async(_path,leaf)=>{assert.equal(leaf,'a');return closed;},runModel:async()=>{calls++;return {creates:[],updates:[],deletes:[]};},retryDelayMs:100000});
+ const c=new ConsolidationCoordinator({openStore:()=>new SQLiteMemoryStore(f.path),loadSnapshot:async(_path,leaf)=>{if(leaf!==undefined)assert.equal(leaf,'a');return closed;},runModel:async()=>{calls++;return {creates:[],updates:[],deletes:[]};},retryDelayMs:100000});
  await c.start(f.ctx);await c.whenIdle();await c.shutdown(f.ctx,'reload');assert.equal(calls,1);
 });
 test('startup source recovery bounds each background pass and continues fairly',async t=>{

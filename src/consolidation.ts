@@ -3,9 +3,12 @@ import { createHash, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import type { SQLiteMemoryStore } from "./memory-store.js";
+import { MemoryConflictError, ConsolidationConflictError, type SQLiteMemoryStore } from "./memory-store.ts";
+import { DistillFailure } from "./distill-failure.ts";
+import { distillRetryContext } from "./distill-retry-context.ts";
+import type { DistillRetryContext } from "./distill-retry.js";
 import type { ConsolidationJob, SessionObservation, SourceBatch, SourcePart } from "./consolidation-types.js";
-import type { DistillTrigger, DistillTriggerInput, RetryCategory } from "./task-types.js";
+import type { DistillTrigger, DistillTriggerInput } from "./task-types.js";
 import {
   findCompactionRecord,
   isValidSourceSnapshot,
@@ -29,6 +32,7 @@ interface Options {
   readonly retryDelayMs?: number;
   readonly claimLeaseMs?: number;
   readonly onProgress?: () => void;
+  readonly now?: () => number;
 }
 
 interface SourceReference {
@@ -84,10 +88,16 @@ export class ConsolidationCoordinator {
   #recoveryNeeded = false;
   #lastObservation: string | undefined;
   #triggerCursor = 0;
+  #triggerSweepEnd: number | undefined;
   #observationCursor = 0;
+  #observationSweepEnd: number | undefined;
   #unobservedCursor = 0;
+  #unobservedSweepEnd: number | undefined;
   #pendingTriggerCursor = 0;
-  #lastJob: string | undefined;
+  #jobCursor = 0;
+  #jobSweepEnd: number | undefined;
+  #preparationCursor = 0;
+  #preparationSweepEnd: number | undefined;
 
   constructor(options: Options) { this.#options = options; }
 
@@ -224,14 +234,19 @@ export class ConsolidationCoordinator {
       try {
         this.#activeClaim.store.releaseDistillClaim({
           claimToken: this.#activeClaim.token,
-          now: Date.now(),
-          retry: { category: "transient", retryAt: Date.now() },
+          now: this.#now(),
         });
       } catch { /* The database lease remains the crash-recovery fence. */ }
       this.#activeClaim = undefined;
     }
     this.#store?.close();
     this.#store = undefined;
+  }
+
+  #now(): number { return this.#options.now?.() ?? Date.now(); }
+
+  #retryContext(path: string, context = this.#context): Promise<DistillRetryContext> {
+    return withSourceAccess(this.#options.openStore, async () => distillRetryContext(path, context?.model), this.#controller?.signal);
   }
 
   #database(): SQLiteMemoryStore { return this.#store ??= this.#options.openStore(); }
@@ -331,7 +346,7 @@ export class ConsolidationCoordinator {
       try {
         const renewed = store.renewDistillClaim({
           claimToken: token,
-          now: Date.now(),
+          now: this.#now(),
           leaseMs: this.#options.claimLeaseMs ?? DEFAULT_CLAIM_LEASE_MS,
         });
         if (!renewed) this.#controller?.abort(new Error("The durable consolidation claim was fenced."));
@@ -363,7 +378,7 @@ export class ConsolidationCoordinator {
     try {
       if (this.#options.hasStore && !this.#options.hasStore() && !this.#store) return false;
       const store = this.#database();
-      return store.listConsolidationJobs().length > 0 || this.#hasPendingTriggers(store);
+      return store.listPendingConsolidationJobs({ limit: 1 }).items.length > 0 || this.#hasPendingTriggers(store);
     } catch { return true; }
   }
 
@@ -436,21 +451,26 @@ export class ConsolidationCoordinator {
     if (signal.aborted || !this.#canRun(context)) return;
 
     const store = this.#database();
-    const jobs = rotateJobs(store.listConsolidationJobs(), this.#lastJob);
+    const page = store.listPendingConsolidationJobs({ limit: PENDING_SCAN_PAGE_SIZE,
+      ...(this.#jobSweepEnd === undefined ? {} : { throughCursor: this.#jobSweepEnd }),
+      ...(this.#jobCursor === 0 ? {} : { cursor: this.#jobCursor }) });
+    this.#jobCursor = page.nextCursor ?? 0;
+    this.#jobSweepEnd = page.nextCursor === undefined ? undefined : page.throughCursor;
     let batches = 0;
-    for (const job of jobs) {
+    for (const job of page.items) {
       if (signal.aborted || batches >= MAX_MODEL_BATCHES_PER_PASS || !this.#canRun(context)) break;
+      const retryContext = await this.#retryContext(job.sessionFile ?? "", context);
       const claim = store.claimDistillJob({
+        retryContext,
         id: job.id,
         workerId: this.#workerId,
-        now: Date.now(),
+        now: this.#now(),
         leaseMs: this.#options.claimLeaseMs ?? DEFAULT_CLAIM_LEASE_MS,
       });
       if (!claim) continue;
       batches++;
-      this.#lastJob = job.id;
       this.#startClaim(store, claim.claimToken);
-      await this.#processJob(claim.job, claim.claimToken, context, signal, store);
+      await this.#processJob(claim.job, claim.claimToken, context, signal, store, retryContext);
       this.#finishClaim();
     }
   }
@@ -460,47 +480,57 @@ export class ConsolidationCoordinator {
     let unresolved = false;
     const triggerPage = store.listDistillTriggers({
       limit: MAX_RECOVERY_ITEMS_PER_PASS,
+      ...(this.#triggerSweepEnd === undefined ? {} : { throughCursor: this.#triggerSweepEnd }),
       ...(this.#triggerCursor === 0 ? {} : { cursor: this.#triggerCursor }),
     });
     for (const trigger of triggerPage.items) {
       if (signal.aborted) return;
       if (trigger.status !== "candidate") continue;
+      const retryContext = await this.#retryContext(trigger.sessionFile);
+      const claim = store.claimDistillTrigger({ id: trigger.id, allowCandidate: true, retryContext,
+        workerId: this.#workerId, now: this.#now(), leaseMs: this.#options.claimLeaseMs ?? DEFAULT_CLAIM_LEASE_MS });
+      if (!claim) { unresolved = true; continue; }
+      this.#startClaim(store, claim.claimToken);
       try {
         const compactionRecordId = await withSourceAccess(this.#options.openStore, () =>
           (this.#options.loadCompactionRecord ?? findCompactionRecord)(trigger.sessionFile, trigger.sessionId, trigger.cwd, trigger.leafId), signal);
-        if (signal.aborted) return;
-        if (compactionRecordId) store.confirmCompactionTrigger({ id: trigger.id, compactionRecordId });
-        else unresolved = true;
-      } catch { unresolved = true; }
+        signal.throwIfAborted();
+        if (!compactionRecordId) throw new DistillFailure("source_invalid", "A persisted compaction record is not available yet.");
+        store.confirmCompactionTrigger({ id: trigger.id, compactionRecordId });
+        store.releaseDistillClaim({ claimToken: claim.claimToken, now: this.#now() });
+      } catch (error) {
+        unresolved = true;
+        this.#releaseClaim(store, claim.claimToken, error, retryContext, signal);
+      } finally { this.#finishClaim(); }
+
     }
     this.#triggerCursor = triggerPage.nextCursor ?? 0;
+    this.#triggerSweepEnd = triggerPage.nextCursor === undefined ? undefined : triggerPage.throughCursor;
     if (this.#triggerCursor !== 0) unresolved = true;
 
     const unobserved = store.listUnobservedSessionUsages({
       limit: MAX_OBSERVATIONS_PER_PASS,
+      ...(this.#unobservedSweepEnd === undefined ? {} : { throughCursor: this.#unobservedSweepEnd }),
       ...(this.#unobservedCursor === 0 ? {} : { cursor: this.#unobservedCursor }),
     });
     for (const owner of unobserved.items) {
       if (signal.aborted) return;
       if (alive(owner.ownerPid) || !existsSync(owner.sessionFile)) continue;
       try {
-        await withSourceAccess(this.#options.openStore, async () => {
-          const source = await (this.#options.loadSnapshot ?? loadSnapshot)(owner.sessionFile);
-          if (signal.aborted) return;
-          if (!isValidSourceSnapshot(source) || source.sessionId !== owner.sessionId || source.cwd !== owner.cwd) {
-            throw new Error("Unobserved crash source is unavailable.");
-          }
-          // Publish the recovered boundary before releasing its source protection.
-          store.observeSession({ sessionId: owner.sessionId, sessionFile: owner.sessionFile,
-            cwd: owner.cwd, leafId: source.leafId, ownerPid: owner.ownerPid });
-        }, signal);
+        // Preserve the known boundary first. The observation recovery below owns
+        // the fenced, retry-controlled read of any tail persisted before a crash.
+        store.observeSession({ sessionId: owner.sessionId, sessionFile: owner.sessionFile,
+          cwd: owner.cwd, leafId: owner.leafId, ownerPid: owner.ownerPid });
       } catch { unresolved = true; }
+
     }
     this.#unobservedCursor = unobserved.nextCursor ?? 0;
+    this.#unobservedSweepEnd = unobserved.nextCursor === undefined ? undefined : unobserved.throughCursor;
     if (this.#unobservedCursor !== 0) unresolved = true;
 
     const observationPage = store.listObservedSessions({
       limit: MAX_OBSERVATIONS_PER_PASS,
+      ...(this.#observationSweepEnd === undefined ? {} : { throughCursor: this.#observationSweepEnd }),
       ...(this.#observationCursor === 0 ? {} : { cursor: this.#observationCursor }),
     });
     const observations = rotateObservations(observationPage.items, this.#lastObservation);
@@ -508,29 +538,51 @@ export class ConsolidationCoordinator {
       if (signal.aborted) return;
       this.#lastObservation = observation.sessionId;
       if (alive(observation.ownerPid) || !observation.sessionFile) continue;
+      const source: SourceReference = {
+        sessionId: observation.sessionId, sessionFile: observation.sessionFile,
+        cwd: observation.cwd, leafId: observation.leafId,
+      };
+      let id = closeTriggerId(source);
+      store.enqueueDistillTrigger(this.#triggerInput(source, "close", id));
+      // A prior compact/close may already have prepared this exact boundary.
+      // Recovery still must inspect the possible crash tail before acknowledging it.
+      const original = store.readDistillTrigger(id);
+      if (original?.status === "prepared" || original?.status === "complete") {
+        id += "-recovery";
+        store.enqueueDistillTrigger(this.#triggerInput(source, "close", id));
+      }
+      const retryContext = await this.#retryContext(source.sessionFile);
+      const claim = store.claimDistillTrigger({ id, retryContext, workerId: this.#workerId,
+        now: this.#now(), leaseMs: this.#options.claimLeaseMs ?? DEFAULT_CLAIM_LEASE_MS });
+      if (!claim) { unresolved = true; continue; }
+      this.#startClaim(store, claim.claimToken);
       try {
-        const source: SourceReference = {
-          sessionId: observation.sessionId,
-          sessionFile: observation.sessionFile,
-          cwd: observation.cwd,
-          leafId: observation.leafId,
-        };
-        store.enqueueDistillTrigger(this.#triggerInput(source, "close", closeTriggerId(source)));
-        const latest = await this.#load(observation.sessionFile);
-        if (signal.aborted) return;
+        const latest = await this.#load(source.sessionFile);
+        signal.throwIfAborted();
         if (!isValidSourceSnapshot(latest) || latest.sessionId !== source.sessionId || latest.cwd !== source.cwd) {
-          throw new Error("Crash recovery source identity or coverage is unavailable.");
+          throw new DistillFailure("source_invalid", "Crash recovery source identity or coverage is unavailable.");
         }
-        // Preserve the recorded boundary and any subsequently persisted tail.
         if (latest.leafId !== source.leafId) {
           const tail = { ...source, leafId: latest.leafId };
           store.enqueueDistillTrigger(this.#triggerInput(tail, "close", closeTriggerId(tail)));
         }
         store.acknowledgeObservation(observation.sessionId, observation.leafId);
-      } catch { unresolved = true; }
+        if (source.leafId === null) {
+          // The recorded pre-message boundary contains no evidence. Its recovered
+          // tail is durable above before this empty boundary can enable cleanup.
+          store.prepareDistillTrigger({ id, claimToken: claim.claimToken, now: this.#now(), jobs: [] });
+        } else {
+          store.releaseDistillClaim({ claimToken: claim.claimToken, now: this.#now() });
+        }
+      } catch (error) {
+        unresolved = true;
+        this.#releaseClaim(store, claim.claimToken, error, retryContext, signal);
+      } finally { this.#finishClaim(); }
+
     }
 
     this.#observationCursor = observationPage.nextCursor ?? 0;
+    this.#observationSweepEnd = observationPage.nextCursor === undefined ? undefined : observationPage.throughCursor;
     if (this.#observationCursor !== 0) unresolved = true;
     this.#recoveryNeeded = unresolved || this.#triggerCursor !== 0 || this.#observationCursor !== 0;
   }
@@ -538,42 +590,51 @@ export class ConsolidationCoordinator {
   async #prepareOneTrigger(signal: AbortSignal): Promise<boolean> {
     if (signal.aborted || !this.#canRun(this.#context)) return false;
     const store = this.#database();
-    const claim = store.claimDistillTrigger({
-      workerId: this.#workerId,
-      now: Date.now(),
-      leaseMs: this.#options.claimLeaseMs ?? DEFAULT_CLAIM_LEASE_MS,
-    });
-    if (!claim) return false;
-    this.#startClaim(store, claim.claimToken);
-    try {
-      const trigger = claim.trigger;
-      const snapshot = await this.#load(trigger.sessionFile, trigger.leafId);
-      assertSnapshotMatches(snapshot, trigger);
-      if (!isValidSourceSnapshot(snapshot)) throw new Error("The frozen source boundary failed validation or exceeds its bounded preparation budget.");
-      const jobs = this.#prepareJobs(snapshot, trigger, store);
-      store.prepareDistillTrigger({
-        id: trigger.id,
-        claimToken: claim.claimToken,
-        now: Date.now(),
-        jobs,
+    const page = store.listDistillTriggers({ limit: PENDING_SCAN_PAGE_SIZE,
+      ...(this.#preparationSweepEnd === undefined ? {} : { throughCursor: this.#preparationSweepEnd }),
+      ...(this.#preparationCursor === 0 ? {} : { cursor: this.#preparationCursor }) });
+    this.#preparationCursor = page.nextCursor ?? 0;
+    this.#preparationSweepEnd = page.nextCursor === undefined ? undefined : page.throughCursor;
+    for (const candidate of page.items) {
+      if (signal.aborted || !this.#canRun(this.#context)) return false;
+      if (candidate.status !== "pending") continue;
+      const retryContext = await this.#retryContext(candidate.sessionFile);
+      const claim = store.claimDistillTrigger({
+        id: candidate.id, retryContext,
+        workerId: this.#workerId,
+        now: this.#now(),
+        leaseMs: this.#options.claimLeaseMs ?? DEFAULT_CLAIM_LEASE_MS,
       });
-      if (jobs.length === 0) this.#notifyProgress();
-      return true;
-    } catch (error) {
-      const retryAt = error instanceof PendingSourceOverlapError
-        ? Date.now()
-        : Date.now() + (this.#options.retryDelayMs ?? 30_000);
-      this.#releaseClaim(store, claim.claimToken, "transient", retryAt);
-      this.#recoveryNeeded = true;
-      return true;
-    } finally {
-      this.#finishClaim();
+      if (!claim) continue;
+      this.#startClaim(store, claim.claimToken);
+      try {
+        const trigger = claim.trigger;
+        const snapshot = await this.#load(trigger.sessionFile, trigger.leafId);
+        assertSnapshotMatches(snapshot, trigger);
+        if (!isValidSourceSnapshot(snapshot)) throw new DistillFailure("source_invalid", "The frozen source boundary failed validation or exceeds its bounded preparation budget.");
+        const jobs = this.#prepareJobs(snapshot, trigger, store);
+        store.prepareDistillTrigger({
+          id: trigger.id,
+          claimToken: claim.claimToken,
+          now: this.#now(),
+          jobs,
+        });
+        if (jobs.length === 0) this.#notifyProgress();
+        return true;
+      } catch (error) {
+        this.#releaseClaim(store, claim.claimToken, error, retryContext, signal);
+        this.#recoveryNeeded = true;
+        return true;
+      } finally {
+        this.#finishClaim();
+      }
     }
+    return false;
   }
 
   #prepareJobs(snapshot: SourceSnapshot, trigger: DistillTrigger, store: SQLiteMemoryStore): ConsolidationJob[] {
     if (snapshot.pending || snapshot.ancestry?.unresolved) {
-      throw new Error(snapshot.pendingReason ?? "The source branch is not fully available.");
+      throw new DistillFailure("source_invalid", snapshot.pendingReason ?? "The source branch is not fully available.");
     }
     const all = planSources(snapshot, new Set());
     const allKeys = all.flatMap(batch => [...batch.sourceKeys]);
@@ -627,25 +688,26 @@ export class ConsolidationCoordinator {
     context: Context,
     signal: AbortSignal,
     store: SQLiteMemoryStore,
+    retryContext: DistillRetryContext,
   ): Promise<void> {
     try {
       const processed = new Set(store.processedSources(job.sourceKeys));
       const sourceKeys = job.sourceKeys.filter(key => !processed.has(key));
       if (sourceKeys.length === 0) {
-        store.commitConsolidation({ jobId: job.id, owner: claimToken, now: Date.now(), sourceKeys, creates: [], updates: [], deletes: [] });
+        store.commitConsolidation({ jobId: job.id, owner: claimToken, now: this.#now(), sourceKeys, creates: [], updates: [], deletes: [] });
         this.#notifyProgress();
         return;
       }
       const sourceFile = job.sessionFile;
-      if (typeof sourceFile !== "string" || sourceFile.length === 0) throw new Error("A durable source file is unavailable.");
+      if (typeof sourceFile !== "string" || sourceFile.length === 0) throw new DistillFailure("source_invalid", "A durable source file is unavailable.");
       const snapshot = await this.#load(sourceFile, job.leafId);
       assertSnapshotMatches(snapshot, job);
-      if (!isValidSourceSnapshot(snapshot)) throw new Error("The frozen source boundary failed validation or exceeds its bounded preparation budget.");
+      if (!isValidSourceSnapshot(snapshot)) throw new DistillFailure("source_invalid", "The frozen source boundary failed validation or exceeds its bounded preparation budget.");
       const all = planSources(snapshot, new Set());
       const parts = new Map(all.flatMap(batch => batch.evidence).map(part => [part.key, part]));
       const evidence = sourceKeys.map(key => {
         const part = parts.get(key);
-        if (!part) throw new Error("A frozen source reference changed after preparation.");
+        if (!part) throw new DistillFailure("source_invalid", "A frozen source reference changed after preparation.");
         return part;
       });
       const currentParts = [...parts.values()];
@@ -676,19 +738,26 @@ export class ConsolidationCoordinator {
         signal,
       );
       signal.throwIfAborted();
-      store.commitConsolidation({ ...changes, jobId: job.id, owner: claimToken, now: Date.now(), sourceKeys });
+      store.commitConsolidation({ ...changes, jobId: job.id, owner: claimToken, now: this.#now(), sourceKeys });
       this.#notifyProgress();
-    } catch {
-      if (!this.#closed) this.#releaseClaim(store, claimToken, "transient");
+    } catch (error) {
+      if (!this.#closed) this.#releaseClaim(store, claimToken, error, retryContext, signal);
     }
   }
 
-  #releaseClaim(store: SQLiteMemoryStore, claimToken: string, category: RetryCategory, retryAt?: number): void {
+  #releaseClaim(store: SQLiteMemoryStore, claimToken: string, error: unknown,
+    context: DistillRetryContext, signal: AbortSignal): void {
     try {
       store.releaseDistillClaim({
         claimToken,
-        now: Date.now(),
-        retry: { category, retryAt: retryAt ?? Date.now() + (this.#options.retryDelayMs ?? 30_000) },
+        now: this.#now(),
+        ...(signal.aborted ? {} : { failure: {
+          reason: error instanceof DistillFailure ? error.reason
+            : error instanceof MemoryConflictError || error instanceof ConsolidationConflictError || error instanceof PendingSourceOverlapError
+              ? "conflict" as const : "transient" as const,
+          context,
+          ...(error instanceof DistillFailure && error.retryAfterMs !== undefined ? { retryAfterMs: error.retryAfterMs } : {}),
+        } }),
       });
     } catch { /* Expiring the lease is the final recovery path. */ }
   }
@@ -696,12 +765,6 @@ export class ConsolidationCoordinator {
   #notifyProgress(): void {
     try { this.#options.onProgress?.(); } catch { /* Cleanup wake failures must not block consolidation. */ }
   }
-}
-
-function rotateJobs(jobs: readonly ConsolidationJob[], last: string | undefined): ConsolidationJob[] {
-  if (!last) return [...jobs];
-  const index = jobs.findIndex(job => job.id === last);
-  return index < 0 ? [...jobs] : [...jobs.slice(index + 1), ...jobs.slice(0, index + 1)];
 }
 
 function rotateObservations(observations: readonly SessionObservation[], last: string | undefined): SessionObservation[] {
@@ -718,14 +781,14 @@ function closeTriggerId(source: SourceReference): string {
 
 function assertSnapshotMatches(snapshot: SourceSnapshot, reference: Pick<DistillTrigger, "sessionId" | "sessionFile" | "leafId" | "cwd"> | ConsolidationJob): void {
   if (snapshot.pending || snapshot.ancestry?.unresolved) {
-    throw new Error(snapshot.pendingReason ?? "The source branch is not fully available.");
+    throw new DistillFailure("source_invalid", snapshot.pendingReason ?? "The source branch is not fully available.");
   }
   if (snapshot.sessionId !== reference.sessionId || snapshot.cwd !== reference.cwd || snapshot.leafId !== reference.leafId) {
-    throw new Error("The original source boundary is unavailable or changed.");
+    throw new DistillFailure("source_invalid", "The original source boundary is unavailable or changed.");
   }
   if (typeof reference.sessionFile !== "string" || snapshot.sessionFile === null ||
     resolve(snapshot.sessionFile) !== resolve(reference.sessionFile)) {
-    throw new Error("The persisted source file identity changed.");
+    throw new DistillFailure("source_invalid", "The persisted source file identity changed.");
   }
 }
 

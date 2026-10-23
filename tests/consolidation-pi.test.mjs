@@ -9,6 +9,13 @@ for(const mode of ['compact','auto','quit','new','resume','fork','reload','updat
  });
 }
 
+test('real Pi SDK model selection wakes a failed distillation and retries with the new model',()=>{
+ const result=spawnSync(process.execPath,['tests/consolidation-pi-child.mjs','modeltwo'],{encoding:'utf8',timeout:20000});
+ assert.ifError(result.error);assert.equal(result.status,0,result.stderr||result.stdout);
+ const report=JSON.parse(result.stdout.trim().split('\n').at(-1));
+ assert.equal(report.passed,true);assert.deepEqual(report.extractionModels,['synthetic','modeltwo']);
+});
+
 test('real Pi SDK runtime teardown fences a late background model reply',()=>{
  const result=spawnSync(process.execPath,['tests/consolidation-pi-child.mjs','late-reply'],{encoding:'utf8',timeout:20000});
  assert.ifError(result.error);assert.equal(result.status,0,result.stderr||result.stdout);

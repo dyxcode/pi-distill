@@ -1,4 +1,5 @@
 import type { ConsolidationJob } from "./consolidation-types.js";
+import type { DistillFailureInput, DistillFailureRecord, DistillRetryContext, DistillTaskKind } from "./distill-retry.js";
 
 export type DistillTriggerReason = "close" | "compact";
 export type DistillTriggerStatus = "candidate" | "pending" | "prepared" | "complete";
@@ -35,10 +36,26 @@ export interface TaskPage<T> {
   readonly nextCursor?: number;
 }
 
+export interface TaskSweepPageOptions extends TaskPageOptions {
+  readonly throughCursor?: number;
+}
+
+export interface TaskSweepPage<T> extends TaskPage<T> {
+  readonly throughCursor: number;
+}
+
 export interface DistillClaimInput {
   readonly workerId: string;
   readonly now: number;
   readonly leaseMs: number;
+  readonly retryContext?: DistillRetryContext;
+}
+
+export interface DistillTriggerClaimInput extends DistillClaimInput {
+  /** Restrict this claim to one source so its version can be checked accurately. */
+  readonly id?: string;
+  /** Allow recovery code to claim an unconfirmed compaction candidate by ID. */
+  readonly allowCandidate?: boolean;
 }
 
 export interface DistillTriggerClaim {
@@ -64,7 +81,11 @@ export interface ReleaseDistillClaimInput {
   readonly claimToken: string;
   readonly now: number;
   readonly retry?: RetryRequest;
+  readonly failure?: DistillFailureInput;
 }
+
+export type DistillFailure = DistillFailureRecord;
+export type DistillFailureKind = DistillTaskKind;
 
 export interface PrepareDistillTriggerInput {
   readonly id: string;

@@ -580,6 +580,7 @@ test("v6 migration preserves a current origin and deletion receipt for an alread
       ) STRICT;
       DROP TABLE memory_evidence;
       DROP TABLE metadata_gc_state;
+      DROP TABLE distill_failures;
     `);
     const insertOrigin = legacy.prepare("INSERT INTO memory_origins VALUES (?, ?, ?)");
     for (const origin of origins) insertOrigin.run(origin.memory_id, origin.evidence_id, origin.revision);
@@ -605,7 +606,7 @@ test("v6 migration preserves a current origin and deletion receipt for an alread
 
   const migrated = database(f.path);
   try {
-    assert.equal(migrated.prepare("PRAGMA user_version").get().user_version, 7);
+    assert.equal(migrated.prepare("PRAGMA user_version").get().user_version, 8);
     assert.deepEqual(migrated.prepare(
       "SELECT memory_id, evidence_id, revision FROM memory_origins",
     ).all().map(row => ({ ...row })), [
@@ -647,7 +648,7 @@ test("v6 migration preserves a current origin and deletion receipt for an alread
   }
 });
 
-test("schema v0 and v1 migrations preserve memory fields and create the v7 evidence registry", async (t) => {
+test("schema v0 and v1 migrations preserve memory fields and create the v8 store", async (t) => {
   for (const version of [0, 1]) {
     const f = await fixture(t);
     const records = [memory("v" + version + "-a"), memory("v" + version + "-b", {
@@ -684,7 +685,7 @@ test("schema v0 and v1 migrations preserve memory fields and create the v7 evide
     }
     const check = database(f.path);
     try {
-      assert.equal(check.prepare("PRAGMA user_version").get()["user_version"], 7);
+      assert.equal(check.prepare("PRAGMA user_version").get()["user_version"], 8);
       const names = check.prepare("SELECT name FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*' ORDER BY name")
         .all().map((row) => row["name"]);
       assert.deepEqual(names, [
@@ -692,6 +693,7 @@ test("schema v0 and v1 migrations preserve memory fields and create the v7 evide
         "clean_tasks",
         "consolidation_jobs",
         "consolidation_progress",
+        "distill_failures",
         "distill_lease",
         "distill_trigger_jobs",
         "distill_triggers",
