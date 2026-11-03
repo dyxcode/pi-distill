@@ -2,7 +2,7 @@ import { dirname } from "node:path";
 import type {
   ConsolidationJob
 } from "../distill/types.ts";
-import { cleanTaskColumns, distillFailureColumns, evidenceColumns, jobColumns, legacyJobColumns, memoryColumns, observationColumns, originColumns, originColumnsV6, progressColumns, progressColumnsV6, schemaColumns, sessionUsageColumns, textColumn, triggerColumns } from './columns.ts';
+import { cleanTaskColumns, distillFailureColumns, evidenceColumns, hostUseColumns, jobColumns, legacyJobColumns, memoryColumns, observationColumns, originColumns, originColumnsV6, progressColumns, progressColumnsV6, schemaColumns, sessionUsageColumns, textColumn, triggerColumns } from './columns.ts';
 import type { ConsolidationCommits } from './commits.ts';
 import type { StorageConnection } from './connection.ts';
 import { SOURCE_COVERAGE_SCHEMAS } from "./coverage.ts";
@@ -13,8 +13,9 @@ import { parseInput, parseMemory } from './memory-validation.ts';
 import type { MemoryEvidence, PersistedDistillTrigger, SchemaColumn } from './records.ts';
 import type { RetentionTasks } from './retention.ts';
 import { DISTILL_SCHEDULE_SCHEMAS } from "./schedule.ts";
-import { cleanTasksSchema, consolidationJobsSchema, consolidationJobsV3Schema, consolidationProgressSchema, consolidationProgressSchemaV6, currentSchema, deletionsSchema, deletionsSchemaV5, distillFailuresSchema, distillLeaseSchema, distillTriggersSchema, latestSchemaVersion, legacySchema, memoryEvidenceSchema, memoryOriginsSchema, memoryOriginsSchemaV6, metadataGcSchema, sessionObservationsSchema, sessionUsagesSchema, sourceAccessSchema, sourceBackfillSchema, storeIndexes, storeIndexesV7, storeSchemas, storeSchemasV7, storeSchemasV8, triggerJobsSchema } from './schema-definitions.ts';
+import { cleanTasksSchema, consolidationJobsSchema, consolidationJobsV3Schema, consolidationProgressSchema, consolidationProgressSchemaV6, currentSchema, deletionsSchema, deletionsSchemaV5, distillFailuresSchema, distillLeaseSchema, distillTriggersSchema, hostSessionUsesSchema, hostSessionUsesByFileSchema, hostSessionUsesBySessionSchema, latestSchemaVersion, legacySchema, memoryEvidenceSchema, memoryOriginsSchema, memoryOriginsSchemaV6, metadataGcSchema, sessionObservationsSchema, sessionUsagesSchema, sourceAccessSchema, sourceBackfillSchema, storeIndexes, storeIndexesV7, storeSchemas, storeSchemasV7, storeSchemasV8, storeSchemasV9, triggerJobsSchema } from './schema-definitions.ts';
 import { parseStoredSessionObservation, parseStoredSessionUsage } from './session-validation.ts';
+import { parseStoredHostUse } from './host-use-validation.ts';
 import { SOURCE_INDEX_SCHEMAS } from "./source-index.ts";
 import { SOURCE_REGISTRY_SCHEMAS, SourceRegistry, initializeSourceRegistry } from "./source-registry.ts";
 import { SOURCE_VIEW_SCHEMAS } from "./source-view.ts";
@@ -35,7 +36,7 @@ export class SchemaManager {
 
   initializeSchema(): void {
     const version = this.connection.database.prepare("PRAGMA user_version").get()?.["user_version"];
-    if (version !== 0 && version !== 1 && version !== 2 && version !== 3 && version !== 4 && version !== 5 && version !== 6 && version !== 7 && version !== 8 && version !== 9 && version !== 10 && version !== 11 && version !== latestSchemaVersion) {
+    if (version !== 0 && version !== 1 && version !== 2 && version !== 3 && version !== 4 && version !== 5 && version !== 6 && version !== 7 && version !== 8 && version !== 9 && version !== 10 && version !== 11 && version !== 12 && version !== latestSchemaVersion) {
       throw new Error("Unsupported memory database schema version: " + String(version) + ".");
     }
     if (version === latestSchemaVersion) {
@@ -144,8 +145,14 @@ export class SchemaManager {
       for (const schema of SOURCE_COVERAGE_SCHEMAS) this.connection.database.exec(schema.sql);
       this.connection.database.exec("INSERT INTO source_derived_gc VALUES (1,0,0,0); PRAGMA user_version = 11");
     }
-    for (const schema of DISTILL_SCHEDULE_SCHEMAS) this.connection.database.exec(schema.sql);
-    this.connection.database.exec("INSERT INTO distill_schedule_state VALUES (1,0,0,0); PRAGMA user_version = 12");
+    if (version < 12) {
+      for (const schema of DISTILL_SCHEDULE_SCHEMAS) this.connection.database.exec(schema.sql);
+      this.connection.database.exec("INSERT INTO distill_schedule_state VALUES (1,0,0,0); PRAGMA user_version = 12");
+    }
+    if (version < 13) {
+      for (const sql of [hostSessionUsesSchema, hostSessionUsesByFileSchema, hostSessionUsesBySessionSchema]) this.connection.database.exec(sql);
+      this.connection.database.exec("PRAGMA user_version = 13");
+    }
     this.validateLatestSchema();
     this.validateAllRows();
     this.dependencies.retention.sourceAccess();
@@ -451,7 +458,7 @@ export class SchemaManager {
       });
     }
     const additional = typeof schemaVersion === "number" && schemaVersion >= 6
-      ? [...SOURCE_REGISTRY_SCHEMAS, ...(schemaVersion >= 9 ? SOURCE_INDEX_SCHEMAS : []), ...(schemaVersion >= 10 ? SOURCE_VIEW_SCHEMAS : []), ...(schemaVersion >= 11 ? SOURCE_COVERAGE_SCHEMAS : []), ...(schemaVersion >= 12 ? DISTILL_SCHEDULE_SCHEMAS : []), ...(usesV8Metadata ? storeSchemasV8 : usesV7Metadata ? storeSchemasV7 : storeSchemas)]
+      ? [...SOURCE_REGISTRY_SCHEMAS, ...(schemaVersion >= 9 ? SOURCE_INDEX_SCHEMAS : []), ...(schemaVersion >= 10 ? SOURCE_VIEW_SCHEMAS : []), ...(schemaVersion >= 11 ? SOURCE_COVERAGE_SCHEMAS : []), ...(schemaVersion >= 12 ? DISTILL_SCHEDULE_SCHEMAS : []), ...(schemaVersion >= 13 ? storeSchemasV9 : usesV8Metadata ? storeSchemasV8 : usesV7Metadata ? storeSchemasV7 : storeSchemas)]
       : [];
     const extraSchemas = new Map(additional.map(schema => [schema.name, schema.sql]));
     if (objects.length !== schemas.size + extraSchemas.size) throw new Error("Unsupported memory database schema.");
@@ -617,6 +624,11 @@ export class SchemaManager {
             }
           }
         }
+      }
+    }
+    if (typeof schemaVersion === "number" && schemaVersion >= 13) {
+      for (const raw of this.connection.database.prepare(`SELECT ${hostUseColumns} FROM host_session_uses`).iterate()) {
+        parseStoredHostUse(this.connection.decodeRow(raw));
       }
     }
   }

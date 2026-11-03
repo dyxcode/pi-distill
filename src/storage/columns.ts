@@ -66,6 +66,14 @@ export const sessionUsageColumns = [
   textColumn("state"),
 ].join(", ");
 
+export const hostUseColumns = [
+  textColumn("id"), textColumn("session_id", "sessionId"),
+  textColumn("session_file", "sessionFile"), textColumn("cwd"),
+  textColumn("source_generation", "sourceGeneration"),
+  "owner_pid AS ownerPid", "created_at AS createdAt", textColumn("state"),
+  "child_pid AS childPid", textColumn("child_token", "childToken"),
+].join(", ");
+
 export const schemaColumns = [textColumn("name"), textColumn("type"), textColumn("sql")].join(", ");
 
 export const distillFailureColumns = [

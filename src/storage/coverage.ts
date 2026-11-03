@@ -147,7 +147,8 @@ export function collectDerivedSources(database: DatabaseSync, store: Pick<SQLite
   const deleted = (path: string): boolean => {
     const receipt = store.getDeletion(path), source = store.sources.get(path);
     if (receipt?.state !== "complete" || (source && (!source.deleted || source.generation !== receipt.sourceGeneration)) || store.sources.hasDependents(path)) return false;
-    return !store.sourceRetentionState(path, receipt.sessionId).pending &&
+    const retention = store.sourceRetentionState(path, receipt.sessionId);
+    return !retention.pending && !retention.hostUse &&
       !exists("SELECT 1 FROM session_usages WHERE session_file=? AND state<>'released' LIMIT 1", path) &&
       !exists("SELECT 1 FROM session_observations WHERE session_file=? AND captured=0 LIMIT 1", path);
   };

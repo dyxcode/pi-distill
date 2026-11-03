@@ -168,6 +168,24 @@ export const cleanTasksSchema =
 
 export const sourceAccessSchema = "CREATE TABLE source_access (singleton INTEGER PRIMARY KEY NOT NULL CHECK (singleton = 1), token TEXT NOT NULL, owner_pid INTEGER NOT NULL CHECK (owner_pid > 0)) STRICT";
 
+export const hostSessionUsesSchema = "CREATE TABLE host_session_uses (" +
+  "id TEXT PRIMARY KEY NOT NULL, " +
+  "session_id TEXT NOT NULL, " +
+  "session_file TEXT NOT NULL, " +
+  "cwd TEXT NOT NULL, " +
+  "source_generation TEXT, " +
+  "owner_pid INTEGER NOT NULL CHECK (owner_pid > 0), " +
+  "created_at INTEGER NOT NULL CHECK (created_at >= 0), " +
+  "state TEXT NOT NULL CHECK (state IN ('opening', 'attached')), " +
+  "child_pid INTEGER CHECK (child_pid IS NULL OR child_pid > 0), " +
+  "child_token TEXT, " +
+  "CHECK ((state = 'opening' AND child_pid IS NULL AND child_token IS NULL) OR " +
+  "(state = 'attached' AND child_pid IS NOT NULL AND child_token IS NOT NULL))" +
+  ") STRICT";
+
+export const hostSessionUsesByFileSchema = "CREATE INDEX host_session_uses_by_file ON host_session_uses (session_file, id)";
+export const hostSessionUsesBySessionSchema = "CREATE INDEX host_session_uses_by_session ON host_session_uses (session_id, id)";
+
 export const deletionsSchemaV5 = "CREATE TABLE session_deletions (session_file TEXT PRIMARY KEY NOT NULL, session_id TEXT NOT NULL, intent_id TEXT NOT NULL, file_version TEXT NOT NULL, state TEXT NOT NULL CHECK (state IN ('deleting', 'complete'))) STRICT";
 
 export const deletionsSchema = "CREATE TABLE session_deletions (session_file TEXT PRIMARY KEY NOT NULL, session_id TEXT NOT NULL, intent_id TEXT NOT NULL, file_version TEXT NOT NULL, source_generation TEXT, state TEXT NOT NULL CHECK (state IN ('deleting', 'complete'))) STRICT";
@@ -204,4 +222,10 @@ export const storeSchemasV7 = [...storeSchemas, ...[metadataGcSchema, ...storeIn
 
 export const storeSchemasV8 = [...storeSchemasV7, { name: "distill_failures", sql: distillFailuresSchema }];
 
-export const latestSchemaVersion = 12;
+export const storeSchemasV9 = [...storeSchemasV8,
+  { name: "host_session_uses", sql: hostSessionUsesSchema },
+  { name: "host_session_uses_by_file", sql: hostSessionUsesByFileSchema },
+  { name: "host_session_uses_by_session", sql: hostSessionUsesBySessionSchema },
+];
+
+export const latestSchemaVersion = 13;

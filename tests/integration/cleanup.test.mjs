@@ -13,6 +13,7 @@ import { planSources } from '../../src/distill/preparation.ts';
 import { CleanupCoordinator } from '../../src/retention/coordinator.ts';
 import { DistillFailure } from '../../src/distill/failure.ts';
 import { readSessionHeader } from '../../src/sources/header.ts';
+import { openHostStorageV1 } from 'pi-distill/host-storage';
 
 async function fixture(t) {
   const root = await mkdtemp(join(tmpdir(), 'pi-distill-clean-'));
@@ -160,6 +161,12 @@ function fixtureChild(t,f,mode,task) {
  let stderr='';child.stderr.on('data',data=>{stderr+=data;});
  t.after(()=>{if(child.exitCode===null&&child.signalCode===null)child.kill('SIGKILL');});
  return {child,stderr:()=>stderr};
+}
+
+function hostUseChild(t,f,mode,source) {
+ const child=fork(new URL('../helpers/host-use-process-child.mjs',import.meta.url),[mode,f.path,JSON.stringify(source)],{stdio:['ignore','ignore','pipe','ipc']});
+ t.after(()=>{if(child.exitCode===null&&child.signalCode===null)child.kill('SIGKILL');});
+ return child;
 }
 
 test('real process usage and source access survive pause, then recover after confirmed exit',async t=>{
@@ -593,4 +600,121 @@ test('unexpected cleanup storage failures are reported without deleting sources'
   const c=f.worker({openStore:()=>{throw new Error('synthetic storage fault');},diagnostics:{record:event=>events.push(event)}});
   c.wake();await c.whenIdle();assert.deepEqual(await readFile(f.file),before);
   assert.ok(events.some(event=>event.operation==='cleanup.pass'&&event.outcome==='failed'));
+});
+
+test('public host read access fences an actual source read from cleanup', async t => {
+ const f=await fixture(t);await f.complete();await releaseFixture(f);f.store.enqueueCleanTask(f.input());
+ const host=openHostStorageV1(f.path);t.after(()=>host.close());
+ const ref={sessionId:f.input().sessionId,sessionFile:f.file,cwd:f.root};
+ const access=host.acquireSourceRead(ref);assert.ok(access);
+ assert.equal(access.sourceGeneration,f.store.sources.get(ref.sessionFile,ref.sessionId).generation);
+ assert.ok(await readFile(f.file));
+ const c=f.worker();c.wake();await c.whenIdle();assert.ok(await readFile(f.file));
+ access.release();access.release();c.wake();await c.whenIdle();
+ await assert.rejects(readFile(f.file),{code:'ENOENT'});
+});
+
+test('durable pre-spawn host use blocks cleanup until the matching child close', async t => {
+ const f=await fixture(t);await f.complete();await releaseFixture(f);f.store.enqueueCleanTask(f.input());
+ const host=openHostStorageV1(f.path);t.after(()=>host.close());
+ const input=f.input();const ref={sessionId:input.sessionId,sessionFile:input.sessionFile,cwd:input.cwd};
+ const reservation=host.beginHostUse(ref);
+ assert.ok(reservation);
+ assert.equal(reservation.sourceGeneration,f.store.sources.get(ref.sessionFile,ref.sessionId).generation);
+ const unmanaged={sessionId:'unmanaged-host-source',sessionFile:join(f.root,'unmanaged.jsonl'),cwd:f.root};
+ const unmanagedUse=host.beginHostUse(unmanaged);assert.ok(unmanagedUse);
+ assert.equal(unmanagedUse.sourceGeneration,null);
+ assert.equal(f.store.sources.get(unmanaged.sessionFile,unmanaged.sessionId),undefined,'Dwell reads do not enroll unmanaged sources');
+ assert.equal(host.recoverHostUse(unmanagedUse.id,{kind:'opening-abandoned'}),true);
+ const c=f.worker();c.wake();await c.whenIdle();assert.ok(await readFile(f.file));
+ const child=reservation.attachChild(process.pid);
+ assert.equal(reservation.releaseAfterClose({...child,token:'wrong-token'}),false);
+ c.wake();await c.whenIdle();assert.ok(await readFile(f.file));
+ assert.equal(reservation.releaseAfterClose(child),true);
+ assert.equal(reservation.releaseAfterClose(child),false);
+ c.wake();await c.whenIdle();await assert.rejects(readFile(f.file),{code:'ENOENT'});
+});
+
+test('an uncertain opening survives host restart until explicit verified recovery', async t => {
+ const f=await fixture(t);await f.complete();await releaseFixture(f);f.store.enqueueCleanTask(f.input());
+ const input=f.input();const ref={sessionId:input.sessionId,sessionFile:input.sessionFile,cwd:input.cwd};
+ const first=openHostStorageV1(f.path);const reservation=first.beginHostUse(ref);first.close();
+ const host=openHostStorageV1(f.path);t.after(()=>host.close());
+ assert.deepEqual(host.listPendingHostUses().map(({id,state})=>({id,state})),[{id:reservation.id,state:'opening'}]);
+ const c=f.worker();c.wake();await c.whenIdle();assert.ok(await readFile(f.file));
+ assert.equal(host.recoverHostUse(reservation.id,{kind:'opening-abandoned'}),true);
+ assert.equal(host.recoverHostUse(reservation.id,{kind:'opening-abandoned'}),false);
+ c.wake();await c.whenIdle();await assert.rejects(readFile(f.file),{code:'ENOENT'});
+});
+
+test('an attached host reservation survives host death and recovers only after its exact child exits', async t => {
+ const f=await fixture(t);await f.complete();await releaseFixture(f);f.store.enqueueCleanTask(f.input());
+ const input=f.input();const source={sessionId:input.sessionId,sessionFile:input.sessionFile,cwd:input.cwd};
+ const hostProcess=hostUseChild(t,f,'attached',source);let childPid;
+ t.after(()=>{if(childPid)try{process.kill(childPid,'SIGKILL');}catch(error){if(error?.code!=='ESRCH')throw error;}});
+ const [message]=await once(hostProcess,'message');assert.equal(typeof message.childIdentity.token,'string');childPid=message.childPid;
+ const host=openHostStorageV1(f.path);t.after(()=>host.close());
+ hostProcess.kill('SIGKILL');await once(hostProcess,'exit');
+ assert.deepEqual(host.listPendingHostUses().map(({id,state,child})=>({id,state,child})),[
+  {id:message.id,state:'attached',child:message.childIdentity},
+ ]);
+ const c=f.worker();c.wake();await c.whenIdle();assert.ok(await readFile(f.file));
+ assert.equal(host.recoverHostUse(message.id,{kind:'child-exited',child:message.childIdentity}),false);
+ process.kill(childPid,'SIGKILL');
+ let recovered=false;const deadline=Date.now()+3000;
+ while(!recovered&&Date.now()<deadline){recovered=host.recoverHostUse(message.id,{kind:'child-exited',child:message.childIdentity});if(!recovered)await new Promise(resolve=>setTimeout(resolve,10));}
+ assert.equal(recovered,true,'a matching child identity is recovered after the OS confirms its PID is absent');
+ c.wake();await c.whenIdle();await assert.rejects(readFile(f.file),{code:'ENOENT'});
+});
+
+test('spawn before child registration leaves an opening blocker until the child is verified gone', async t => {
+ const f=await fixture(t);await f.complete();await releaseFixture(f);f.store.enqueueCleanTask(f.input());
+ const input=f.input();const source={sessionId:input.sessionId,sessionFile:input.sessionFile,cwd:input.cwd};
+ const hostProcess=hostUseChild(t,f,'opening',source);let childPid;
+ t.after(()=>{if(childPid)try{process.kill(childPid,'SIGKILL');}catch(error){if(error?.code!=='ESRCH')throw error;}});
+ const [message]=await once(hostProcess,'message');childPid=message.childPid;assert.equal(message.childIdentity,null);
+ const host=openHostStorageV1(f.path);t.after(()=>host.close());
+ hostProcess.kill('SIGKILL');await once(hostProcess,'exit');
+ assert.equal(host.listPendingHostUses().find(record=>record.id===message.id)?.state,'opening');
+ const c=f.worker();c.wake();await c.whenIdle();assert.ok(await readFile(f.file));
+ let exited=false;const deadline=Date.now()+3000;
+ process.kill(childPid,'SIGKILL');
+ while(!exited&&Date.now()<deadline){
+  try{process.kill(childPid,0);}catch(error){if(error?.code==='ESRCH')exited=true;else throw error;}
+  if(!exited)await new Promise(resolve=>setTimeout(resolve,10));
+ }
+ assert.equal(exited,true,'the test verifies the child is gone before resolving the unbound opening');
+ assert.equal(host.recoverHostUse(message.id,{kind:'opening-abandoned'}),true);
+ c.wake();await c.whenIdle();await assert.rejects(readFile(f.file),{code:'ENOENT'});
+});
+
+test('completed deletion lookup requires the current registered source generation', async t => {
+ const f=await fixture(t);await f.complete();await releaseFixture(f);f.store.enqueueCleanTask(f.input());
+ const input=f.input();const host=openHostStorageV1(f.path);t.after(()=>host.close());
+ const original={sessionId:input.sessionId,sessionFile:input.sessionFile,cwd:input.cwd};
+ const reservation=host.beginHostUse(original);assert.ok(reservation);
+ assert.equal(typeof reservation.sourceGeneration,'string');
+ const c=f.worker();c.wake();await c.whenIdle();assert.ok(await readFile(f.file));
+ assert.equal(host.recoverHostUse(reservation.id,{kind:'opening-abandoned'}),true);
+ c.wake();await c.whenIdle();await assert.rejects(readFile(f.file),{code:'ENOENT'});
+ const raw=new DatabaseSync(f.path);raw.prepare("DELETE FROM managed_sources WHERE session_file=? AND session_id=?").run(input.sessionFile,input.sessionId);raw.close();
+ assert.equal(host.getCompletedDeletion(original),undefined,'registry GC leaves no identity to match');
+ const cached={...original,sourceGeneration:reservation.sourceGeneration};
+ assert.equal(host.getCompletedDeletion(cached)?.state,'complete','the cached generation matches the durable receipt after registry GC');
+ f.store.sources.register(original);
+ assert.equal(host.getCompletedDeletion(cached),undefined,'a newly registered generation cannot reuse the old receipt');
+});
+
+test('a failed read-lease release can be retried after the SQLite writer unlocks', async t => {
+ const f=await fixture(t);
+ const host=openHostStorageV1(f.path);t.after(()=>host.close());
+ const input=f.input();const ref={sessionId:input.sessionId,sessionFile:input.sessionFile,cwd:input.cwd};
+ const lease=host.acquireSourceRead(ref);assert.ok(lease);
+ const writer=new DatabaseSync(f.path);t.after(()=>writer.close());
+ writer.exec('BEGIN IMMEDIATE');
+ assert.throws(()=>lease.release(),/locked|busy/i);
+ writer.exec('ROLLBACK');
+ lease.release();
+ const next=host.acquireSourceRead(ref);assert.ok(next,'the retried release frees the gate');
+ next.release();
 });

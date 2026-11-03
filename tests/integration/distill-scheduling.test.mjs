@@ -186,7 +186,7 @@ test('schema 11 upgrade preserves memories, progress and pending work', async (t
   const raw = new DatabaseSync(f.db);
   for (const schema of [...DISTILL_SCHEDULE_SCHEMAS].reverse())
     raw.exec(`DROP ${schema.sql.split(' ')[1]} ${schema.name}`);
-  raw.exec('PRAGMA user_version=11');
+  raw.exec('DROP TABLE host_session_uses; PRAGMA user_version=11');
   raw.close();
   const current = new SQLiteMemoryStore(f.db);
   try {
@@ -246,7 +246,7 @@ test('migration backfill resumes after reopen and eventually exposes work beyond
   const { DISTILL_SCHEDULE_SCHEMAS } = await import('../../src/storage/schedule.ts');
   const raw = new DatabaseSync(f.db);
   for (const schema of [...DISTILL_SCHEDULE_SCHEMAS].reverse()) raw.exec(`DROP ${schema.sql.split(' ')[1]} ${schema.name}`);
-  raw.exec('PRAGMA user_version=11'); raw.close();
+  raw.exec('DROP TABLE host_session_uses; PRAGMA user_version=11'); raw.close();
   let store = new SQLiteMemoryStore(f.db);
   try {
     const first = store.listScheduledDistill(1);

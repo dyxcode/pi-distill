@@ -16,3 +16,11 @@ export interface SessionDeletion {
   readonly sourceGeneration: string | null;
   readonly state: "deleting" | "complete";
 }
+
+export type {
+  HostSourceRefV1,
+  HostChildIdentityV1,
+  HostUseRecordV1,
+  HostUseRecoveryV1,
+  CompletedDeletionReceiptV1,
+} from "../host-storage.ts";

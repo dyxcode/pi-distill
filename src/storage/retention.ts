@@ -6,14 +6,15 @@ import type {
   TaskPage,
   WaitReason
 } from "../distill/tasks.ts";
-import type { SessionDeletion } from '../retention/types.ts';
-import { cleanTaskColumns, deletionColumns, jobColumns, sessionUsageColumns, textColumn } from './columns.ts';
+import type { CompletedDeletionReceiptV1, HostChildIdentityV1, HostSourceRefV1, HostUseRecordV1, HostUseRecoveryV1, SessionDeletion } from '../retention/types.ts';
+import { cleanTaskColumns, deletionColumns, hostUseColumns, jobColumns, sessionUsageColumns, textColumn } from './columns.ts';
 import type { StorageConnection } from './connection.ts';
 import type { DistillQueue } from './distill.ts';
 import { parsePersistedJobRow } from './evidence-validation.ts';
 import { maxTaskPageSize } from './limits.ts';
 import type { PersistedCleanTask } from './records.ts';
 import { parseStoredSessionUsage, processHasExited } from './session-validation.ts';
+import { parseHostChildIdentity, parseHostSourceRef, parseHostUseRecovery, parseStoredHostUse } from './host-use-validation.ts';
 import type { SessionRecords } from './sessions.ts';
 import { SourceRegistry } from "./source-registry.ts";
 import { cleanTaskId, parseCleanTaskInput, parsePersistedCleanTask, parseTaskPageOptions } from './task-validation.ts';
@@ -214,6 +215,94 @@ export class RetentionTasks {
     return this.connection.transaction(() => this.connection.database.prepare("DELETE FROM source_access WHERE token = ?").run(token).changes === 1);
   }
 
+  /** Persist a host's pre-read/pre-spawn reservation under the cleanup mutex. */
+  beginHostUse(input: HostSourceRefV1): HostUseRecordV1 | undefined {
+    this.connection.ensureOpen();
+    const source = parseHostSourceRef(input);
+    const access = this.acquireSourceAccess();
+    if (!access) return undefined;
+    try {
+      return this.connection.transaction(() => {
+        const registered = this.dependencies.sources.get(source.sessionFile, source.sessionId);
+        if (registered && registered.cwd !== source.cwd) throw new Error("Host source working directory does not match its registered source.");
+        if (registered && source.sourceGeneration !== undefined && source.sourceGeneration !== registered.generation) {
+          throw new Error("Host source generation does not match its registered source.");
+        }
+        const sourceGeneration = source.sourceGeneration ?? registered?.generation ?? null;
+        const id = randomUUID();
+        const ownerPid = process.pid;
+        const createdAt = Date.now();
+        this.connection.database.prepare(
+          "INSERT INTO host_session_uses " +
+          "(id, session_id, session_file, cwd, source_generation, owner_pid, created_at, state, child_pid, child_token) " +
+          "VALUES (?, ?, ?, ?, ?, ?, ?, 'opening', NULL, NULL)",
+        ).run(id, source.sessionId, source.sessionFile, source.cwd, sourceGeneration, ownerPid, createdAt);
+        return { id, sessionId: source.sessionId, sessionFile: source.sessionFile, cwd: source.cwd, sourceGeneration, ownerPid, createdAt, state: "opening", child: null };
+      });
+    } finally {
+      this.releaseSourceAccess(access);
+    }
+  }
+
+  attachHostUseChild(id: string, pid: number): HostChildIdentityV1 {
+    this.connection.ensureOpen();
+    validateText(id, "host use ID");
+    if (!Number.isSafeInteger(pid) || pid <= 0) throw new TypeError("Host child PID must be a positive safe integer.");
+    const child = { pid, token: randomUUID() };
+    this.connection.transaction(() => {
+      const changed = this.connection.database.prepare(
+        "UPDATE host_session_uses SET state = 'attached', child_pid = ?, child_token = ? " +
+        "WHERE id = ? AND state = 'opening'",
+      ).run(child.pid, child.token, id).changes;
+      if (changed !== 1) throw new Error("Host use is no longer awaiting a child.");
+    });
+    return child;
+  }
+
+  releaseHostUseAfterClose(id: string, childInput: HostChildIdentityV1): boolean {
+    this.connection.ensureOpen();
+    validateText(id, "host use ID");
+    const child = parseHostChildIdentity(childInput);
+    return this.connection.transaction(() => this.connection.database.prepare(
+      "DELETE FROM host_session_uses WHERE id = ? AND state = 'attached' AND child_pid = ? AND child_token = ?",
+    ).run(id, child.pid, child.token).changes === 1);
+  }
+
+  listPendingHostUses(): HostUseRecordV1[] {
+    this.connection.ensureOpen();
+    const rows = this.connection.database.prepare(
+      `SELECT ${hostUseColumns} FROM host_session_uses ORDER BY created_at, id LIMIT 1025`,
+    ).all().map(raw => parseStoredHostUse(this.connection.decodeRow(raw)));
+    if (rows.length > 1024) throw new RangeError("Pending host uses exceed the reconciliation limit.");
+    return rows;
+  }
+
+  hostSourceGeneration(input: HostSourceRefV1): string | null | undefined {
+    this.connection.ensureOpen();
+    const sourceRef = parseHostSourceRef(input);
+    return this.connection.transaction(() => {
+      const source = this.dependencies.sources.get(sourceRef.sessionFile, sourceRef.sessionId);
+      if (source && (source.cwd !== sourceRef.cwd ||
+        (sourceRef.sourceGeneration !== undefined && sourceRef.sourceGeneration !== source.generation))) return undefined;
+      return source?.generation ?? sourceRef.sourceGeneration ?? null;
+    }, "DEFERRED");
+  }
+
+  recoverHostUse(id: string, evidenceInput: HostUseRecoveryV1): boolean {
+    this.connection.ensureOpen();
+    validateText(id, "host use ID");
+    const evidence = parseHostUseRecovery(evidenceInput);
+    if (evidence.kind === "opening-abandoned") {
+      return this.connection.transaction(() => this.connection.database.prepare(
+        "DELETE FROM host_session_uses WHERE id = ? AND state = 'opening'",
+      ).run(id).changes === 1);
+    }
+    if (!processHasExited(evidence.child.pid)) return false;
+    return this.connection.transaction(() => this.connection.database.prepare(
+      "DELETE FROM host_session_uses WHERE id = ? AND state = 'attached' AND child_pid = ? AND child_token = ?",
+    ).run(id, evidence.child.pid, evidence.child.token).changes === 1);
+  }
+
   sourceAccess(): { token: string; pid: number; } | undefined {
     const raw = this.connection.database.prepare(`SELECT ${textColumn("token")}, owner_pid FROM source_access`).get();
     if (!raw) return undefined;
@@ -243,13 +332,14 @@ export class RetentionTasks {
   }
 
   /** Compare on this connection only; includes other connections and local mutations. */
-  sourceRetentionState(path: string, sessionId: string): { pending: boolean; released: boolean; } {
+  sourceRetentionState(path: string, sessionId: string): { pending: boolean; released: boolean; hostUse: boolean; } {
     validateAbsolutePath(path, "source path"); validateText(sessionId, "session ID");
     const pending = this.connection.database.prepare("SELECT 1 FROM consolidation_jobs WHERE status='pending' AND (json_extract(job_json,'$.sessionFile')=? OR json_extract(job_json,'$.sessionId')=?) LIMIT 1").get(path, sessionId) !== undefined ||
       this.connection.database.prepare("SELECT 1 FROM distill_triggers WHERE status<>'complete' AND (json_extract(trigger_json,'$.sessionFile')=? OR json_extract(trigger_json,'$.sessionId')=?) LIMIT 1").get(path, sessionId) !== undefined;
     const known = this.connection.database.prepare("SELECT 1 FROM session_usages WHERE session_file=? OR session_id=? LIMIT 1").get(path, sessionId) !== undefined;
     const outstanding = this.connection.database.prepare("SELECT 1 FROM session_usages WHERE (session_file=? OR session_id=?) AND state<>'released' LIMIT 1").get(path, sessionId) !== undefined;
-    return { pending, released: known && !outstanding };
+    const hostUse = this.connection.database.prepare("SELECT 1 FROM host_session_uses WHERE session_file=? OR session_id=? LIMIT 1").get(path, sessionId) !== undefined;
+    return { pending, released: known && !outstanding && !hostUse, hostUse };
   }
 
   retentionVersion(scope?: readonly string[]): string {
@@ -290,6 +380,25 @@ export class RetentionTasks {
     const raw = this.connection.database.prepare(`SELECT ${columns} FROM session_deletions WHERE session_file = ?`).get(path);
     if (!raw) return undefined;
     return this.parseDeletionRow(this.connection.decodeRow(raw));
+  }
+
+  getCompletedDeletionFor(input: HostSourceRefV1): CompletedDeletionReceiptV1 | undefined {
+    this.connection.ensureOpen();
+    const sourceRef = parseHostSourceRef(input);
+    return this.connection.transaction(() => {
+      const source = this.dependencies.sources.get(sourceRef.sessionFile, sourceRef.sessionId);
+      let expectedGeneration = sourceRef.sourceGeneration;
+      if (source) {
+        if (!source.deleted || source.cwd !== sourceRef.cwd ||
+          (expectedGeneration !== undefined && expectedGeneration !== source.generation)) return undefined;
+        expectedGeneration = source.generation;
+      }
+      if (expectedGeneration === undefined) return undefined;
+      const receipt = this.getDeletion(sourceRef.sessionFile);
+      if (receipt?.state !== "complete" || receipt.sessionId !== sourceRef.sessionId ||
+        receipt.sourceGeneration === null || receipt.sourceGeneration !== expectedGeneration) return undefined;
+      return { ...receipt, sourceGeneration: receipt.sourceGeneration, state: "complete" };
+    }, "DEFERRED");
   }
 
   private parseDeletionRow(value: unknown): SessionDeletion {

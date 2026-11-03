@@ -244,6 +244,7 @@ export class MetadataMaintenance {
       ["distill_triggers", "json_extract(trigger_json, '$.sessionFile')", "status <> 'complete'"],
       ["session_observations", "session_file", "captured = 0"],
       ["session_usages", "session_file", "state <> 'released'"],
+      ["host_session_uses", "session_file", "1"],
     ] as const) {
       if (this.connection.database.prepare(`SELECT 1 AS present FROM ${table} WHERE ${condition} AND ${filter.sql(column)} LIMIT 1`)
         .get(...filter.values) !== undefined) return true;
@@ -259,6 +260,7 @@ export class MetadataMaintenance {
       ["distill_triggers", "json_extract(trigger_json, '$.sessionFile')"],
       ["session_observations", "session_file"],
       ["session_usages", "session_file"],
+      ["host_session_uses", "session_file"],
     ] as const;
     for (const [table, column] of queries) {
       if (this.connection.database.prepare(`SELECT 1 AS present FROM ${table} WHERE ${filter.sql(column)} LIMIT 1`)

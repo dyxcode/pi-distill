@@ -278,7 +278,7 @@ export class CleanupCoordinator {
           const current = store.sourceRetentionState(task.sessionFile, task.sessionId);
           if (report.sessionId !== task.sessionId) reason = "unavailable";
           else if (report.status !== "processed" || current.pending) reason = "unprocessed";
-          else reason = current.released ? "host_coordination" : "usage";
+          else reason = current.hostUse ? "usage" : current.released ? "host_coordination" : "usage";
           if (report.status === "building") building = true;
           if (store.hasUncapturedObservation(scope.paths)) reason = "unprocessed";
           if (scope.hasDependents) reason = "dependencies";
