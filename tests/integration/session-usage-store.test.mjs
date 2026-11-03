@@ -389,7 +389,7 @@ test("schema v2 migration preserves memories, jobs, progress, origins and observ
 
   const verify = database(f.path);
   try {
-    assert.equal(verify.prepare("PRAGMA user_version").get()["user_version"], 13);
+    assert.equal(verify.prepare("PRAGMA user_version").get()["user_version"], 14);
     assert.deepEqual(verify.prepare("SELECT name FROM sqlite_schema WHERE name = 'session_usages'").all()
       .map(row => row["name"]), ["session_usages"]);
   } finally {

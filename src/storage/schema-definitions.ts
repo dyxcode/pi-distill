@@ -171,6 +171,21 @@ export const sourceAccessSchema = "CREATE TABLE source_access (singleton INTEGER
 export const hostSessionUsesSchema = "CREATE TABLE host_session_uses (" +
   "id TEXT PRIMARY KEY NOT NULL, " +
   "session_id TEXT NOT NULL, " +
+  "session_file TEXT, " +
+  "cwd TEXT NOT NULL, " +
+  "source_generation TEXT, " +
+  "owner_pid INTEGER NOT NULL CHECK (owner_pid > 0), " +
+  "created_at INTEGER NOT NULL CHECK (created_at >= 0), " +
+  "state TEXT NOT NULL CHECK (state IN ('opening', 'attached')), " +
+  "child_pid INTEGER CHECK (child_pid IS NULL OR child_pid > 0), " +
+  "child_token TEXT, " +
+  "CHECK ((state = 'opening' AND child_pid IS NULL AND child_token IS NULL) OR " +
+  "(state = 'attached' AND child_pid IS NOT NULL AND child_token IS NOT NULL))" +
+  ") STRICT";
+
+export const hostSessionUsesSchemaV13 = "CREATE TABLE host_session_uses (" +
+  "id TEXT PRIMARY KEY NOT NULL, " +
+  "session_id TEXT NOT NULL, " +
   "session_file TEXT NOT NULL, " +
   "cwd TEXT NOT NULL, " +
   "source_generation TEXT, " +
@@ -222,10 +237,16 @@ export const storeSchemasV7 = [...storeSchemas, ...[metadataGcSchema, ...storeIn
 
 export const storeSchemasV8 = [...storeSchemasV7, { name: "distill_failures", sql: distillFailuresSchema }];
 
+export const storeSchemasV9V13 = [...storeSchemasV8,
+  { name: "host_session_uses", sql: hostSessionUsesSchemaV13 },
+  { name: "host_session_uses_by_file", sql: hostSessionUsesByFileSchema },
+  { name: "host_session_uses_by_session", sql: hostSessionUsesBySessionSchema },
+];
+
 export const storeSchemasV9 = [...storeSchemasV8,
   { name: "host_session_uses", sql: hostSessionUsesSchema },
   { name: "host_session_uses_by_file", sql: hostSessionUsesByFileSchema },
   { name: "host_session_uses_by_session", sql: hostSessionUsesBySessionSchema },
 ];
 
-export const latestSchemaVersion = 13;
+export const latestSchemaVersion = 14;

@@ -625,7 +625,7 @@ test("v6 migration preserves shared current origins and the deletion receipt for
 
   const migrated = database(f.path);
   try {
-    assert.equal(migrated.prepare("PRAGMA user_version").get().user_version, 13);
+    assert.equal(migrated.prepare("PRAGMA user_version").get().user_version, 14);
     assert.deepEqual(migrated.prepare(
       "SELECT o.memory_id AS memory_id, e.session_id AS session_id, e.source_keys AS source_keys " +
       "FROM memory_origins AS o JOIN memory_evidence AS e ON e.evidence_id = o.evidence_id ORDER BY o.rowid",
@@ -705,7 +705,7 @@ test("schema v0 and v1 migrations preserve memory fields and create the current 
     }
     const check = database(f.path);
     try {
-      assert.equal(check.prepare("PRAGMA user_version").get()["user_version"], 13);
+      assert.equal(check.prepare("PRAGMA user_version").get()["user_version"], 14);
       const names = check.prepare("SELECT name FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*' ORDER BY name")
         .all().map((row) => row["name"]);
       assert.deepEqual(names, [

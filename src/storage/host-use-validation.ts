@@ -1,11 +1,12 @@
 import { resolve } from "node:path";
-import type { HostChildIdentityV1, HostSourceRefV1, HostUseRecordV1, HostUseRecoveryV1 } from "../retention/types.ts";
+import type { HostChildIdentityV1, HostSourceRefV1, HostUseRecordV1, HostUseRecoveryV1, HostUseSourceRefV1 } from "../retention/types.ts";
 import { fields, validateAbsolutePath, validateText, validateNow } from "./validation.ts";
 
 const validSourceGeneration = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 export function parseHostSourceRef(value: unknown): HostSourceRefV1 {
   if (typeof value !== "object" || value === null || Array.isArray(value)) throw new TypeError("Host source reference must be an object.");
+  if (!Object.hasOwn(value, "sessionFile")) throw new TypeError("Host source reference requires a session file.");
   const hasGeneration = Object.hasOwn(value, "sourceGeneration");
   const row = fields(value, hasGeneration ? ["sessionId", "sessionFile", "cwd", "sourceGeneration"] : ["sessionId", "sessionFile", "cwd"]);
   validateText(row["sessionId"], "host source session ID");
@@ -25,6 +26,24 @@ export function parseHostSourceRef(value: unknown): HostSourceRefV1 {
     return { ...result, sourceGeneration: row["sourceGeneration"] };
   }
   return result;
+}
+
+export function parseHostUseSourceRef(value: unknown): HostUseSourceRefV1 {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new TypeError("Host use source reference must be an object.");
+  }
+  const hasGeneration = Object.hasOwn(value, "sourceGeneration");
+  if (Object.hasOwn(value, "sessionFile")) return parseHostSourceRef(value);
+  const row = fields(value, hasGeneration ? ["sessionId", "cwd", "sourceGeneration"] : ["sessionId", "cwd"]);
+  if (hasGeneration) {
+    throw new TypeError("Host source generation requires a session file.");
+  }
+  validateText(row["sessionId"], "host source session ID");
+  validateAbsolutePath(row["cwd"], "host source working directory");
+  if (resolve(row["cwd"]) !== row["cwd"]) {
+    throw new TypeError("Host source paths must be normalized.");
+  }
+  return { sessionId: row["sessionId"], cwd: row["cwd"] };
 }
 
 export function parseHostChildIdentity(value: unknown): HostChildIdentityV1 {
@@ -58,15 +77,20 @@ export function parseStoredHostUse(value: unknown): HostUseRecordV1 {
     "id", "sessionId", "sessionFile", "cwd", "sourceGeneration", "ownerPid", "createdAt", "state", "childPid", "childToken",
   ]);
   validateText(row["id"], "stored host use ID");
-  const source = parseHostSourceRef({
+  const sessionFile = row["sessionFile"];
+  if (sessionFile !== null && typeof sessionFile !== "string") {
+    throw new TypeError("Stored host session file is invalid.");
+  }
+  const source = parseHostUseSourceRef({
     sessionId: row["sessionId"],
-    sessionFile: row["sessionFile"],
     cwd: row["cwd"],
+    ...(sessionFile === null ? {} : { sessionFile }),
   });
   const sourceGeneration = row["sourceGeneration"];
   if (sourceGeneration !== null) {
     validateText(sourceGeneration, "stored host source generation");
     if (!validSourceGeneration.test(sourceGeneration)) throw new TypeError("Stored host source generation is invalid.");
+    if (sessionFile === null) throw new TypeError("Stored host generation requires a session file.");
   }
   const ownerPid = row["ownerPid"];
   if (typeof ownerPid !== "number" || !Number.isSafeInteger(ownerPid) || ownerPid <= 0) {
@@ -82,5 +106,5 @@ export function parseStoredHostUse(value: unknown): HostUseRecordV1 {
   } else {
     child = parseHostChildIdentity({ pid: row["childPid"], token: row["childToken"] });
   }
-  return { id: row["id"], ...source, sourceGeneration, ownerPid, createdAt: row["createdAt"], state, child };
+  return { id: row["id"], ...source, sessionFile, sourceGeneration, ownerPid, createdAt: row["createdAt"], state, child };
 }

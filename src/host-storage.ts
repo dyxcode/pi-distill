@@ -8,13 +8,25 @@ export interface HostSourceRefV1 {
   readonly sourceGeneration?: string;
 }
 
+export interface HostUseSourceIdentityV1 {
+  readonly sessionId: string;
+  readonly cwd: string;
+}
+
+export type HostUseSourceRefV1 = HostUseSourceIdentityV1 &
+  (
+    | { readonly sessionFile?: never; readonly sourceGeneration?: never }
+    | { readonly sessionFile: string; readonly sourceGeneration?: string }
+  );
+
 export interface HostChildIdentityV1 {
   readonly pid: number;
   readonly token: string;
 }
 
-export interface HostUseRecordV1 extends Omit<HostSourceRefV1, "sourceGeneration"> {
+export interface HostUseRecordV1 extends HostUseSourceIdentityV1 {
   readonly id: string;
+  readonly sessionFile: string | null;
   readonly sourceGeneration: string | null;
   readonly ownerPid: number;
   readonly createdAt: number;
@@ -55,8 +67,8 @@ export interface HostStorageV1 {
   readonly version: 1;
   /** Returns undefined when cleanup or another source read currently holds the global gate. */
   acquireSourceRead(source: HostSourceRefV1): SourceReadLeaseV1 | undefined;
-  /** Call before reading or spawning. Undefined means no durable reservation was acquired. */
-  beginHostUse(source: HostSourceRefV1): HostUseReservationV1 | undefined;
+  /** Call before reading or spawning. A new session may have no Pi session file yet. */
+  beginHostUse(source: HostUseSourceRefV1): HostUseReservationV1 | undefined;
   listPendingHostUses(): readonly HostUseRecordV1[];
   /** Recover only after verifying the stated no-child or exact-child-exited condition. */
   recoverHostUse(id: string, evidence: HostUseRecoveryV1): boolean;
@@ -104,7 +116,7 @@ class HostStorage implements HostStorageV1 {
     };
   }
 
-  beginHostUse(source: HostSourceRefV1): HostUseReservationV1 | undefined {
+  beginHostUse(source: HostUseSourceRefV1): HostUseReservationV1 | undefined {
     this.#ensureOpen();
     const record = this.#store.beginHostUse(source);
     if (!record) return undefined;

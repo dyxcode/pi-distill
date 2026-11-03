@@ -6,7 +6,7 @@ import type {
   TaskPage,
   WaitReason
 } from "../distill/tasks.ts";
-import type { CompletedDeletionReceiptV1, HostChildIdentityV1, HostSourceRefV1, HostUseRecordV1, HostUseRecoveryV1, SessionDeletion } from '../retention/types.ts';
+import type { CompletedDeletionReceiptV1, HostChildIdentityV1, HostSourceRefV1, HostUseRecordV1, HostUseRecoveryV1, HostUseSourceRefV1, SessionDeletion } from '../retention/types.ts';
 import { cleanTaskColumns, deletionColumns, hostUseColumns, jobColumns, sessionUsageColumns, textColumn } from './columns.ts';
 import type { StorageConnection } from './connection.ts';
 import type { DistillQueue } from './distill.ts';
@@ -14,7 +14,7 @@ import { parsePersistedJobRow } from './evidence-validation.ts';
 import { maxTaskPageSize } from './limits.ts';
 import type { PersistedCleanTask } from './records.ts';
 import { parseStoredSessionUsage, processHasExited } from './session-validation.ts';
-import { parseHostChildIdentity, parseHostSourceRef, parseHostUseRecovery, parseStoredHostUse } from './host-use-validation.ts';
+import { parseHostChildIdentity, parseHostSourceRef, parseHostUseRecovery, parseHostUseSourceRef, parseStoredHostUse } from './host-use-validation.ts';
 import type { SessionRecords } from './sessions.ts';
 import { SourceRegistry } from "./source-registry.ts";
 import { cleanTaskId, parseCleanTaskInput, parsePersistedCleanTask, parseTaskPageOptions } from './task-validation.ts';
@@ -216,14 +216,16 @@ export class RetentionTasks {
   }
 
   /** Persist a host's pre-read/pre-spawn reservation under the cleanup mutex. */
-  beginHostUse(input: HostSourceRefV1): HostUseRecordV1 | undefined {
+  beginHostUse(input: HostUseSourceRefV1): HostUseRecordV1 | undefined {
     this.connection.ensureOpen();
-    const source = parseHostSourceRef(input);
+    const source = parseHostUseSourceRef(input);
     const access = this.acquireSourceAccess();
     if (!access) return undefined;
     try {
       return this.connection.transaction(() => {
-        const registered = this.dependencies.sources.get(source.sessionFile, source.sessionId);
+        const registered = source.sessionFile === undefined
+          ? undefined
+          : this.dependencies.sources.get(source.sessionFile, source.sessionId);
         if (registered && registered.cwd !== source.cwd) throw new Error("Host source working directory does not match its registered source.");
         if (registered && source.sourceGeneration !== undefined && source.sourceGeneration !== registered.generation) {
           throw new Error("Host source generation does not match its registered source.");
@@ -236,8 +238,8 @@ export class RetentionTasks {
           "INSERT INTO host_session_uses " +
           "(id, session_id, session_file, cwd, source_generation, owner_pid, created_at, state, child_pid, child_token) " +
           "VALUES (?, ?, ?, ?, ?, ?, ?, 'opening', NULL, NULL)",
-        ).run(id, source.sessionId, source.sessionFile, source.cwd, sourceGeneration, ownerPid, createdAt);
-        return { id, sessionId: source.sessionId, sessionFile: source.sessionFile, cwd: source.cwd, sourceGeneration, ownerPid, createdAt, state: "opening", child: null };
+        ).run(id, source.sessionId, source.sessionFile ?? null, source.cwd, sourceGeneration, ownerPid, createdAt);
+        return { id, sessionId: source.sessionId, sessionFile: source.sessionFile ?? null, cwd: source.cwd, sourceGeneration, ownerPid, createdAt, state: "opening", child: null };
       });
     } finally {
       this.releaseSourceAccess(access);

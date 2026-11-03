@@ -13,7 +13,7 @@ import { parseInput, parseMemory } from './memory-validation.ts';
 import type { MemoryEvidence, PersistedDistillTrigger, SchemaColumn } from './records.ts';
 import type { RetentionTasks } from './retention.ts';
 import { DISTILL_SCHEDULE_SCHEMAS } from "./schedule.ts";
-import { cleanTasksSchema, consolidationJobsSchema, consolidationJobsV3Schema, consolidationProgressSchema, consolidationProgressSchemaV6, currentSchema, deletionsSchema, deletionsSchemaV5, distillFailuresSchema, distillLeaseSchema, distillTriggersSchema, hostSessionUsesSchema, hostSessionUsesByFileSchema, hostSessionUsesBySessionSchema, latestSchemaVersion, legacySchema, memoryEvidenceSchema, memoryOriginsSchema, memoryOriginsSchemaV6, metadataGcSchema, sessionObservationsSchema, sessionUsagesSchema, sourceAccessSchema, sourceBackfillSchema, storeIndexes, storeIndexesV7, storeSchemas, storeSchemasV7, storeSchemasV8, storeSchemasV9, triggerJobsSchema } from './schema-definitions.ts';
+import { cleanTasksSchema, consolidationJobsSchema, consolidationJobsV3Schema, consolidationProgressSchema, consolidationProgressSchemaV6, currentSchema, deletionsSchema, deletionsSchemaV5, distillFailuresSchema, distillLeaseSchema, distillTriggersSchema, hostSessionUsesSchema, hostSessionUsesByFileSchema, hostSessionUsesBySessionSchema, latestSchemaVersion, legacySchema, memoryEvidenceSchema, memoryOriginsSchema, memoryOriginsSchemaV6, metadataGcSchema, sessionObservationsSchema, sessionUsagesSchema, sourceAccessSchema, sourceBackfillSchema, storeIndexes, storeIndexesV7, storeSchemas, storeSchemasV7, storeSchemasV8, storeSchemasV9, storeSchemasV9V13, triggerJobsSchema } from './schema-definitions.ts';
 import { parseStoredSessionObservation, parseStoredSessionUsage } from './session-validation.ts';
 import { parseStoredHostUse } from './host-use-validation.ts';
 import { SOURCE_INDEX_SCHEMAS } from "./source-index.ts";
@@ -36,7 +36,7 @@ export class SchemaManager {
 
   initializeSchema(): void {
     const version = this.connection.database.prepare("PRAGMA user_version").get()?.["user_version"];
-    if (version !== 0 && version !== 1 && version !== 2 && version !== 3 && version !== 4 && version !== 5 && version !== 6 && version !== 7 && version !== 8 && version !== 9 && version !== 10 && version !== 11 && version !== 12 && version !== latestSchemaVersion) {
+    if (version !== 0 && version !== 1 && version !== 2 && version !== 3 && version !== 4 && version !== 5 && version !== 6 && version !== 7 && version !== 8 && version !== 9 && version !== 10 && version !== 11 && version !== 12 && version !== 13 && version !== latestSchemaVersion) {
       throw new Error("Unsupported memory database schema version: " + String(version) + ".");
     }
     if (version === latestSchemaVersion) {
@@ -151,11 +151,32 @@ export class SchemaManager {
     }
     if (version < 13) {
       for (const sql of [hostSessionUsesSchema, hostSessionUsesByFileSchema, hostSessionUsesBySessionSchema]) this.connection.database.exec(sql);
-      this.connection.database.exec("PRAGMA user_version = 13");
+      this.connection.database.exec("PRAGMA user_version = 14");
+    } else if (version === 13) {
+      this.migrateV13ToV14();
     }
     this.validateLatestSchema();
     this.validateAllRows();
     this.dependencies.retention.sourceAccess();
+  }
+
+  private migrateV13ToV14(): void {
+    const currentVersion = this.connection.database.prepare("PRAGMA user_version").get()?.["user_version"];
+    if (currentVersion !== 13) throw new Error("Memory schema migration expected version 13.");
+    this.connection.database.exec(
+      "DROP INDEX host_session_uses_by_file; " +
+        "DROP INDEX host_session_uses_by_session; " +
+        "ALTER TABLE host_session_uses RENAME TO host_session_uses_v13; " +
+        hostSessionUsesSchema + "; " +
+        "INSERT INTO host_session_uses " +
+        "(id, session_id, session_file, cwd, source_generation, owner_pid, created_at, state, child_pid, child_token) " +
+        "SELECT id, session_id, session_file, cwd, source_generation, owner_pid, created_at, state, child_pid, child_token " +
+        "FROM host_session_uses_v13; " +
+        "DROP TABLE host_session_uses_v13; " +
+        hostSessionUsesByFileSchema + "; " +
+        hostSessionUsesBySessionSchema + "; " +
+        "PRAGMA user_version = 14",
+    );
   }
 
   private migrateV6ToV7(): void {
@@ -458,7 +479,7 @@ export class SchemaManager {
       });
     }
     const additional = typeof schemaVersion === "number" && schemaVersion >= 6
-      ? [...SOURCE_REGISTRY_SCHEMAS, ...(schemaVersion >= 9 ? SOURCE_INDEX_SCHEMAS : []), ...(schemaVersion >= 10 ? SOURCE_VIEW_SCHEMAS : []), ...(schemaVersion >= 11 ? SOURCE_COVERAGE_SCHEMAS : []), ...(schemaVersion >= 12 ? DISTILL_SCHEDULE_SCHEMAS : []), ...(schemaVersion >= 13 ? storeSchemasV9 : usesV8Metadata ? storeSchemasV8 : usesV7Metadata ? storeSchemasV7 : storeSchemas)]
+      ? [...SOURCE_REGISTRY_SCHEMAS, ...(schemaVersion >= 9 ? SOURCE_INDEX_SCHEMAS : []), ...(schemaVersion >= 10 ? SOURCE_VIEW_SCHEMAS : []), ...(schemaVersion >= 11 ? SOURCE_COVERAGE_SCHEMAS : []), ...(schemaVersion >= 12 ? DISTILL_SCHEDULE_SCHEMAS : []), ...(schemaVersion === 13 ? storeSchemasV9V13 : schemaVersion >= 14 ? storeSchemasV9 : usesV8Metadata ? storeSchemasV8 : usesV7Metadata ? storeSchemasV7 : storeSchemas)]
       : [];
     const extraSchemas = new Map(additional.map(schema => [schema.name, schema.sql]));
     if (objects.length !== schemas.size + extraSchemas.size) throw new Error("Unsupported memory database schema.");

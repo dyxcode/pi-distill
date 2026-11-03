@@ -19,6 +19,8 @@ export interface SessionDeletion {
 
 export type {
   HostSourceRefV1,
+  HostUseSourceIdentityV1,
+  HostUseSourceRefV1,
   HostChildIdentityV1,
   HostUseRecordV1,
   HostUseRecoveryV1,

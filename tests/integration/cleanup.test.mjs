@@ -614,6 +614,25 @@ test('public host read access fences an actual source read from cleanup', async 
  await assert.rejects(readFile(f.file),{code:'ENOENT'});
 });
 
+test('a pre-spawn host use without a session file blocks cleanup by session ID', async t => {
+ const f=await fixture(t);await f.complete();await releaseFixture(f);f.store.enqueueCleanTask(f.input());
+ const host=openHostStorageV1(f.path);t.after(()=>host.close());
+ const input=f.input();
+ const reservation=host.beginHostUse({sessionId:input.sessionId,cwd:input.cwd});
+ assert.ok(reservation);
+ assert.equal(reservation.sourceGeneration,null);
+ assert.equal(host.listPendingHostUses().find(record=>record.id===reservation.id)?.sessionFile,null);
+ assert.throws(()=>host.beginHostUse({
+  sessionId:input.sessionId,cwd:input.cwd,sourceGeneration:'00000000-0000-4000-8000-000000000001',
+ }),/generation requires a session file/i);
+ assert.throws(()=>host.acquireSourceRead({sessionId:input.sessionId,cwd:input.cwd}),/session file/i);
+ assert.throws(()=>host.getCompletedDeletion({sessionId:input.sessionId,cwd:input.cwd}),/session file/i);
+ const c=f.worker();c.wake();await c.whenIdle();assert.ok(await readFile(f.file));
+ assert.equal(f.task().waitReason,'usage');
+ assert.equal(host.recoverHostUse(reservation.id,{kind:'opening-abandoned'}),true);
+ c.wake();await c.whenIdle();await assert.rejects(readFile(f.file),{code:'ENOENT'});
+});
+
 test('durable pre-spawn host use blocks cleanup until the matching child close', async t => {
  const f=await fixture(t);await f.complete();await releaseFixture(f);f.store.enqueueCleanTask(f.input());
  const host=openHostStorageV1(f.path);t.after(()=>host.close());

@@ -197,7 +197,7 @@ test(`v${legacyVersion} legacy source backfill resumes in bounded passes across 
   store = f.open();
   const version = new DatabaseSync(f.path);
   try {
-    assert.equal(version.prepare("PRAGMA user_version").get().user_version, 13);
+    assert.equal(version.prepare("PRAGMA user_version").get().user_version, 14);
   } finally {
     version.close();
   }

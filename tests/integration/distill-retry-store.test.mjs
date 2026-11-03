@@ -524,7 +524,7 @@ test("opening a v7 database preserves memories and pending distillation work dur
   const migrated = f.open();
   const check = new DatabaseSync(f.path);
   try {
-    assert.equal(check.prepare("PRAGMA user_version").get().user_version, 13);
+    assert.equal(check.prepare("PRAGMA user_version").get().user_version, 14);
   } finally {
     check.close();
   }
