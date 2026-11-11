@@ -86,7 +86,9 @@ test('real Pi automatically records a storage failure and subsequent recovery wi
   assert.deepEqual(result.statuses,['unavailable','ok']);
   const records=result.records.filter(event=>event.operation==='memory.search');
   assert.deepEqual(records.map(event=>event.outcome),['failed','recovered']);
-  assert.equal(records[0].errorCode,'ERR_SQLITE_ERROR');
-  assert.equal(records[0].piVersion,'1.3.0');assert.equal(records[0].extensionVersion,JSON.parse(await readFile(join(repoRoot,'package.json'),'utf8')).version);
+  assert.equal(records[0].errorCode, 'ERR_SQLITE_ERROR');
+  const piPackage = JSON.parse(await readFile(join(repoRoot, 'node_modules', '@earendil-works', 'pi-coding-agent', 'package.json'), 'utf8'));
+  assert.equal(records[0].piVersion, piPackage.version);
+  assert.equal(records[0].extensionVersion, JSON.parse(await readFile(join(repoRoot, 'package.json'), 'utf8')).version);
   assert.ok(!JSON.stringify(result.records).includes('private synthetic words'));
 });
