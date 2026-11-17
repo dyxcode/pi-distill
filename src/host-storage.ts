@@ -164,3 +164,5 @@ class HostStorage implements HostStorageV1 {
 export function openHostStorageV1(databasePath: string): HostStorageV1 {
   return new HostStorage(databasePath);
 }
+
+export { openMemoryReaderV1, HostMemoryError, type HostMemoryReaderV1, type HostMemorySearchRequestV1, type HostMemorySearchResponseV1, type HostMemoryReadRequestV1, type HostMemoryReadResponseV1 } from "./memory/host-reader.ts";

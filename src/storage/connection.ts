@@ -5,14 +5,14 @@ import { DatabaseSync } from 'node:sqlite';
 export class StorageConnection {
   readonly database: DatabaseSync;
   readonly textDecoder: TextDecoder;
-  constructor(path: string) {
+  constructor(path: string, options: { readOnly?: boolean } = {}) {
     if (typeof path !== 'string' || !isAbsolute(path)) throw new TypeError('Memory database requires an absolute file path.');
-    this.database = new DatabaseSync(path, { timeout: 1_000 });
+    this.database = new DatabaseSync(path, { timeout: 1_000, readOnly: options.readOnly ?? false });
     try {
       const encoding = this.database.prepare('PRAGMA encoding').get()?.['encoding'];
       if (encoding !== 'UTF-8' && encoding !== 'UTF-16le' && encoding !== 'UTF-16be') throw new Error('Unsupported memory database text encoding.');
       this.textDecoder = new TextDecoder(encoding, { fatal: true, ignoreBOM: true });
-      this.database.exec('PRAGMA synchronous = FULL');
+      if (!options.readOnly) this.database.exec('PRAGMA synchronous = FULL');
     } catch (error) { this.database.close(); throw error; }
   }
   close(): void {

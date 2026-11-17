@@ -21,7 +21,7 @@ try {
   execFileSync(process.execPath, ['--input-type=module', '-e', `
     import assert from 'node:assert/strict';
     import { join } from 'node:path';
-    import { openHostStorageV1 } from 'pi-distill/host-storage';
+    import { openHostStorageV1, openMemoryReaderV1 } from 'pi-distill/host-storage';
     const storage = openHostStorageV1(join(process.cwd(), 'memories.sqlite'));
     assert.equal(storage.version, 1);
     const ref = { sessionId: 'synthetic', sessionFile: join(process.cwd(), 'session.jsonl'), cwd: process.cwd() };
@@ -34,13 +34,21 @@ try {
     assert.equal(storage.listPendingHostUses()[0].state, 'opening');
     assert.equal(storage.recoverHostUse(use.id, { kind: 'opening-abandoned' }), true);
     storage.close();
+    const reader = openMemoryReaderV1(join(process.cwd(), 'memories.sqlite'));
+    assert.equal(reader.version, 1);
+    assert.deepEqual(reader.search({query: 'synthetic'}), {items: []});
+    reader.close();
   `], { cwd: temporary, env, stdio: 'inherit' });
   await writeFile(join(temporary, 'consumer.mts'), `
-    import { openHostStorageV1, type HostSourceRefV1, type CompletedDeletionReceiptV1 } from 'pi-distill/host-storage';
+    import { openHostStorageV1, type HostSourceRefV1, type CompletedDeletionReceiptV1, openMemoryReaderV1, type HostMemoryReadResponseV1 } from 'pi-distill/host-storage';
     const source: HostSourceRefV1 = { sessionId: 'synthetic', sessionFile: '/tmp/session.jsonl', cwd: '/tmp' };
     const storage = openHostStorageV1('/tmp/memories.sqlite');
     const receipt: CompletedDeletionReceiptV1 | undefined = storage.getCompletedDeletion(source);
     void receipt;
+    const reader = openMemoryReaderV1('/tmp/memories.sqlite');
+    const page: HostMemoryReadResponseV1 = reader.read({id: 'synthetic', expectedRevision: 1});
+    void page;
+    reader.close();
   `);
   await writeFile(join(temporary, 'tsconfig.json'), JSON.stringify({
     compilerOptions: { target: 'ES2022', module: 'NodeNext', moduleResolution: 'NodeNext', strict: true, noEmit: true, types: [] },
