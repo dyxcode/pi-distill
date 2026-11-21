@@ -8,6 +8,7 @@ import { SQLiteMemoryStore } from '../../src/storage/store.ts';
 
 const repository = resolve('.');
 const cli = resolve('node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js');
+const standaloneBinary = process.env.PI_TEST_STANDALONE_BINARY;
 const providerExtension = resolve('tests/helpers/task-pi-cli-provider.mjs');
 const distillExtension = resolve('src/index.ts');
 const ptyRelay = `import errno, os, pty, select, signal, sys
@@ -82,7 +83,7 @@ function startInteractivePi(root, logPath, { initialPrompt = true, delayMs }) {
     PI_TASK_TEST_DISTILL_DELAY_MS: String(delayMs),
   };
   const args = [
-    process.execPath, cli,
+    ...(standaloneBinary ? [resolve(standaloneBinary)] : [process.execPath, cli]),
     '--extension', distillExtension,
     '--extension', providerExtension,
     '--model', 'task-test/synthetic',
