@@ -26,7 +26,7 @@ async function fixture(t,long=false){
   // Synthetic distillation participates in the same source-access protocol as
   // the running cleaner, so its fixture writes cannot race a coverage page.
   const deadline=Date.now()+5000;let access;
-  while(!(access=store.acquireSourceAccess())&&Date.now()<deadline)await new Promise(r=>setTimeout(r,10));
+  while(!(access=store.acquireSourceAccess(file,'read'))&&Date.now()<deadline)await new Promise(r=>setTimeout(r,10));
   assert.ok(access,'synthetic distillation must acquire source access');
   try{
    const v=await view(leaf);let cursor=0;
@@ -87,7 +87,7 @@ test('v10 upgrade preserves an indexed source and pending work while adding incr
  const f=await fixture(t);const v=await f.view('left');const expected=(await v.page()).items.map(i=>i.part.key);
  f.store.save({id:'before-upgrade',content:'Retain this synthetic memory.',createdAt:at});f.store.close();
  const {SOURCE_COVERAGE_SCHEMAS}=await import('../../src/storage/coverage.ts');const {DatabaseSync}=await import('node:sqlite');const raw=new DatabaseSync(join(f.root,'memory.sqlite'));
- for(const schema of [...SOURCE_COVERAGE_SCHEMAS,...(await import('../../src/storage/schedule.ts')).DISTILL_SCHEDULE_SCHEMAS].reverse()){const type=schema.sql.split(' ')[1];raw.exec(`DROP ${type} ${schema.name}`);}raw.exec('DROP TABLE host_session_uses; PRAGMA user_version=10');raw.close();
+ for(const schema of [...SOURCE_COVERAGE_SCHEMAS,...(await import('../../src/storage/schedule.ts')).DISTILL_SCHEDULE_SCHEMAS].reverse()){const type=schema.sql.split(' ')[1];raw.exec(`DROP ${type} ${schema.name}`);}raw.exec('DROP TABLE host_session_uses; DROP INDEX IF EXISTS source_access_by_file; DROP TABLE source_access; CREATE TABLE source_access (singleton INTEGER PRIMARY KEY NOT NULL CHECK (singleton = 1), token TEXT NOT NULL, owner_pid INTEGER NOT NULL CHECK (owner_pid > 0)) STRICT; PRAGMA user_version=10');raw.close();
  const upgraded=f.open();assert.equal(upgraded.get('before-upgrade').content,'Retain this synthetic memory.');
  const result=await upgraded.sourceViews.advance(f.file,'left');assert.ok(result.ready);assert.deepEqual((await result.view.page()).items.map(i=>i.part.key),expected);
  assert.ok(upgraded.listCleanTasks({limit:10}).items.length);assert.doesNotThrow(()=>upgraded.retentionVersion([f.file]));

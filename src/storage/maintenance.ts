@@ -14,7 +14,7 @@ import { fields, validateAbsolutePath, validateNow, validateText } from './valid
 interface Dependencies {
   readonly sourceViews: SourceViews;
   readonly sourceIndex: SourceIndex;
-  readonly retention: Pick<RetentionTasks, "acquireSourceAccess" | "releaseSourceAccess" | "getDeletion" | "scopeFilter" | "sourceRetentionState">;
+  readonly retention: Pick<RetentionTasks, "hasLiveSourceAccess" | "getDeletion" | "scopeFilter" | "sourceRetentionState">;
   readonly sources: SourceRegistry;
   readonly distill: Pick<DistillQueue, "parseTriggerRow" | "clearDistillFailure">;
 }
@@ -24,6 +24,7 @@ export class MetadataMaintenance {
   private readonly dependencies: Dependencies;
   constructor(connection: StorageConnection, dependencies: Dependencies) { this.connection = connection; this.dependencies = dependencies; }
   #gcBoundaries: { core: number[]; derived: number[]; } | undefined;
+  #gcContended = false;
 
   /** Bounded conversion of the old task-derived inventory; safe to repeat after interruption. */
   backfillSources(limit = 128): boolean {
@@ -35,10 +36,8 @@ export class MetadataMaintenance {
   collectMetadata(limit = maxMetadataGcPageSize): { readonly removed: number; readonly hasMore: boolean; readonly contended: boolean; } {
     this.connection.ensureOpen();
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > maxMetadataGcPageSize) throw new TypeError("Invalid metadata collection page size.");
-    const access = this.dependencies.retention.acquireSourceAccess();
-    if (!access) return { removed: 0, hasMore: true, contended: true };
-    try {
-      return this.connection.transaction(() => {
+    this.#gcContended = false;
+    return this.connection.transaction(() => {
         // Bits 1/2 latch completed collectors; bit 4 requests a fresh sweep after
         // removals. Retained rows do not require both collectors to end together.
         let state = this.dependencies.sources.readCursor("gc") ?? 0;
@@ -75,9 +74,8 @@ export class MetadataMaintenance {
         const hasMore = !finished || (state & 4) !== 0;
         this.dependencies.sources.writeCursor("gc", finished ? null : state);
         if (finished) this.#gcBoundaries = undefined;
-        return { removed, hasMore, contended: false };
+        return { removed, hasMore: hasMore || this.#gcContended, contended: this.#gcContended };
       });
-    } finally { this.dependencies.retention.releaseSourceAccess(access); }
   }
 
   private collectOperationalMetadata(limit: number, through: readonly number[]): { readonly removed: number; readonly hasMore: boolean; } {
@@ -229,6 +227,10 @@ export class MetadataMaintenance {
   }
 
   private metadataSourceEligible(sessionFile: string, sessionId: string): { readonly generation: string; } | undefined {
+    if (this.dependencies.retention.hasLiveSourceAccess(sessionFile)) {
+      this.#gcContended = true;
+      return undefined;
+    }
     const source = this.dependencies.sources.get(sessionFile, sessionId);
     if (!source || !source.deleted) return undefined;
     const receipt = this.dependencies.retention.getDeletion(sessionFile);

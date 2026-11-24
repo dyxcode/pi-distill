@@ -166,7 +166,10 @@ export const cleanTasksSchema =
   "(lease_owner IS NOT NULL AND lease_until IS NOT NULL))" +
   ") STRICT";
 
-export const sourceAccessSchema = "CREATE TABLE source_access (singleton INTEGER PRIMARY KEY NOT NULL CHECK (singleton = 1), token TEXT NOT NULL, owner_pid INTEGER NOT NULL CHECK (owner_pid > 0)) STRICT";
+export const sourceAccessSchemaV5 = "CREATE TABLE source_access (singleton INTEGER PRIMARY KEY NOT NULL CHECK (singleton = 1), token TEXT NOT NULL, owner_pid INTEGER NOT NULL CHECK (owner_pid > 0)) STRICT";
+
+export const sourceAccessSchema = "CREATE TABLE source_access (token TEXT PRIMARY KEY NOT NULL, session_file TEXT NOT NULL, mode TEXT NOT NULL CHECK (mode IN ('read', 'delete')), owner_pid INTEGER NOT NULL CHECK (owner_pid > 0)) STRICT";
+export const sourceAccessByFileSchema = "CREATE INDEX source_access_by_file ON source_access (session_file, mode, token)";
 
 export const hostSessionUsesSchema = "CREATE TABLE host_session_uses (" +
   "id TEXT PRIMARY KEY NOT NULL, " +
@@ -249,4 +252,8 @@ export const storeSchemasV9 = [...storeSchemasV8,
   { name: "host_session_uses_by_session", sql: hostSessionUsesBySessionSchema },
 ];
 
-export const latestSchemaVersion = 14;
+export const storeSchemasV15 = [...storeSchemasV9,
+  { name: "source_access_by_file", sql: sourceAccessByFileSchema },
+];
+
+export const latestSchemaVersion = 15;

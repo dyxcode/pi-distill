@@ -198,16 +198,44 @@ export class RetentionTasks {
     ).get(path, path, path, path) !== undefined;
   }
 
-  /** Serializes bounded internal source reads and cleanup. Never held during LLM work. */
-  acquireSourceAccess(): string | undefined {
+  /** Coordinates per-session reads (shared) and deletion (exclusive). Never held during LLM work. */
+  acquireSourceAccess(sessionFile: string, mode: "read" | "delete" = "delete"): string | undefined {
+    validateAbsolutePath(sessionFile, "Source access path");
+    if (mode !== "read" && mode !== "delete") throw new TypeError("Source access mode must be read or delete.");
     return this.connection.transaction(() => {
-      const access = this.sourceAccess();
-      if (access && !processHasExited(access.pid)) return undefined;
+      const rows = this.connection.database.prepare(
+        `SELECT ${textColumn("token")}, ${textColumn("session_file", "sessionFile")}, ${textColumn("mode")}, owner_pid FROM source_access WHERE session_file = ?`,
+      ).all(sessionFile);
+      let hasLiveRead = false;
+      let hasLiveDelete = false;
+      for (const raw of rows) {
+        const parsed = this.parseSourceAccessRow(this.connection.decodeRow(raw));
+        if (processHasExited(parsed.pid)) {
+          this.connection.database.prepare("DELETE FROM source_access WHERE token = ?").run(parsed.token);
+          continue;
+        }
+        if (parsed.mode === "delete") hasLiveDelete = true;
+        else hasLiveRead = true;
+      }
+      if (hasLiveDelete || (mode === "delete" && hasLiveRead)) return undefined;
       const token = randomUUID();
-      this.connection.database.prepare("DELETE FROM source_access").run();
-      this.connection.database.prepare("INSERT INTO source_access VALUES (1, ?, ?)").run(token, process.pid);
+      this.connection.database.prepare(
+        "INSERT INTO source_access (token, session_file, mode, owner_pid) VALUES (?, ?, ?, ?)",
+      ).run(token, sessionFile, mode, process.pid);
       return token;
     });
+  }
+
+  hasLiveSourceAccess(sessionFile: string): boolean {
+    validateAbsolutePath(sessionFile, "Source access path");
+    const rows = this.connection.database.prepare(
+      `SELECT ${textColumn("token")}, ${textColumn("session_file", "sessionFile")}, ${textColumn("mode")}, owner_pid FROM source_access WHERE session_file = ?`,
+    ).all(sessionFile);
+    for (const raw of rows) {
+      const parsed = this.parseSourceAccessRow(this.connection.decodeRow(raw));
+      if (!processHasExited(parsed.pid)) return true;
+    }
+    return false;
   }
 
   releaseSourceAccess(token: string): boolean {
@@ -219,8 +247,8 @@ export class RetentionTasks {
   beginHostUse(input: HostUseSourceRefV1): HostUseRecordV1 | undefined {
     this.connection.ensureOpen();
     const source = parseHostUseSourceRef(input);
-    const access = this.acquireSourceAccess();
-    if (!access) return undefined;
+    const access = source.sessionFile === undefined ? undefined : this.acquireSourceAccess(source.sessionFile, "read");
+    if (source.sessionFile !== undefined && !access) return undefined;
     try {
       return this.connection.transaction(() => {
         const registered = source.sessionFile === undefined
@@ -242,7 +270,7 @@ export class RetentionTasks {
         return { id, sessionId: source.sessionId, sessionFile: source.sessionFile ?? null, cwd: source.cwd, sourceGeneration, ownerPid, createdAt, state: "opening", child: null };
       });
     } finally {
-      this.releaseSourceAccess(access);
+      if (access) this.releaseSourceAccess(access);
     }
   }
 
@@ -305,14 +333,44 @@ export class RetentionTasks {
     ).run(id, evidence.child.pid, evidence.child.token).changes === 1);
   }
 
-  sourceAccess(): { token: string; pid: number; } | undefined {
-    const raw = this.connection.database.prepare(`SELECT ${textColumn("token")}, owner_pid FROM source_access`).get();
-    if (!raw) return undefined;
-    const row = this.connection.decodeRow(raw);
+  private parseSourceAccessRow(value: unknown): { readonly token: string; readonly sessionFile: string; readonly mode: "read" | "delete"; readonly pid: number; } {
+    const row = fields(value, ["token", "sessionFile", "mode", "owner_pid"]);
     validateText(row["token"], "Stored source token");
+    validateAbsolutePath(row["sessionFile"], "Stored source access path");
+    if (row["mode"] !== "read" && row["mode"] !== "delete") throw new TypeError("Invalid source access mode.");
     const pid = row["owner_pid"];
     if (typeof pid !== "number" || !Number.isSafeInteger(pid) || pid <= 0) throw new TypeError("Invalid source owner PID.");
-    return { token: row["token"], pid };
+    return { token: row["token"], sessionFile: row["sessionFile"], mode: row["mode"], pid };
+  }
+
+  private hasDeleteAccess(sessionFile: string, token: string): boolean {
+    const raw = this.connection.database.prepare(
+      `SELECT ${textColumn("token")}, ${textColumn("session_file", "sessionFile")}, ${textColumn("mode")}, owner_pid FROM source_access WHERE token = ?`,
+    ).get(token);
+    if (!raw) return false;
+    const parsed = this.parseSourceAccessRow(this.connection.decodeRow(raw));
+    return parsed.sessionFile === sessionFile && parsed.mode === "delete" && !processHasExited(parsed.pid);
+  }
+
+  sourceAccess(): { token: string; pid: number; } | undefined {
+    const schemaVersion = this.connection.database.prepare("PRAGMA user_version").get()?.["user_version"];
+    if (typeof schemaVersion === "number" && schemaVersion < 15) {
+      const raw = this.connection.database.prepare(`SELECT ${textColumn("token")}, owner_pid FROM source_access`).get();
+      if (!raw) return undefined;
+      const row = this.connection.decodeRow(raw);
+      validateText(row["token"], "Stored source token");
+      const pid = row["owner_pid"];
+      if (typeof pid !== "number" || !Number.isSafeInteger(pid) || pid <= 0) throw new TypeError("Invalid source owner PID.");
+      return { token: row["token"], pid };
+    }
+    let first: { token: string; pid: number; } | undefined;
+    for (const raw of this.connection.database.prepare(
+      `SELECT ${textColumn("token")}, ${textColumn("session_file", "sessionFile")}, ${textColumn("mode")}, owner_pid FROM source_access`,
+    ).iterate()) {
+      const parsed = this.parseSourceAccessRow(this.connection.decodeRow(raw));
+      first ??= { token: parsed.token, pid: parsed.pid };
+    }
+    return first;
   }
 
   scopeFilter(scope?: readonly string[]): { values: string[]; sql: (column: string) => string; } {
@@ -423,11 +481,12 @@ export class RetentionTasks {
   }
 
   private deletionTask(id: string, owner: string, access: string, version: string, scope?: readonly string[]): CleanTaskInput | undefined {
-    if (this.retentionVersion(scope) !== version || this.sourceAccess()?.token !== access) return undefined;
+    if (this.retentionVersion(scope) !== version) return undefined;
     const raw = this.connection.database.prepare(`SELECT ${cleanTaskColumns} FROM clean_tasks WHERE id = ?`).get(id);
     if (!raw) return undefined;
     const record = parsePersistedCleanTask(this.connection.decodeRow(raw));
     if (record.leaseOwner !== owner || record.leaseUntil === null || record.leaseUntil <= Date.now()) return undefined;
+    if (!this.hasDeleteAccess(record.task.sessionFile, access)) return undefined;
     return record.task;
   }
 

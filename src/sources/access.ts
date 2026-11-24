@@ -4,6 +4,7 @@ import type { SQLiteMemoryStore } from '../storage/store.ts';
 /** A separate connection keeps protection until the actual read ends, even after runtime shutdown. */
 export async function withSourceAccess<T>(
   openStore: () => Pick<SQLiteMemoryStore, "acquireSourceAccess" | "releaseSourceAccess" | "close">,
+  sessionFile: string,
   operation: () => Promise<T>,
   signal?: AbortSignal,
 ): Promise<T> {
@@ -11,7 +12,7 @@ export async function withSourceAccess<T>(
   let token: string | undefined;
   try {
     const deadline = Date.now() + 1_000;
-    while (!(token = store.acquireSourceAccess())) {
+    while (!(token = store.acquireSourceAccess(sessionFile, "read"))) {
       signal?.throwIfAborted();
       if (Date.now() >= deadline) throw new Error("Source access is busy; retry the queued task.");
       await delay(10, undefined, signal ? { signal } : undefined);

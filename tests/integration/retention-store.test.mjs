@@ -13,12 +13,12 @@ async function fixture(t){
  return {a,b,task,path};
 }
 test('source access excludes another reader or cleaner until its actual release',async t=>{
- const {a,b}=await fixture(t);const access=a.acquireSourceAccess();assert.ok(access);
- assert.equal(b.acquireSourceAccess(),undefined);assert.equal(b.releaseSourceAccess('wrong'),false);
- assert.equal(a.releaseSourceAccess(access),true);const next=b.acquireSourceAccess();assert.ok(next);b.releaseSourceAccess(next);
+ const {a,b,task}=await fixture(t);const access=a.acquireSourceAccess(task.sessionFile,'delete');assert.ok(access);
+ assert.equal(b.acquireSourceAccess(task.sessionFile,'delete'),undefined);assert.equal(b.releaseSourceAccess('wrong'),false);
+ assert.equal(a.releaseSourceAccess(access),true);const next=b.acquireSourceAccess(task.sessionFile,'delete');assert.ok(next);b.releaseSourceAccess(next);
 });
 test('durable deletion intent is fenced by metadata changes and current task ownership',async t=>{
- const {a,b,task}=await fixture(t);const access=a.acquireSourceAccess();
+ const {a,b,task}=await fixture(t);const access=a.acquireSourceAccess(task.sessionFile,'delete');
  assert.equal(a.claimCleanTask(task.id,'attempt',Date.now(),60_000),true);
  let version=a.retentionVersion();const {id,status,...input}=task;b.enqueueCleanTask({...input,intentId:'new-range'});
  assert.equal(a.prepareDeletion(task.id,'attempt',access,version,'1:2:3:4:5'),false);
@@ -34,7 +34,7 @@ test('durable deletion intent is fenced by metadata changes and current task own
  a.releaseSourceAccess(access);
 });
 test('a failed file mutation leaves a recoverable deletion intent',async t=>{
- const {a,task}=await fixture(t);const access=a.acquireSourceAccess();a.claimCleanTask(task.id,'attempt',Date.now(),60_000);
+ const {a,task}=await fixture(t);const access=a.acquireSourceAccess(task.sessionFile,'delete');a.claimCleanTask(task.id,'attempt',Date.now(),60_000);
  a.prepareDeletion(task.id,'attempt',access,a.retentionVersion(),'1:2:3:4:5');
  assert.throws(()=>a.finishDeletion(task.id,'attempt',access,a.retentionVersion(),()=>{throw new Error('disk failure');}),/disk failure/);
  assert.equal(a.getDeletion(task.sessionFile).state,'deleting');
@@ -42,7 +42,7 @@ test('a failed file mutation leaves a recoverable deletion intent',async t=>{
 });
 
 test('metadata changes after intent prevent any filesystem mutation',async t=>{
- const {a,b,task}=await fixture(t);const access=a.acquireSourceAccess();a.claimCleanTask(task.id,'attempt',Date.now(),60_000);
+ const {a,b,task}=await fixture(t);const access=a.acquireSourceAccess(task.sessionFile,'delete');a.claimCleanTask(task.id,'attempt',Date.now(),60_000);
  a.prepareDeletion(task.id,'attempt',access,a.retentionVersion(),'1:2:3:4:5');const version=a.retentionVersion();
  b.save({id:'another',content:'A concurrent memory change.',createdAt:'2026-10-23T00:00:00.000Z'});
  let called=false;assert.equal(a.finishDeletion(task.id,'attempt',access,version,()=>{called=true;return true;}),false);
@@ -66,6 +66,7 @@ test('v5 migration preserves pending work and memories while rebuilding source d
   DROP INDEX managed_sources_path_session; DROP INDEX managed_sources_physical; DROP INDEX managed_sources_session_id;
   DROP TABLE source_backfill; DROP TABLE managed_sources;
   DROP TABLE source_registry_cursors; DROP TABLE source_registry_state;
+  DROP INDEX IF EXISTS source_access_by_file; DROP TABLE source_access; CREATE TABLE source_access (singleton INTEGER PRIMARY KEY NOT NULL CHECK (singleton = 1), token TEXT NOT NULL, owner_pid INTEGER NOT NULL CHECK (owner_pid > 0)) STRICT;
   PRAGMA user_version = 5;
  `);raw.close();
  const upgraded=new SQLiteMemoryStore(path);try {
@@ -73,7 +74,7 @@ test('v5 migration preserves pending work and memories while rebuilding source d
   assert.equal(upgraded.listCleanTasks({limit:10}).items[0].id,task.id);
   assert.equal(upgraded.sources.get(task.sessionFile,task.sessionId).headerState,'unknown');
   assert.deepEqual(upgraded.listKnownSessionFiles(),[task.sessionFile]);
-  const access=upgraded.acquireSourceAccess();assert.ok(access);upgraded.releaseSourceAccess(access);
+  const access=upgraded.acquireSourceAccess(task.sessionFile,'delete');assert.ok(access);upgraded.releaseSourceAccess(access);
  } finally {upgraded.close();}
 });
 
@@ -81,7 +82,7 @@ test('v6 migration binds a completed deletion receipt to its existing source gen
  const {a,b,task,path}=await fixture(t);
  const expectedGeneration=a.sources.get(task.sessionFile,task.sessionId).generation;
  const owner='legacy-delete-owner';
- const access=a.acquireSourceAccess();assert.ok(access);
+ const access=a.acquireSourceAccess(task.sessionFile,'delete');assert.ok(access);
  assert.equal(a.claimCleanTask(task.id,owner,Date.now(),60_000),true);
  assert.equal(a.prepareDeletion(task.id,owner,access,a.retentionVersion(),'1:2:3:4:5'),true);
  assert.equal(a.finishDeletion(task.id,owner,access,a.retentionVersion(),()=>true),true);
@@ -98,6 +99,7 @@ test('v6 migration binds a completed deletion receipt to its existing source gen
   DROP TABLE consolidation_progress; CREATE TABLE consolidation_progress (source_key TEXT PRIMARY KEY NOT NULL, job_id TEXT NOT NULL, processed_at INTEGER NOT NULL) STRICT;
   DROP TABLE session_deletions; CREATE TABLE session_deletions (session_file TEXT PRIMARY KEY NOT NULL, session_id TEXT NOT NULL, intent_id TEXT NOT NULL, file_version TEXT NOT NULL, state TEXT NOT NULL CHECK (state IN ('deleting', 'complete'))) STRICT;
   DROP TABLE memory_evidence; DROP TABLE metadata_gc_state; DROP TRIGGER source_fence_session_observations_insert; DROP TRIGGER source_fence_session_observations_update; DROP TRIGGER source_fence_session_observations_delete; DROP TRIGGER source_fence_session_usages_insert; DROP TRIGGER source_fence_session_usages_update; DROP TRIGGER source_fence_session_usages_delete; DROP TRIGGER source_fence_consolidation_jobs_insert; DROP TRIGGER source_fence_consolidation_jobs_update; DROP TRIGGER source_fence_consolidation_jobs_delete; DROP TRIGGER source_fence_distill_triggers_insert; DROP TRIGGER source_fence_distill_triggers_update; DROP TRIGGER source_fence_distill_triggers_delete; DROP TRIGGER source_fence_clean_tasks_insert; DROP TRIGGER source_fence_clean_tasks_update; DROP TRIGGER source_fence_clean_tasks_delete; DROP INDEX source_index_parents; DROP INDEX distill_schedule_probe; DROP INDEX jobs_session_status; DROP INDEX triggers_session_status; DROP TABLE distill_schedule; DROP TABLE distill_schedule_state; DROP TABLE source_coverage; DROP TABLE source_fences; DROP TABLE source_derived_gc; DROP TABLE source_view_parts; DROP TABLE source_view_edits; DROP TABLE source_view_entries; DROP TABLE source_preparation; DROP TABLE source_views; DROP TABLE source_index_entries; DROP TABLE source_index_files; DROP TABLE distill_failures; DROP TABLE host_session_uses;
+  DROP INDEX IF EXISTS source_access_by_file; DROP TABLE source_access; CREATE TABLE source_access (singleton INTEGER PRIMARY KEY NOT NULL CHECK (singleton = 1), token TEXT NOT NULL, owner_pid INTEGER NOT NULL CHECK (owner_pid > 0)) STRICT;
   PRAGMA user_version = 6;
  `);
  const insert=raw.prepare('INSERT INTO session_deletions VALUES (?, ?, ?, ?, ?)');

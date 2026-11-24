@@ -113,13 +113,13 @@ async function releaseFixture(f) {
 
 test('a source access reservation prevents cleanup until the actual read finishes',async t=>{
  const f=await fixture(t);await f.complete();await releaseFixture(f);f.store.enqueueCleanTask(f.input());
- const access=f.store.acquireSourceAccess();const c=f.worker();c.wake();await c.whenIdle();assert.ok(await readFile(f.file));
+ const access=f.store.acquireSourceAccess(f.file, 'read');const c=f.worker();c.wake();await c.whenIdle();assert.ok(await readFile(f.file));
  f.store.releaseSourceAccess(access);c.wake();await c.whenIdle();await assert.rejects(readFile(f.file),{code:'ENOENT'});
 });
 
 test('a replacement file is retained when recovering an earlier deletion intent',async t=>{
  const f=await fixture(t);await f.complete();await releaseFixture(f);const task=f.store.enqueueCleanTask(f.input());
- const access=f.store.acquireSourceAccess();f.store.claimCleanTask(task.id,'intent',Date.now(),60_000);
+ const access=f.store.acquireSourceAccess(f.file, 'delete');f.store.claimCleanTask(task.id,'intent',Date.now(),60_000);
  f.store.prepareDeletion(task.id,'intent',access,f.store.retentionVersion(),'1:2:3:4:5');
  f.store.releaseCleanTask(task.id,'intent');f.store.releaseSourceAccess(access);
  const bytes=await readFile(f.file);const c=f.worker();c.wake();await c.whenIdle();assert.deepEqual(await readFile(f.file),bytes);
@@ -202,7 +202,7 @@ test('a changed same-file intent can be reassessed after the new content is proc
  const {lstatSync}=await import('node:fs');
  const f=await fixture(t);await f.complete();await releaseFixture(f);const task=f.store.enqueueCleanTask(f.input());
  const info=lstatSync(f.file,{bigint:true});const version=[info.dev,info.ino,info.size,info.mtimeNs,info.ctimeNs].join(':');
- const access=f.store.acquireSourceAccess();f.store.claimCleanTask(task.id,'old-intent',Date.now(),60_000);
+ const access=f.store.acquireSourceAccess(f.file, 'delete');f.store.claimCleanTask(task.id,'old-intent',Date.now(),60_000);
  f.store.prepareDeletion(task.id,'old-intent',access,f.store.retentionVersion(),version);
  f.store.releaseCleanTask(task.id,'old-intent');f.store.releaseSourceAccess(access);
  f.manager.appendMessage({role:'user',content:'New synthetic conclusion after the old assessment.',timestamp:3});await f.save();
@@ -388,7 +388,7 @@ test('two actual Pi-side worker processes coordinate one deletion',async t=>{
 
 test('cleanup automatically resumes after a source reservation is released without another wake', async t => {
   const f = await fixture(t); await f.complete(); await releaseFixture(f);
-  const access = f.store.acquireSourceAccess(); assert.ok(access);
+  const access = f.store.acquireSourceAccess(f.file, 'read'); assert.ok(access);
   t.mock.timers.enable({apis:['setTimeout','Date'],now:Date.now()});
   const c = f.worker({retryDelayMs:undefined}); c.wake(); await c.whenIdle();
   assert.ok(await readFile(f.file));
@@ -399,10 +399,10 @@ test('cleanup automatically resumes after a source reservation is released witho
 
 test('a held reservation uses bounded backoff and a later release resumes cleanup without host activity', async t => {
   const f=await fixture(t);await f.complete();await releaseFixture(f);
-  const access=f.store.acquireSourceAccess();let probes=0;
+  const access=f.store.acquireSourceAccess(f.file, 'delete');let probes=0;
   const openObservedStore=()=>{
     const store=new SQLiteMemoryStore(f.path), acquire=store.acquireSourceAccess.bind(store);
-    t.mock.method(store,'acquireSourceAccess',()=>{probes++;return acquire();});
+    t.mock.method(store,'acquireSourceAccess',(...args)=>{probes++;return acquire(...args);});
     return store;
   };
   t.mock.timers.enable({apis:['setTimeout','Date'],now:Date.now()});
@@ -421,7 +421,7 @@ test('a wake bypassing an old assessment survives temporary contention without a
   const f=await fixture(t);await f.complete();
   const previous=f.worker();previous.wake();await previous.whenIdle();previous.close();
   assert.equal(f.task().waitReason,'usage');await releaseFixture(f);
-  const access=f.store.acquireSourceAccess();
+  const access=f.store.acquireSourceAccess(f.file, 'read');
   t.mock.timers.enable({apis:['setTimeout','Date'],now:Date.now()});
   const c=f.worker({retryDelayMs:undefined});c.wake();await c.whenIdle();
   f.store.releaseSourceAccess(access);
@@ -553,7 +553,7 @@ test('an exited process releases contention for automatic cleanup without anothe
 });
 
 test('closing while maintenance is waiting cancels automatic continuation and a new worker resumes',async t=>{
-  const f=await fixture(t);await f.complete();await releaseFixture(f);const access=f.store.acquireSourceAccess();
+  const f=await fixture(t);await f.complete();await releaseFixture(f);const access=f.store.acquireSourceAccess(f.file, 'read');
   t.mock.timers.enable({apis:['setTimeout','Date'],now:Date.now()});
   const first=f.worker({retryDelayMs:undefined});first.wake();await first.whenIdle();first.close();
   f.store.releaseSourceAccess(access);t.mock.timers.tick(30000);await first.whenIdle();assert.ok(await readFile(f.file));
@@ -561,7 +561,7 @@ test('closing while maintenance is waiting cancels automatic continuation and a 
 });
 
 test('repeated wakes coalesce and still yield between maintenance passes',async t=>{
-  const f=await fixture(t);await f.complete();await releaseFixture(f);const access=f.store.acquireSourceAccess();
+  const f=await fixture(t);await f.complete();await releaseFixture(f);const access=f.store.acquireSourceAccess(f.file, 'read');
   t.mock.timers.enable({apis:['setTimeout','Date'],now:Date.now()});
   const c=f.worker({retryDelayMs:undefined});for(let i=0;i<100;i++)c.wake();await c.whenIdle();
   f.store.releaseSourceAccess(access);assert.ok(await readFile(f.file));
@@ -570,7 +570,7 @@ test('repeated wakes coalesce and still yield between maintenance passes',async 
 
 test('two actual cleanup processes retry a released reservation without a second wake', {timeout:15000}, async t=>{
   const f=await fixture(t);await f.complete();await releaseFixture(f);
-  const access=f.store.acquireSourceAccess();
+  const access=f.store.acquireSourceAccess(f.file, 'read');
   const a=fixtureChild(t,f,'clean-auto',f.input()),b=fixtureChild(t,f,'clean-auto',f.input());
   await Promise.all([once(a.child,'message'),once(b.child,'message')]);
   const replies=[once(a.child,'message'),once(b.child,'message')];

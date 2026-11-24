@@ -209,7 +209,7 @@ function deleteSource(store, sessionFile, owner) {
   assert.ok(task, `completion should have queued cleanup for ${sessionFile}`);
   const now = Date.now();
   assert.equal(store.claimCleanTask(task.id, owner, now, 60_000), true);
-  const access = store.acquireSourceAccess();
+  const access = store.acquireSourceAccess(sessionFile, "delete");
   assert.ok(access);
   try {
     assert.equal(store.prepareDeletion(task.id, owner, access, store.retentionVersion(), "1:2:3:4:5"), true);
@@ -723,10 +723,26 @@ test('a metadata round with unequal retained core and derived sweeps finishes ac
 });
 
 test('source access contention is reported separately from completed metadata work',async t=>{
-  const f=await fixture(t);const owner=f.open(),worker=f.open(),token=owner.acquireSourceAccess();
-  assert.ok(token);assert.deepEqual(worker.collectMetadata(128),{removed:0,hasMore:true,contended:true});
-  owner.releaseSourceAccess(token);
-  assert.deepEqual(worker.collectMetadata(128),{removed:0,hasMore:false,contended:false});
+  const f=await fixture(t);const owner=f.open(),worker=f.open();
+  const deletedFile=join(f.root,'contended-deleted.jsonl');
+  const activeFile=join(f.root,'unrelated-active.jsonl');
+  const completed=job('gc-contended-job','contended-session',deletedFile,['contended-key']);
+  completeJob(owner,completed,memory('gc-contended-memory'));
+  addCapturedObservationAndReleasedUsage(owner,completed,'gc-contended-owner');
+  deleteSource(owner,deletedFile,'gc-contended-cleaner');
+  const activeToken=owner.acquireSourceAccess(activeFile,'read');
+  assert.ok(activeToken);
+  const deletedToken=owner.acquireSourceAccess(deletedFile,'read');
+  assert.ok(deletedToken);
+  const contended=worker.collectMetadata(128);
+  assert.equal(contended.contended,true);
+  assert.equal(contended.hasMore,true);
+  owner.releaseSourceAccess(deletedToken);
+  let drained;
+  for (let i=0;i<10;i++) { drained=worker.collectMetadata(128); if (!drained.hasMore) break; }
+  assert.equal(drained.contended,false);
+  assert.equal(drained.hasMore,false,'unrelated active session lock must not block GC');
+  owner.releaseSourceAccess(activeToken);
 });
 
 test('finite metadata sweeps finish despite new retained work arriving after every page',async t=>{

@@ -1,3 +1,4 @@
+import { parseHostSourceRef } from "./storage/host-use-validation.ts";
 import { SQLiteMemoryStore } from "./storage/store.ts";
 
 export interface HostSourceRefV1 {
@@ -65,7 +66,7 @@ export interface HostUseReservationV1 {
 
 export interface HostStorageV1 {
   readonly version: 1;
-  /** Returns undefined when cleanup or another source read currently holds the global gate. */
+  /** Returns undefined when cleanup currently holds an exclusive delete lock on this session file. */
   acquireSourceRead(source: HostSourceRefV1): SourceReadLeaseV1 | undefined;
   /** Call before reading or spawning. A new session may have no Pi session file yet. */
   beginHostUse(source: HostUseSourceRefV1): HostUseReservationV1 | undefined;
@@ -90,7 +91,8 @@ class HostStorage implements HostStorageV1 {
 
   acquireSourceRead(sourceInput: HostSourceRefV1): SourceReadLeaseV1 | undefined {
     this.#ensureOpen();
-    const token = this.#store.acquireSourceAccess();
+    const sourceRef = parseHostSourceRef(sourceInput);
+    const token = this.#store.acquireSourceAccess(sourceRef.sessionFile, "read");
     if (!token) return undefined;
     let sourceGeneration: string | null | undefined;
     try {

@@ -41,7 +41,7 @@ test('startup maintenance collects completed work with an empty clean queue and 
   const original = store.get('birch');
   const origin = store.memoryOrigin('birch');
   const task = store.listCleanTasks({ limit: 10 }).items[0];
-  const access = store.acquireSourceAccess();
+  const access = store.acquireSourceAccess(task.sessionFile, "delete");
   assert.ok(access);
   assert.equal(store.claimCleanTask(task.id, 'delete-worker', Date.now(), 60_000), true);
   assert.equal(store.prepareDeletion(task.id, 'delete-worker', access, store.retentionVersion(), '1:2:3:4:5'), true);

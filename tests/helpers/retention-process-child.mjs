@@ -17,7 +17,7 @@ if (mode === 'clean' || mode === 'clean-auto') {
  cleaner.close();store.close();
  process.send({done:true,completed},()=>process.disconnect());
 } else {
-const access=store.acquireSourceAccess();
+const access=store.acquireSourceAccess(task.sessionFile, 'delete');
 if (!access) throw new Error('Fixture source access unavailable');
 if (mode==='hold') {
  const {reason,intentId,id,status,...source}=task;

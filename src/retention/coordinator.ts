@@ -131,17 +131,13 @@ export class CleanupCoordinator {
     if (!backfilled) result.ready = true;
 
     if (!round.headersDone) {
-      const access = store.acquireSourceAccess();
-      if (!access) result.contended = true;
-      else {
-        try {
-          const before = store.sources.topologyVersion();
-          round.headersDone = this.#discoverHeaders(store, round.headerEnd);
-          result.progressed = true;
-          if (!round.headersDone) result.ready = true;
-          if (store.sources.topologyVersion() !== before) round.cleanAgain = true;
-        } finally { store.releaseSourceAccess(access); }
-      }
+      const before = store.sources.topologyVersion();
+      const headers = this.#discoverHeaders(store, round.headerEnd);
+      round.headersDone = headers.done;
+      if (headers.contended) result.contended = true;
+      if (headers.progressed) result.progressed = true;
+      if (!round.headersDone && !headers.contended) result.ready = true;
+      if (store.sources.topologyVersion() !== before) round.cleanAgain = true;
     }
     if (!round.legacyDone) {
       const cursor = store.sources.readCursor("legacy");
@@ -192,37 +188,45 @@ export class CleanupCoordinator {
     if (round.headersDone && round.legacyDone && round.cleanDone && round.gcDone) this.#round = undefined;
   }
 
-  #discoverHeaders(store: SQLiteMemoryStore, throughRowId: number): boolean {
+  #discoverHeaders(store: SQLiteMemoryStore, throughRowId: number): { done: boolean; contended: boolean; progressed: boolean } {
     const afterRowId = store.sources.readCursor("headers");
     const page = store.sources.listPage({
       limit: headerPageSize, throughRowId,
       ...(afterRowId === null ? {} : { afterRowId }),
     });
+    let progressed = false;
     for (const source of page.items) {
       if (this.#closed || source.deleted) continue;
       // The Pi manager supplied this header and dependency before the first
       // save. Pending close/trigger work does not invalidate that fact; once a
       // file appears, its physical header is validated and clears the reserve.
       if (source.reserved && missing(source.sessionFile)) continue;
-      const header = readSessionHeader(source.sessionFile);
-      if (header.state === "known" && header.sessionId === source.sessionId) {
-        store.sources.recordHeader({
-          sessionFile: source.sessionFile,
-          sessionId: source.sessionId,
-          fileVersion: header.fileVersion,
-          ...(header.parentSession === undefined ? {} : { parentSession: header.parentSession }),
-        });
-      } else {
-        store.sources.markUnknown({
-          sessionFile: source.sessionFile,
-          sessionId: source.sessionId,
-        });
+      const access = store.acquireSourceAccess(source.sessionFile, "read");
+      if (!access) return { done: false, contended: true, progressed };
+      try {
+        const header = readSessionHeader(source.sessionFile);
+        if (header.state === "known" && header.sessionId === source.sessionId) {
+          store.sources.recordHeader({
+            sessionFile: source.sessionFile,
+            sessionId: source.sessionId,
+            fileVersion: header.fileVersion,
+            ...(header.parentSession === undefined ? {} : { parentSession: header.parentSession }),
+          });
+        } else {
+          store.sources.markUnknown({
+            sessionFile: source.sessionFile,
+            sessionId: source.sessionId,
+          });
+        }
+        progressed = true;
+      } finally {
+        store.releaseSourceAccess(access);
       }
     }
     // Page writes are idempotent. Advance only after every row was examined so
     // a crash repeats the page instead of silently skipping an unvisited row.
     store.sources.writeCursor("headers", page.nextCursor);
-    return page.nextCursor === null;
+    return { done: page.nextCursor === null, contended: false, progressed: true };
   }
 
   async #processTask(store: SQLiteMemoryStore, task: CleanTask, force: boolean): Promise<TaskOutcome> {
@@ -233,7 +237,7 @@ export class CleanupCoordinator {
     let building = false;
     let failed = false;
     let stage: "cleanup.assess" | "cleanup.delete" = "cleanup.assess";
-    const access = store.acquireSourceAccess();
+    const access = store.acquireSourceAccess(task.sessionFile, "delete");
     if (!access) {
       store.releaseCleanTask(task.id, owner);
       this.#claim = undefined;

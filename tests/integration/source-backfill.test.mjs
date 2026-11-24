@@ -81,6 +81,7 @@ function oldV5Schema(path) {
         file_version TEXT NOT NULL,
         state TEXT NOT NULL CHECK (state IN ('deleting', 'complete'))
       ) STRICT;
+      DROP INDEX IF EXISTS source_access_by_file; DROP TABLE source_access; CREATE TABLE source_access (singleton INTEGER PRIMARY KEY NOT NULL CHECK (singleton = 1), token TEXT NOT NULL, owner_pid INTEGER NOT NULL CHECK (owner_pid > 0)) STRICT;
       PRAGMA user_version = 5;
     `);
 
@@ -145,6 +146,7 @@ function oldV6Schema(path) {
       UPDATE source_registry_state SET backfill_complete = 0 WHERE singleton = 1;
       UPDATE source_registry_cursors SET cursor_row = NULL;
       UPDATE source_backfill SET phase = 0, cursor_row = 128 WHERE singleton = 1;
+      DROP INDEX IF EXISTS source_access_by_file; DROP TABLE source_access; CREATE TABLE source_access (singleton INTEGER PRIMARY KEY NOT NULL CHECK (singleton = 1), token TEXT NOT NULL, owner_pid INTEGER NOT NULL CHECK (owner_pid > 0)) STRICT;
       PRAGMA user_version = 6;
     `);
     assert.equal(db.prepare("PRAGMA user_version").get().user_version, 6);
@@ -197,7 +199,7 @@ test(`v${legacyVersion} legacy source backfill resumes in bounded passes across 
   store = f.open();
   const version = new DatabaseSync(f.path);
   try {
-    assert.equal(version.prepare("PRAGMA user_version").get().user_version, 14);
+    assert.equal(version.prepare("PRAGMA user_version").get().user_version, 15);
   } finally {
     version.close();
   }

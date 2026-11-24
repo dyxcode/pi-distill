@@ -254,7 +254,7 @@ export class ConsolidationCoordinator {
   #now(): number { return this.#options.now?.() ?? Date.now(); }
 
   #retryContext(path: string, context = this.#context): Promise<DistillRetryContext> {
-    return withSourceAccess(this.#options.openStore, async () => distillRetryContext(path, context?.model), this.#controller?.signal);
+    return withSourceAccess(this.#options.openStore, path, async () => distillRetryContext(path, context?.model), this.#controller?.signal);
   }
 
   #database(): SQLiteMemoryStore { return this.#store ??= this.#options.openStore(); }
@@ -274,13 +274,13 @@ export class ConsolidationCoordinator {
   }
 
   async #load(path: string, leaf?: string | null): Promise<SourceSnapshot> {
-    if (this.#options.loadSnapshot) return withSourceAccess(this.#options.openStore,
+    if (this.#options.loadSnapshot) return withSourceAccess(this.#options.openStore, path,
       () => this.#options.loadSnapshot!(path, leaf), this.#controller?.signal);
     // A small source can finish its four phases in one pass; larger sources
     // persist their cursor and yield to the host between bounded passes.
     for (let page = 0; page < 4; page++) {
       if (this.#controller) await this.#waitUntilIdle(this.#controller.signal);
-      const result = await withSourceAccess(this.#options.openStore,
+      const result = await withSourceAccess(this.#options.openStore, path,
         () => this.#database().sourceViews.advance(path, leaf, this.#controller?.signal), this.#controller?.signal);
       if (result.ready) {
         const view = result.view, header = view.source.header;
@@ -295,14 +295,14 @@ export class ConsolidationCoordinator {
   }
 
   async #compaction(trigger: DistillTrigger, signal: AbortSignal): Promise<string | undefined> {
-    if (this.#options.loadCompactionRecord) return withSourceAccess(this.#options.openStore,
+    if (this.#options.loadCompactionRecord) return withSourceAccess(this.#options.openStore, trigger.sessionFile,
       () => this.#options.loadCompactionRecord!(trigger.sessionFile, trigger.sessionId, trigger.cwd, trigger.leafId), signal);
     const snapshot = await this.#load(trigger.sessionFile, trigger.leafId);
     assertSnapshotMatches(snapshot, trigger);
     const view = snapshot.indexed;
-    if (!view) return withSourceAccess(this.#options.openStore,
+    if (!view) return withSourceAccess(this.#options.openStore, trigger.sessionFile,
       () => findCompactionRecord(trigger.sessionFile, trigger.sessionId, trigger.cwd, trigger.leafId), signal);
-    return withSourceAccess(this.#options.openStore, async () => {
+    return withSourceAccess(this.#options.openStore, view.source.path, async () => {
       const source = view.source;
       const row = view.owner.database.prepare("SELECT metadata FROM source_index_entries WHERE generation=? AND json_extract(metadata,'$.type')='compaction' AND json_extract(metadata,'$.parentId') IS ? ORDER BY seq LIMIT 1")
         .get(source.generation, trigger.leafId);
