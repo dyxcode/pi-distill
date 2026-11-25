@@ -105,13 +105,16 @@ export class SessionRecords {
 
   acknowledgeObservation(sessionId: string, leafId: string | null): void {
     this.connection.ensureOpen();
+    this.connection.transaction(() => this.acknowledgeObservationInTransaction(sessionId, leafId));
+  }
+
+  acknowledgeObservationInTransaction(sessionId: string, leafId: string | null, sessionFile?: string): void {
     validateText(sessionId, "session ID");
     const currentLeafId = parseNullableText(leafId, "session leaf ID");
-    this.connection.transaction(() => {
-      this.connection.database.prepare(
-        "UPDATE session_observations SET captured = 1 WHERE session_id = ? AND leaf_id IS ?",
-      ).run(sessionId, currentLeafId);
-    });
+    if (sessionFile !== undefined) validateAbsolutePath(sessionFile, "session file");
+    this.connection.database.prepare(
+      "UPDATE session_observations SET captured = 1 WHERE session_id = ? AND leaf_id IS ? AND (? IS NULL OR session_file = ?)",
+    ).run(sessionId, currentLeafId, sessionFile ?? null, sessionFile ?? null);
   }
 
   observedSessions(): readonly SessionObservation[] {

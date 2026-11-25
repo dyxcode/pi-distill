@@ -208,6 +208,8 @@ test("durable host workspace holds survive restart, block retention and child sh
   }, "quit");
   assert.equal(store.sourceRetentionState(sessionFile, "ws-hold-1").pending, false);
 
+  store.observeSession({ sessionId: "ws-hold-1", sessionFile, cwd: directory, leafId: "m1", ownerPid: process.pid });
+  assert.equal(store.hasUncapturedObservation([sessionFile]), true);
   // Explicit user close releases hold and atomically enqueues distillation
   const released = reopened.releaseWorkspaceHold(
     { sessionId: "ws-hold-1", sessionFile, cwd: directory },
@@ -220,5 +222,6 @@ test("durable host workspace holds survive restart, block retention and child sh
   const retentionAfterRelease = store.sourceRetentionState(sessionFile, "ws-hold-1");
   assert.equal(retentionAfterRelease.hostUse, false);
   assert.equal(retentionAfterRelease.pending, true);
+  assert.equal(store.hasUncapturedObservation([sessionFile]), false, "the queued close captures the same observed leaf");
   assert.equal(retentionAfterRelease.released, true, "explicit close supersedes exited owners' interruption protection");
 });

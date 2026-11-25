@@ -22,7 +22,7 @@ import { fields, parseNullableText, validateAbsolutePath, validateLeaseDuration,
 interface Dependencies {
   readonly distill: Pick<DistillQueue, "jobTriggerIds" | "enqueueDistillTriggerInTransaction">;
   readonly sources: SourceRegistry;
-  readonly sessions: Pick<SessionRecords, "assertSourceEnqueueAllowed">;
+  readonly sessions: Pick<SessionRecords, "assertSourceEnqueueAllowed" | "acknowledgeObservationInTransaction">;
 }
 
 export class RetentionTasks {
@@ -394,6 +394,7 @@ export class RetentionTasks {
           cwd: source.cwd,
           leafId,
         });
+        this.dependencies.sessions.acknowledgeObservationInTransaction(source.sessionId, leafId, sessionFile);
       }
       return deleted;
     });
