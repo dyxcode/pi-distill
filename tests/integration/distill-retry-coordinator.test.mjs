@@ -65,14 +65,14 @@ test('transient retry delays persist without marking evidence processed',async t
   const job=f.read(s=>s.listConsolidationJobs()[0]);
   assert.equal(f.read(s=>s.processedSources(job.sourceKeys).length),0);
 });
-test('crash recovery of an invalid observed source does not bypass the source hold',async t=>{
+test('preparation of an invalid closed trigger does not bypass the source hold',async t=>{
   let reads=0,broken=true,calls=0;
   const f=await fixture(t,async()=>{calls++;return empty;},s=>{reads++;if(broken)throw new DistillFailure('source_invalid','synthetic');return s;});
-  f.read(s=>s.observeSession({sessionId:f.snapshot.sessionId,sessionFile:f.file,cwd:f.snapshot.cwd,leafId:'a',ownerPid:2147483647}));
+  f.read(s=>s.enqueueDistillTrigger({id:'invalid-close',reason:'close',sessionId:f.snapshot.sessionId,sessionFile:f.file,cwd:f.snapshot.cwd,leafId:'a'}));
   await f.wake();const first=reads;assert.ok(first>0);
   await f.wake();assert.equal(reads,first);
   await f.c.shutdown(f.ctx,'reload');const other=f.worker();await f.wake(other);assert.equal(reads,first);
-  broken=false;await writeFile(f.file,'repaired observed source');await f.wake(other);assert.equal(calls,1);
+  broken=false;await writeFile(f.file,'repaired closed source');await f.wake(other);assert.equal(calls,1);
 });
 test('unconfirmed compaction recovery waits for source change after invalid source',async t=>{
   let reads=0;

@@ -4,7 +4,7 @@ import type { SessionObservation } from "../distill/types.ts";
 export interface SessionUsage extends SessionObservation {
   readonly ownerId: string;
   readonly processToken: string;
-  readonly state: "active" | "closing" | "released";
+  readonly state: "active" | "closing" | "released" | "interrupted";
 }
 
 
@@ -24,5 +24,7 @@ export type {
   HostChildIdentityV1,
   HostUseRecordV1,
   HostUseRecoveryV1,
+  HostWorkspaceHoldV1,
+  ReleaseWorkspaceHoldOptionsV1,
   CompletedDeletionReceiptV1,
 } from "../host-storage.ts";

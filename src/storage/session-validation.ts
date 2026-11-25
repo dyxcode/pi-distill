@@ -30,7 +30,7 @@ export function parseSessionUsage(value: unknown): SessionUsage {
   );
   validateText(ownerId, "session usage owner ID");
   validateText(processToken, "session usage process token");
-  if (state !== "active" && state !== "closing" && state !== "released") {
+  if (state !== "active" && state !== "closing" && state !== "released" && state !== "interrupted") {
     throw new TypeError("Session usage state must be active, closing, or released.");
   }
   return {

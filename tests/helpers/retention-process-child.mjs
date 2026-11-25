@@ -22,6 +22,7 @@ if (!access) throw new Error('Fixture source access unavailable');
 if (mode==='hold') {
  const {reason,intentId,id,status,...source}=task;
  store.saveSessionUsage({...source,ownerPid:process.pid,ownerId:'child',processToken:'child',state:'active'});
+ store.saveSessionUsage({...source,ownerPid:process.pid,ownerId:'child',processToken:'child',state:'closing'});
  process.send({ready:true});
  setInterval(()=>{},1000);
 } else if (mode==='crash-delete') {

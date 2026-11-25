@@ -227,7 +227,7 @@ try{
     assert.equal(extractionCalls,1,'compaction while background work is in flight must not overlap another distillation request');
     resolveLateReply();
   }
-  if(mode!=='reload'&&mode!=='close-capture'&&mode!=='late-reply'){
+  if(mode!=='reload'&&mode!=='close-capture'&&mode!=='late-reply'&&mode!=='crash-recover'){
     if(mode==='roundtrip')await runtime.newSession();
     const deadline=Date.now()+(mode==='long'?60000:8000);
     let found;
@@ -274,8 +274,9 @@ const { planSources } = await import('../../src/distill/preparation.ts');
     }
   }
   if(mode==='crash-recover'){
-    assertQueuedClose(session.sessionManager.getSessionId(),session.sessionManager.getSessionFile(),session.sessionManager.getLeafId());
-    assert.ok(extractionCalls>=1,'a new Pi runtime should process the source recovered from the crashed owner');
+    await new Promise(resolve=>setTimeout(resolve,500));
+    assert.equal(queuedTrigger(session.sessionManager.getSessionId()),undefined,'resuming a crashed session is not an explicit close');
+    assert.equal(extractionCalls,0);
   }
   console.log(JSON.stringify({mode,extractionCalls,extractionModels,calls:faux.state.callCount,passed:true}));
 }finally{if(runtime)await runtime.dispose();if(!externalRoot)await rm(root,{recursive:true,force:true});}

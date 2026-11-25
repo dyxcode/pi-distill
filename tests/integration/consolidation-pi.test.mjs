@@ -25,14 +25,15 @@ test('real Pi SDK runtime teardown fences a late background model reply',()=>{
 import {mkdtemp,rm} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
-test('real Pi SDK recovers a missed shutdown after the original process has exited',async t=>{
- const root=await mkdtemp(join(tmpdir(),'pi-distill-crash-recovery-'));t.after(()=>rm(root,{recursive:true,force:true}));
+test('real Pi SDK does not auto-distill a crashed session after the original process exits without user close',async t=>{
+ const root=await mkdtemp(join(tmpdir(),'pi-distill-crash-no-distill-'));t.after(()=>rm(root,{recursive:true,force:true}));
  const crashed=spawnSync(process.execPath,['tests/helpers/consolidation-pi-child.mjs','crash-capture',root],{encoding:'utf8',timeout:20000});
  assert.ifError(crashed.error);assert.equal(crashed.status,0,crashed.stderr||crashed.stdout);
  const before=JSON.parse(crashed.stdout.trim().split('\n').at(-1));assert.equal(before.passed,true);assert.equal(before.extractionCalls,0);
- const recovered=spawnSync(process.execPath,['tests/helpers/consolidation-pi-child.mjs','crash-recover',root,before.sessionFile],{encoding:'utf8',timeout:20000});
- assert.ifError(recovered.error);assert.equal(recovered.status,0,recovered.stderr||recovered.stdout);
- const after=JSON.parse(recovered.stdout.trim().split('\n').at(-1));assert.equal(after.passed,true);assert.ok(after.extractionCalls>=1);
+ const next=spawnSync(process.execPath,['tests/helpers/consolidation-pi-child.mjs','crash-recover',root,before.sessionFile],{encoding:'utf8',timeout:20000});
+ assert.ifError(next.error);assert.equal(next.status,0,next.stderr||next.stdout);
+ const after=JSON.parse(next.stdout.trim().split('\n').at(-1));
+ assert.equal(after.passed,true);assert.equal(after.extractionCalls,0);
 });
 
 test('a clean quit leaves only a durable source trigger for the next process to reopen and distill',async t=>{

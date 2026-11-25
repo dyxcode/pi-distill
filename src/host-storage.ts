@@ -25,6 +25,17 @@ export interface HostChildIdentityV1 {
   readonly token: string;
 }
 
+export interface HostWorkspaceHoldV1 extends HostUseSourceIdentityV1 {
+  readonly sessionFile: string | null;
+  readonly sourceGeneration: string | null;
+  readonly createdAt: number;
+}
+
+export interface ReleaseWorkspaceHoldOptionsV1 {
+  readonly enqueueDistill?: boolean;
+  readonly leafId?: string | null;
+}
+
 export interface HostUseRecordV1 extends HostUseSourceIdentityV1 {
   readonly id: string;
   readonly sessionFile: string | null;
@@ -75,7 +86,12 @@ export interface HostStorageV1 {
   recoverHostUse(id: string, evidence: HostUseRecoveryV1): boolean;
   /** Requires the exact current registry generation, or a caller-supplied cached generation after registry GC. */
   getCompletedDeletion(source: HostSourceRefV1): CompletedDeletionReceiptV1 | undefined;
-  /** Close the local connection. Durable host-use rows intentionally survive. */
+  /** Persist an idempotent workspace hold that survives idle reclamation, redeploys, and reboots. */
+  holdWorkspaceSession(source: HostUseSourceRefV1): HostWorkspaceHoldV1 | undefined;
+  /** Release a workspace hold on explicit user close; optionally enqueue distillation atomically. */
+  releaseWorkspaceHold(source: HostUseSourceRefV1, options?: ReleaseWorkspaceHoldOptionsV1): boolean;
+  listWorkspaceHolds(): readonly HostWorkspaceHoldV1[];
+  /** Close the local connection. Durable host-use and workspace-hold rows intentionally survive. */
   close(): void;
 }
 
@@ -148,6 +164,21 @@ class HostStorage implements HostStorageV1 {
   getCompletedDeletion(source: HostSourceRefV1): CompletedDeletionReceiptV1 | undefined {
     this.#ensureOpen();
     return this.#store.getCompletedDeletionFor(source);
+  }
+
+  holdWorkspaceSession(source: HostUseSourceRefV1): HostWorkspaceHoldV1 | undefined {
+    this.#ensureOpen();
+    return this.#store.holdHostWorkspaceSession(source);
+  }
+
+  releaseWorkspaceHold(source: HostUseSourceRefV1, options?: ReleaseWorkspaceHoldOptionsV1): boolean {
+    this.#ensureOpen();
+    return this.#store.releaseHostWorkspaceHold(source, options);
+  }
+
+  listWorkspaceHolds(): readonly HostWorkspaceHoldV1[] {
+    this.#ensureOpen();
+    return this.#store.listHostWorkspaceHolds();
   }
 
   close(): void {

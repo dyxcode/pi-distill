@@ -1,5 +1,5 @@
 import { resolve } from "node:path";
-import type { HostChildIdentityV1, HostSourceRefV1, HostUseRecordV1, HostUseRecoveryV1, HostUseSourceRefV1 } from "../retention/types.ts";
+import type { HostChildIdentityV1, HostSourceRefV1, HostUseRecordV1, HostUseRecoveryV1, HostUseSourceRefV1, HostWorkspaceHoldV1, ReleaseWorkspaceHoldOptionsV1 } from "../retention/types.ts";
 import { fields, validateAbsolutePath, validateText, validateNow } from "./validation.ts";
 
 const validSourceGeneration = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -107,4 +107,49 @@ export function parseStoredHostUse(value: unknown): HostUseRecordV1 {
     child = parseHostChildIdentity({ pid: row["childPid"], token: row["childToken"] });
   }
   return { id: row["id"], ...source, sessionFile, sourceGeneration, ownerPid, createdAt: row["createdAt"], state, child };
+}
+
+export function parseStoredHostWorkspaceHold(value: unknown): HostWorkspaceHoldV1 {
+  const row = fields(value, ["sessionId", "sessionFile", "cwd", "sourceGeneration", "createdAt"]);
+  const sessionFile = row["sessionFile"];
+  if (sessionFile !== null && typeof sessionFile !== "string") {
+    throw new TypeError("Stored host workspace hold session file is invalid.");
+  }
+  const source = parseHostUseSourceRef({
+    sessionId: row["sessionId"],
+    cwd: row["cwd"],
+    ...(sessionFile === null ? {} : { sessionFile }),
+  });
+  const sourceGeneration = row["sourceGeneration"];
+  if (sourceGeneration !== null) {
+    validateText(sourceGeneration, "stored host workspace hold generation");
+    if (!validSourceGeneration.test(sourceGeneration)) throw new TypeError("Stored host workspace hold generation is invalid.");
+    if (sessionFile === null) throw new TypeError("Stored host workspace hold generation requires a session file.");
+  }
+  validateNow(row["createdAt"], "Stored host workspace hold creation time");
+  return { ...source, sessionFile, sourceGeneration, createdAt: row["createdAt"] };
+}
+
+export function parseReleaseWorkspaceHoldOptions(value: unknown): ReleaseWorkspaceHoldOptionsV1 {
+  if (value === undefined) return {};
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new TypeError("Release workspace hold options must be an object.");
+  }
+  const allowed = new Set(["enqueueDistill", "leafId"]);
+  for (const key of Object.keys(value)) {
+    if (!allowed.has(key)) throw new TypeError("Release workspace hold options contain an unsupported field.");
+  }
+  const raw = value as Record<string, unknown>;
+  const enqueueDistill = raw["enqueueDistill"];
+  if (enqueueDistill !== undefined && typeof enqueueDistill !== "boolean") {
+    throw new TypeError("enqueueDistill must be a boolean.");
+  }
+  const leafId = raw["leafId"];
+  if (leafId !== undefined && leafId !== null) {
+    validateText(leafId, "workspace hold leaf ID");
+  }
+  return {
+    ...(enqueueDistill === undefined ? {} : { enqueueDistill }),
+    ...(leafId === undefined ? {} : { leafId: leafId as string | null }),
+  };
 }

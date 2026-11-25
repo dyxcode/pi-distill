@@ -1,3 +1,4 @@
+import { SOURCE_COVERAGE_SCHEMAS } from "../../src/storage/coverage.ts";
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { mkdtemp, writeFile, rm } from 'node:fs/promises';
@@ -186,7 +187,7 @@ test('schema 11 upgrade preserves memories, progress and pending work', async (t
   const raw = new DatabaseSync(f.db);
   for (const schema of [...DISTILL_SCHEDULE_SCHEMAS].reverse())
     raw.exec(`DROP ${schema.sql.split(' ')[1]} ${schema.name}`);
-  raw.exec('DROP TABLE host_session_uses; DROP INDEX IF EXISTS source_access_by_file; DROP TABLE source_access; CREATE TABLE source_access (singleton INTEGER PRIMARY KEY NOT NULL CHECK (singleton = 1), token TEXT NOT NULL, owner_pid INTEGER NOT NULL CHECK (owner_pid > 0)) STRICT; PRAGMA user_version=11');
+  raw.exec('DROP TABLE host_session_uses; DROP INDEX IF EXISTS host_workspace_holds_by_file; DROP TABLE IF EXISTS host_workspace_holds; DROP TRIGGER IF EXISTS source_fence_session_usages_insert; DROP TRIGGER IF EXISTS source_fence_session_usages_update; DROP TRIGGER IF EXISTS source_fence_session_usages_delete; DROP INDEX IF EXISTS usages_source; ALTER TABLE session_usages RENAME TO session_usages_v16; CREATE TABLE session_usages (owner_id TEXT PRIMARY KEY NOT NULL, process_token TEXT NOT NULL, session_id TEXT NOT NULL, session_file TEXT NOT NULL, cwd TEXT NOT NULL, leaf_id TEXT, owner_pid INTEGER NOT NULL CHECK (owner_pid > 0), state TEXT NOT NULL CHECK (state IN (\'active\', \'closing\', \'released\'))) STRICT; INSERT INTO session_usages SELECT * FROM session_usages_v16; DROP TABLE session_usages_v16; CREATE INDEX usages_source ON session_usages (session_file); DROP INDEX IF EXISTS source_access_by_file; DROP TABLE source_access; CREATE TABLE source_access (singleton INTEGER PRIMARY KEY NOT NULL CHECK (singleton = 1), token TEXT NOT NULL, owner_pid INTEGER NOT NULL CHECK (owner_pid > 0)) STRICT; PRAGMA user_version=11'); for (const sc of SOURCE_COVERAGE_SCHEMAS.filter(x => x.name.startsWith('source_fence_session_usages_'))) raw.exec(sc.sql);
   raw.close();
   const current = new SQLiteMemoryStore(f.db);
   try {
@@ -246,7 +247,7 @@ test('migration backfill resumes after reopen and eventually exposes work beyond
   const { DISTILL_SCHEDULE_SCHEMAS } = await import('../../src/storage/schedule.ts');
   const raw = new DatabaseSync(f.db);
   for (const schema of [...DISTILL_SCHEDULE_SCHEMAS].reverse()) raw.exec(`DROP ${schema.sql.split(' ')[1]} ${schema.name}`);
-  raw.exec('DROP TABLE host_session_uses; DROP INDEX IF EXISTS source_access_by_file; DROP TABLE source_access; CREATE TABLE source_access (singleton INTEGER PRIMARY KEY NOT NULL CHECK (singleton = 1), token TEXT NOT NULL, owner_pid INTEGER NOT NULL CHECK (owner_pid > 0)) STRICT; PRAGMA user_version=11'); raw.close();
+  raw.exec('DROP TABLE host_session_uses; DROP INDEX IF EXISTS host_workspace_holds_by_file; DROP TABLE IF EXISTS host_workspace_holds; DROP TRIGGER IF EXISTS source_fence_session_usages_insert; DROP TRIGGER IF EXISTS source_fence_session_usages_update; DROP TRIGGER IF EXISTS source_fence_session_usages_delete; DROP INDEX IF EXISTS usages_source; ALTER TABLE session_usages RENAME TO session_usages_v16; CREATE TABLE session_usages (owner_id TEXT PRIMARY KEY NOT NULL, process_token TEXT NOT NULL, session_id TEXT NOT NULL, session_file TEXT NOT NULL, cwd TEXT NOT NULL, leaf_id TEXT, owner_pid INTEGER NOT NULL CHECK (owner_pid > 0), state TEXT NOT NULL CHECK (state IN (\'active\', \'closing\', \'released\'))) STRICT; INSERT INTO session_usages SELECT * FROM session_usages_v16; DROP TABLE session_usages_v16; CREATE INDEX usages_source ON session_usages (session_file); DROP INDEX IF EXISTS source_access_by_file; DROP TABLE source_access; CREATE TABLE source_access (singleton INTEGER PRIMARY KEY NOT NULL CHECK (singleton = 1), token TEXT NOT NULL, owner_pid INTEGER NOT NULL CHECK (owner_pid > 0)) STRICT; PRAGMA user_version=11'); for (const sc of SOURCE_COVERAGE_SCHEMAS.filter(x => x.name.startsWith('source_fence_session_usages_'))) raw.exec(sc.sql); raw.close();
   let store = new SQLiteMemoryStore(f.db);
   try {
     const first = store.listScheduledDistill(1);

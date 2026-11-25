@@ -81,10 +81,12 @@ export class SessionRecords {
       }
       const checkpointChanged = current.leafId !== record.leafId;
       const transitionAllowed = current.state === "active"
-        ? record.state === "active" || record.state === "closing"
+        ? record.state === "active" || record.state === "closing" || record.state === "interrupted"
         : current.state === "closing"
           ? (record.state === "closing" || record.state === "released") && !checkpointChanged
-          : record.state === "released" && !checkpointChanged;
+          : current.state === "interrupted"
+            ? (record.state === "interrupted" || record.state === "released") && !checkpointChanged
+            : record.state === "released" && !checkpointChanged;
       if (!transitionAllowed) {
         throw new ConsolidationConflictError(record.ownerId, "cannot change its session usage state or checkpoint");
       }
@@ -92,6 +94,12 @@ export class SessionRecords {
       this.connection.database.prepare(
         "UPDATE session_usages SET leaf_id = ?, state = ? WHERE owner_id = ?",
       ).run(record.leafId, record.state, record.ownerId);
+      // Explicit user closure supersedes prior crash/reboot interruptions for this session.
+      if (record.state === "closing" || record.state === "released") {
+        this.connection.database.prepare(
+          "UPDATE session_usages SET state = 'released' WHERE state = 'interrupted' AND (session_id = ? OR session_file = ?)",
+        ).run(record.sessionId, record.sessionFile);
+      }
     });
   }
 

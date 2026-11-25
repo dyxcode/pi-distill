@@ -89,7 +89,7 @@ export const sessionObservationsSchema =
   "captured INTEGER NOT NULL DEFAULT 0 CHECK (captured IN (0, 1))" +
   ") STRICT";
 
-export const sessionUsagesSchema =
+export const sessionUsagesSchemaV15 =
   "CREATE TABLE session_usages (" +
   "owner_id TEXT PRIMARY KEY NOT NULL, " +
   "process_token TEXT NOT NULL, " +
@@ -99,6 +99,18 @@ export const sessionUsagesSchema =
   "leaf_id TEXT, " +
   "owner_pid INTEGER NOT NULL CHECK (owner_pid > 0), " +
   "state TEXT NOT NULL CHECK (state IN ('active', 'closing', 'released'))" +
+  ") STRICT";
+
+export const sessionUsagesSchema =
+  "CREATE TABLE session_usages (" +
+  "owner_id TEXT PRIMARY KEY NOT NULL, " +
+  "process_token TEXT NOT NULL, " +
+  "session_id TEXT NOT NULL, " +
+  "session_file TEXT NOT NULL, " +
+  "cwd TEXT NOT NULL, " +
+  "leaf_id TEXT, " +
+  "owner_pid INTEGER NOT NULL CHECK (owner_pid > 0), " +
+  "state TEXT NOT NULL CHECK (state IN ('active', 'closing', 'released', 'interrupted'))" +
   ") STRICT";
 
 export const distillTriggersSchema =
@@ -252,8 +264,25 @@ export const storeSchemasV9 = [...storeSchemasV8,
   { name: "host_session_uses_by_session", sql: hostSessionUsesBySessionSchema },
 ];
 
+export const hostWorkspaceHoldsSchema =
+  "CREATE TABLE host_workspace_holds (" +
+  "session_id TEXT PRIMARY KEY NOT NULL, " +
+  "session_file TEXT, " +
+  "cwd TEXT NOT NULL, " +
+  "source_generation TEXT, " +
+  "created_at INTEGER NOT NULL CHECK (created_at >= 0)" +
+  ") STRICT";
+
+export const hostWorkspaceHoldsByFileSchema =
+  "CREATE INDEX host_workspace_holds_by_file ON host_workspace_holds (session_file, session_id)";
+
 export const storeSchemasV15 = [...storeSchemasV9,
   { name: "source_access_by_file", sql: sourceAccessByFileSchema },
 ];
 
-export const latestSchemaVersion = 15;
+export const storeSchemasV16 = [...storeSchemasV15,
+  { name: "host_workspace_holds", sql: hostWorkspaceHoldsSchema },
+  { name: "host_workspace_holds_by_file", sql: hostWorkspaceHoldsByFileSchema },
+];
+
+export const latestSchemaVersion = 16;

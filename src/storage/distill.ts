@@ -48,26 +48,29 @@ export class DistillQueue {
 
   enqueueDistillTrigger(trigger: DistillTriggerInput): void {
     this.connection.ensureOpen();
+    this.connection.transaction(() => this.enqueueDistillTriggerInTransaction(trigger));
+  }
+
+  enqueueDistillTriggerInTransaction(trigger: DistillTriggerInput): void {
+    this.connection.ensureOpen();
     const record = parseDistillTriggerInput(trigger);
     const triggerJson = JSON.stringify(record);
     const status = record.reason === "compact" ? "candidate" : "pending";
-    this.connection.transaction(() => {
-      if (record.sessionFile !== null) this.dependencies.sessions.assertSourceEnqueueAllowed(record.sessionId, record.sessionFile, record.cwd);
-      const row = this.connection.database.prepare(`SELECT ${triggerColumns} FROM distill_triggers WHERE id = ?`).get(record.id);
-      if (row !== undefined) {
-        const existing = this.parseTriggerRow(row);
-        if (JSON.stringify(existing.trigger) !== triggerJson) {
-          throw new ConsolidationConflictError(record.id, "already exists with a different trigger boundary");
-        }
-        return;
+    if (record.sessionFile !== null) this.dependencies.sessions.assertSourceEnqueueAllowed(record.sessionId, record.sessionFile, record.cwd);
+    const row = this.connection.database.prepare(`SELECT ${triggerColumns} FROM distill_triggers WHERE id = ?`).get(record.id);
+    if (row !== undefined) {
+      const existing = this.parseTriggerRow(row);
+      if (JSON.stringify(existing.trigger) !== triggerJson) {
+        throw new ConsolidationConflictError(record.id, "already exists with a different trigger boundary");
       }
-      if (status === "pending") this.schedule().enqueue(record.sessionId);
-      this.connection.database.prepare(
-        "INSERT INTO distill_triggers " +
-        "(id, trigger_json, status, compaction_record_id, retry_category, retry_at) " +
-        "VALUES (?, ?, ?, NULL, NULL, NULL)",
-      ).run(record.id, triggerJson, status);
-    });
+      return;
+    }
+    if (status === "pending") this.schedule().enqueue(record.sessionId);
+    this.connection.database.prepare(
+      "INSERT INTO distill_triggers " +
+      "(id, trigger_json, status, compaction_record_id, retry_category, retry_at) " +
+      "VALUES (?, ?, ?, NULL, NULL, NULL)",
+    ).run(record.id, triggerJson, status);
   }
 
   confirmCompactionTrigger(input: { readonly id: string; readonly compactionRecordId: string; }): boolean {

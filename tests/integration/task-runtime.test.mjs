@@ -286,9 +286,10 @@ test('dead-source recovery gets its own bounded page even behind many completed 
       id: claim.trigger.id, claimToken: claim.claimToken, now: Date.now(), jobs: [],
     });
   }
-  store.observeSession({
+  store.enqueueDistillTrigger({
+    id: 'closed-source-trigger', reason: 'close',
     sessionId: 'closed-source', sessionFile: closedPath, cwd: f.root,
-    leafId: f.source.leafId, ownerPid: 2_147_483_647,
+    leafId: f.source.leafId,
   });
   store.close();
 
@@ -440,7 +441,7 @@ test('each consolidation model round waits for foreground idle before issuing an
   assert.equal(calls, 2);
 });
 
-test('crash recovery captures durable messages written after the last recorded boundary', async t => {
+test('crashed unclosed sessions are not auto-distilled even after their PID exits', async t => {
   const { SessionManager } = await import('@earendil-works/pi-coding-agent');
   const { loadSnapshot } = await import('../../src/sources/snapshot.ts');
   const captured = [];
@@ -453,21 +454,8 @@ test('crash recovery captures durable messages written after the last recorded b
   old.appendMessage({role:'user',content:'The newer conclusion survived a crash.',timestamp:2});
   const store = new SQLiteMemoryStore(f.path);
   store.observeSession({sessionId:old.getSessionId(),sessionFile:old.getSessionFile(),cwd:f.root,leafId:recordedLeaf,ownerPid:2_147_483_647});
+  store.saveSessionUsage({sessionId:old.getSessionId(),sessionFile:old.getSessionFile(),cwd:f.root,leafId:recordedLeaf,ownerId:'dead-crashed',processToken:'dead',ownerPid:2_147_483_647,state:'active'});
   store.close();
   await f.coordinator.start(f.ctx);await f.coordinator.whenIdle();
-  for (let pass=0;pass<3&&!captured.some(text=>text.includes('The newer conclusion survived a crash.'));pass++) {
-    f.coordinator.setForegroundBusy(false);await f.coordinator.whenIdle();
-  }
-  assert.ok(captured.some(text=>text.includes('The newer conclusion survived a crash.')));
-});
-
-test('crash recovery finds a persisted first message even when no observation hook ran', async t => {
- const {SessionManager}=await import('@earendil-works/pi-coding-agent');
- const { loadSnapshot } = await import('../../src/sources/snapshot.ts');
- const captured=[];const f=await fixture(t,{loadSnapshot,runModel:async batch=>{captured.push(JSON.stringify(batch.evidence));return {creates:[],updates:[],deletes:[]};}});
- const old=SessionManager.create(f.root,join(f.root,'sessions'));old.appendMessage({role:'user',content:'Persisted before the first observation hook.',timestamp:1});
- const store=new SQLiteMemoryStore(f.path);
- store.saveSessionUsage({sessionId:old.getSessionId(),sessionFile:old.getSessionFile(),cwd:f.root,leafId:null,ownerId:'dead-first-message',processToken:'dead',ownerPid:2_147_483_647,state:'active'});store.close();
- await f.coordinator.start(f.ctx);await f.coordinator.whenIdle();
- assert.ok(captured.some(text=>text.includes('Persisted before the first observation hook.')));
+  assert.equal(captured.length, 0);
 });

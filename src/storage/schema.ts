@@ -2,7 +2,7 @@ import { dirname } from "node:path";
 import type {
   ConsolidationJob
 } from "../distill/types.ts";
-import { cleanTaskColumns, distillFailureColumns, evidenceColumns, hostUseColumns, jobColumns, legacyJobColumns, memoryColumns, observationColumns, originColumns, originColumnsV6, progressColumns, progressColumnsV6, schemaColumns, sessionUsageColumns, textColumn, triggerColumns } from './columns.ts';
+import { cleanTaskColumns, distillFailureColumns, evidenceColumns, hostUseColumns, hostWorkspaceHoldColumns, jobColumns, legacyJobColumns, memoryColumns, observationColumns, originColumns, originColumnsV6, progressColumns, progressColumnsV6, schemaColumns, sessionUsageColumns, textColumn, triggerColumns } from './columns.ts';
 import type { ConsolidationCommits } from './commits.ts';
 import type { StorageConnection } from './connection.ts';
 import { SOURCE_COVERAGE_SCHEMAS } from "./coverage.ts";
@@ -13,9 +13,9 @@ import { parseInput, parseMemory } from './memory-validation.ts';
 import type { MemoryEvidence, PersistedDistillTrigger, SchemaColumn } from './records.ts';
 import type { RetentionTasks } from './retention.ts';
 import { DISTILL_SCHEDULE_SCHEMAS } from "./schedule.ts";
-import { cleanTasksSchema, consolidationJobsSchema, consolidationJobsV3Schema, consolidationProgressSchema, consolidationProgressSchemaV6, currentSchema, deletionsSchema, deletionsSchemaV5, distillFailuresSchema, distillLeaseSchema, distillTriggersSchema, hostSessionUsesSchema, hostSessionUsesByFileSchema, hostSessionUsesBySessionSchema, latestSchemaVersion, legacySchema, memoryEvidenceSchema, memoryOriginsSchema, memoryOriginsSchemaV6, metadataGcSchema, sessionObservationsSchema, sessionUsagesSchema, sourceAccessByFileSchema, sourceAccessSchema, sourceAccessSchemaV5, sourceBackfillSchema, storeIndexes, storeIndexesV7, storeSchemas, storeSchemasV7, storeSchemasV8, storeSchemasV9, storeSchemasV9V13, storeSchemasV15, triggerJobsSchema } from './schema-definitions.ts';
+import { cleanTasksSchema, consolidationJobsSchema, consolidationJobsV3Schema, consolidationProgressSchema, consolidationProgressSchemaV6, currentSchema, deletionsSchema, deletionsSchemaV5, distillFailuresSchema, distillLeaseSchema, distillTriggersSchema, hostSessionUsesSchema, hostSessionUsesByFileSchema, hostSessionUsesBySessionSchema, hostWorkspaceHoldsSchema, hostWorkspaceHoldsByFileSchema, latestSchemaVersion, legacySchema, memoryEvidenceSchema, memoryOriginsSchema, memoryOriginsSchemaV6, metadataGcSchema, sessionObservationsSchema, sessionUsagesSchema, sessionUsagesSchemaV15, sourceAccessByFileSchema, sourceAccessSchema, sourceAccessSchemaV5, sourceBackfillSchema, storeIndexes, storeIndexesV7, storeSchemas, storeSchemasV7, storeSchemasV8, storeSchemasV9, storeSchemasV9V13, storeSchemasV15, storeSchemasV16, triggerJobsSchema } from './schema-definitions.ts';
 import { parseStoredSessionObservation, parseStoredSessionUsage } from './session-validation.ts';
-import { parseStoredHostUse } from './host-use-validation.ts';
+import { parseStoredHostUse, parseStoredHostWorkspaceHold } from './host-use-validation.ts';
 import { SOURCE_INDEX_SCHEMAS } from "./source-index.ts";
 import { SOURCE_REGISTRY_SCHEMAS, SourceRegistry, initializeSourceRegistry } from "./source-registry.ts";
 import { SOURCE_VIEW_SCHEMAS } from "./source-view.ts";
@@ -104,7 +104,7 @@ export class SchemaManager {
     } else if (version === 2) {
       this.validateSchema(false, true);
       this.validateAllRows(false, true);
-      this.connection.database.exec(sessionUsagesSchema);
+      this.connection.database.exec(sessionUsagesSchemaV15);
       this.connection.database.exec("PRAGMA user_version = 3");
     } else if (version === 3) {
       this.validateSchema(true, true);
@@ -156,6 +156,7 @@ export class SchemaManager {
       this.migrateV13ToV14();
     }
     if (version < 15) this.migrateV14ToV15();
+    if (version < 16) this.migrateV15ToV16();
     this.validateLatestSchema();
     this.validateAllRows();
     this.dependencies.retention.sourceAccess();
@@ -169,6 +170,26 @@ export class SchemaManager {
         sourceAccessSchema + "; " +
         sourceAccessByFileSchema + "; " +
         "PRAGMA user_version = 15",
+    );
+  }
+
+  private migrateV15ToV16(): void {
+    const currentVersion = this.connection.database.prepare("PRAGMA user_version").get()?.["user_version"];
+    if (currentVersion !== 15) throw new Error("Memory schema migration expected version 15.");
+    const usageTriggers = SOURCE_COVERAGE_SCHEMAS.filter(s => s.name.startsWith("source_fence_session_usages_"));
+    this.connection.database.exec(
+      usageTriggers.map(t => "DROP TRIGGER IF EXISTS " + t.name + "; ").join("") +
+        "DROP INDEX IF EXISTS usages_source; " +
+        "ALTER TABLE session_usages RENAME TO session_usages_v15; " +
+        sessionUsagesSchema + "; " +
+        "INSERT INTO session_usages (owner_id, process_token, session_id, session_file, cwd, leaf_id, owner_pid, state) " +
+        "SELECT owner_id, process_token, session_id, session_file, cwd, leaf_id, owner_pid, state FROM session_usages_v15; " +
+        "DROP TABLE session_usages_v15; " +
+        "CREATE INDEX usages_source ON session_usages (session_file); " +
+        usageTriggers.map(t => t.sql + "; ").join("") +
+        hostWorkspaceHoldsSchema + "; " +
+        hostWorkspaceHoldsByFileSchema + "; " +
+        "PRAGMA user_version = 16",
     );
   }
 
@@ -304,7 +325,7 @@ export class SchemaManager {
     this.connection.database.exec(consolidationProgressSchemaV6);
     this.connection.database.exec(memoryOriginsSchemaV6);
     this.connection.database.exec(sessionObservationsSchema);
-    this.connection.database.exec(sessionUsagesSchema);
+    this.connection.database.exec(sessionUsagesSchemaV15);
   }
 
   private createTaskTables(): void {
@@ -412,7 +433,7 @@ export class SchemaManager {
     }
     if (includeSessionUsages) {
       schemas.set("session_usages", {
-        sql: sessionUsagesSchema,
+        sql: typeof schemaVersion === "number" && schemaVersion >= 16 ? sessionUsagesSchema : sessionUsagesSchemaV15,
         columns: [
           { name: "owner_id", type: "TEXT", notNull: 1, primaryKey: 1 },
           { name: "process_token", type: "TEXT", notNull: 1, primaryKey: 0 },
@@ -500,7 +521,7 @@ export class SchemaManager {
       });
     }
     const additional = typeof schemaVersion === "number" && schemaVersion >= 6
-      ? [...SOURCE_REGISTRY_SCHEMAS, ...(schemaVersion >= 9 ? SOURCE_INDEX_SCHEMAS : []), ...(schemaVersion >= 10 ? SOURCE_VIEW_SCHEMAS : []), ...(schemaVersion >= 11 ? SOURCE_COVERAGE_SCHEMAS : []), ...(schemaVersion >= 12 ? DISTILL_SCHEDULE_SCHEMAS : []), ...(schemaVersion === 13 ? storeSchemasV9V13 : schemaVersion === 14 ? storeSchemasV9 : schemaVersion >= 15 ? storeSchemasV15 : usesV8Metadata ? storeSchemasV8 : usesV7Metadata ? storeSchemasV7 : storeSchemas)]
+      ? [...SOURCE_REGISTRY_SCHEMAS, ...(schemaVersion >= 9 ? SOURCE_INDEX_SCHEMAS : []), ...(schemaVersion >= 10 ? SOURCE_VIEW_SCHEMAS : []), ...(schemaVersion >= 11 ? SOURCE_COVERAGE_SCHEMAS : []), ...(schemaVersion >= 12 ? DISTILL_SCHEDULE_SCHEMAS : []), ...(schemaVersion === 13 ? storeSchemasV9V13 : schemaVersion === 14 ? storeSchemasV9 : schemaVersion === 15 ? storeSchemasV15 : schemaVersion >= 16 ? storeSchemasV16 : usesV8Metadata ? storeSchemasV8 : usesV7Metadata ? storeSchemasV7 : storeSchemas)]
       : [];
     const extraSchemas = new Map(additional.map(schema => [schema.name, schema.sql]));
     if (objects.length !== schemas.size + extraSchemas.size) throw new Error("Unsupported memory database schema.");
@@ -671,6 +692,11 @@ export class SchemaManager {
     if (typeof schemaVersion === "number" && schemaVersion >= 13) {
       for (const raw of this.connection.database.prepare(`SELECT ${hostUseColumns} FROM host_session_uses`).iterate()) {
         parseStoredHostUse(this.connection.decodeRow(raw));
+      }
+    }
+    if (typeof schemaVersion === "number" && schemaVersion >= 16) {
+      for (const raw of this.connection.database.prepare(`SELECT ${hostWorkspaceHoldColumns} FROM host_workspace_holds`).iterate()) {
+        parseStoredHostWorkspaceHold(this.connection.decodeRow(raw));
       }
     }
   }

@@ -74,6 +74,13 @@ export const hostUseColumns = [
   "child_pid AS childPid", textColumn("child_token", "childToken"),
 ].join(", ");
 
+export const hostWorkspaceHoldColumns = [
+  textColumn("session_id", "sessionId"),
+  textColumn("session_file", "sessionFile"), textColumn("cwd"),
+  textColumn("source_generation", "sourceGeneration"),
+  "created_at AS createdAt",
+].join(", ");
+
 export const schemaColumns = [textColumn("name"), textColumn("type"), textColumn("sql")].join(", ");
 
 export const distillFailureColumns = [

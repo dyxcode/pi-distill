@@ -92,18 +92,17 @@ test('invalid model output leaves all source work pending for retry',async t=>{
   const db=new SQLiteMemoryStore(f.path); assert.equal(db.listConsolidationJobs().length,1); db.close();
 });
 
-test('startup recovers missed closure only for an inactive observed process',async t=>{
+test('startup does not auto-distill unclosed observed processes even after their PID exits',async t=>{
   let calls=0;
   const f=await fixture(t,async()=>{calls++;return {creates:[],updates:[],deletes:[]};});
   const db=new SQLiteMemoryStore(f.path);
-  db.observeSession({sessionId:'closed',sessionFile:join(f.root,'closed.jsonl'),cwd:f.root,leafId:'a',ownerPid:2147483647});
+  db.observeSession({sessionId:'crashed',sessionFile:join(f.root,'crashed.jsonl'),cwd:f.root,leafId:'a',ownerPid:2147483647});
   db.observeSession({sessionId:'active',sessionFile:join(f.root,'active.jsonl'),cwd:f.root,leafId:'a',ownerPid:process.pid});
   db.close();
-  const closed={...f.s,sessionId:'closed',sessionFile:join(f.root,'closed.jsonl')};
-  const c=new ConsolidationCoordinator({openStore:()=>new SQLiteMemoryStore(f.path),loadSnapshot:async path=>{
-    assert.equal(path,closed.sessionFile);return closed;
+  const c=new ConsolidationCoordinator({openStore:()=>new SQLiteMemoryStore(f.path),loadSnapshot:async()=>{
+    throw new Error('should not load unclosed crashed source');
   },runModel:async()=>{calls++;return {creates:[],updates:[],deletes:[]};},retryDelayMs:100000});
-  await c.start(f.ctx);await c.whenIdle();await c.shutdown(f.ctx,'reload');assert.equal(calls,1);
+  await c.start(f.ctx);await c.whenIdle();await c.shutdown(f.ctx,'reload');assert.equal(calls,0);
 });
 test('already committed sources are not re-applied after the resulting memory is removed',async t=>{
  let calls=0;
@@ -145,16 +144,16 @@ test('large conversation content is processed in bounded pieces without marking 
  assert.equal(reconstructed,original);
  const db=new SQLiteMemoryStore(f.path);assert.equal(db.listConsolidationJobs().length,0);db.close();
 });
-test('a transient source-read failure during startup recovery retries without restarting Pi',async t=>{
+test('a transient source-read failure on a closed trigger retries without restarting Pi',async t=>{
  const f=await fixture(t,async()=>({creates:[],updates:[],deletes:[]}));
- const db=new SQLiteMemoryStore(f.path);db.observeSession({sessionId:'closed',sessionFile:join(f.root,'closed.jsonl'),cwd:f.root,leafId:'a',ownerPid:2147483647});db.close();
- const closed={...f.s,sessionId:'closed',sessionFile:join(f.root,'closed.jsonl')};
- let loads=0,calls=0,now=Date.now();const diagnostics=[];
- const c=new ConsolidationCoordinator({diagnostics:{record:event=>diagnostics.push(event)},openStore:()=>new SQLiteMemoryStore(f.path),loadSnapshot:async()=>{loads++;if(loads===1)throw new Error('transient read');return closed;},runModel:async()=>{calls++;return {creates:[],updates:[],deletes:[]};},retryDelayMs:10,now:()=>now});
+ const closedFile=join(f.root,'closed.jsonl');
+ const db=new SQLiteMemoryStore(f.path);db.enqueueDistillTrigger({id:'closed-trigger-retry',reason:'close',sessionId:'closed',sessionFile:closedFile,cwd:f.root,leafId:'a'});db.close();
+ const closed={...f.s,sessionId:'closed',sessionFile:closedFile};
+ let loads=0,calls=0,now=Date.now();
+ const c=new ConsolidationCoordinator({openStore:()=>new SQLiteMemoryStore(f.path),loadSnapshot:async()=>{loads++;if(loads===1)throw new Error('transient read');return closed;},runModel:async()=>{calls++;return {creates:[],updates:[],deletes:[]};},retryDelayMs:10,now:()=>now});
  await c.start(f.ctx);await c.whenIdle();assert.equal(calls,0);now+=30000;
  for(let i=0;i<30&&calls===0;i++)await new Promise(resolve=>setTimeout(resolve,10));
  await c.shutdown(f.ctx,'reload');assert.equal(calls,1);assert.ok(loads>=2);
- const recovery=diagnostics.filter(event=>event.operation==='distill.recover');assert.deepEqual(recovery.map(event=>event.outcome),['failed','ok']);assert.equal(recovery[0].task,recovery[1].task);
 });
 test('a 10k-context selected model processes 5KiB of source without permanent oversized jobs',async t=>{
  const {consolidateWithModel}=await import('../../src/distill/model.ts');
@@ -174,7 +173,7 @@ test('a 10k-context selected model processes 5KiB of source without permanent ov
 });
 test('recovery uses the observed branch checkpoint instead of the last appended sibling',async t=>{
  const f=await fixture(t,async()=>({creates:[],updates:[],deletes:[]}));
- const db=new SQLiteMemoryStore(f.path);db.observeSession({sessionId:'closed',sessionFile:join(f.root,'closed.jsonl'),cwd:f.root,leafId:'a',ownerPid:2147483647});db.close();
+ const db=new SQLiteMemoryStore(f.path);db.enqueueDistillTrigger({id:'branch-checkpoint-close',reason:'close',sessionId:'closed',sessionFile:join(f.root,'closed.jsonl'),cwd:f.root,leafId:'a'});db.close();
  const closed={...f.s,sessionId:'closed',sessionFile:join(f.root,'closed.jsonl')};let calls=0;
  const c=new ConsolidationCoordinator({openStore:()=>new SQLiteMemoryStore(f.path),loadSnapshot:async(_path,leaf)=>{if(leaf!==undefined)assert.equal(leaf,'a');return closed;},runModel:async()=>{calls++;return {creates:[],updates:[],deletes:[]};},retryDelayMs:100000});
  await c.start(f.ctx);await c.whenIdle();await c.shutdown(f.ctx,'reload');assert.equal(calls,1);

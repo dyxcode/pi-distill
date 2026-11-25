@@ -6,21 +6,21 @@ import type {
   TaskPage,
   WaitReason
 } from "../distill/tasks.ts";
-import type { CompletedDeletionReceiptV1, HostChildIdentityV1, HostSourceRefV1, HostUseRecordV1, HostUseRecoveryV1, HostUseSourceRefV1, SessionDeletion } from '../retention/types.ts';
-import { cleanTaskColumns, deletionColumns, hostUseColumns, jobColumns, sessionUsageColumns, textColumn } from './columns.ts';
+import type { CompletedDeletionReceiptV1, HostChildIdentityV1, HostSourceRefV1, HostUseRecordV1, HostUseRecoveryV1, HostUseSourceRefV1, HostWorkspaceHoldV1, ReleaseWorkspaceHoldOptionsV1, SessionDeletion } from '../retention/types.ts';
+import { cleanTaskColumns, deletionColumns, hostUseColumns, hostWorkspaceHoldColumns, jobColumns, sessionUsageColumns, textColumn } from './columns.ts';
 import type { StorageConnection } from './connection.ts';
 import type { DistillQueue } from './distill.ts';
 import { parsePersistedJobRow } from './evidence-validation.ts';
 import { maxTaskPageSize } from './limits.ts';
 import type { PersistedCleanTask } from './records.ts';
 import { parseStoredSessionUsage, processHasExited } from './session-validation.ts';
-import { parseHostChildIdentity, parseHostSourceRef, parseHostUseRecovery, parseHostUseSourceRef, parseStoredHostUse } from './host-use-validation.ts';
+import { parseHostChildIdentity, parseHostSourceRef, parseHostUseRecovery, parseHostUseSourceRef, parseReleaseWorkspaceHoldOptions, parseStoredHostUse, parseStoredHostWorkspaceHold } from './host-use-validation.ts';
 import type { SessionRecords } from './sessions.ts';
 import { SourceRegistry } from "./source-registry.ts";
 import { cleanTaskId, parseCleanTaskInput, parsePersistedCleanTask, parseTaskPageOptions } from './task-validation.ts';
 import { fields, parseNullableText, validateAbsolutePath, validateLeaseDuration, validateNow, validateTaskCursor, validateText } from './validation.ts';
 interface Dependencies {
-  readonly distill: Pick<DistillQueue, "jobTriggerIds">;
+  readonly distill: Pick<DistillQueue, "jobTriggerIds" | "enqueueDistillTriggerInTransaction">;
   readonly sources: SourceRegistry;
   readonly sessions: Pick<SessionRecords, "assertSourceEnqueueAllowed">;
 }
@@ -298,6 +298,130 @@ export class RetentionTasks {
     ).run(id, child.pid, child.token).changes === 1);
   }
 
+  holdHostWorkspaceSession(input: HostUseSourceRefV1): HostWorkspaceHoldV1 | undefined {
+    this.connection.ensureOpen();
+    const source = parseHostUseSourceRef(input);
+    const access = source.sessionFile === undefined ? undefined : this.acquireSourceAccess(source.sessionFile, "read");
+    if (source.sessionFile !== undefined && !access) return undefined;
+    try {
+      return this.connection.transaction(() => {
+        if (source.sessionFile !== undefined) {
+          const deletion = this.getDeletion(source.sessionFile);
+          if (deletion) return undefined;
+        }
+        const registered = source.sessionFile === undefined
+          ? undefined
+          : this.dependencies.sources.get(source.sessionFile, source.sessionId);
+        if (registered && registered.cwd !== source.cwd) {
+          throw new Error("Host workspace hold working directory does not match its registered source.");
+        }
+        if (registered && source.sourceGeneration !== undefined && source.sourceGeneration !== registered.generation) {
+          throw new Error("Host workspace hold source generation does not match its registered source.");
+        }
+        const existingRow = this.connection.database.prepare(
+          `SELECT ${hostWorkspaceHoldColumns} FROM host_workspace_holds WHERE session_id = ?`,
+        ).get(source.sessionId);
+        const sourceGeneration = source.sourceGeneration ?? registered?.generation ?? null;
+        if (existingRow !== undefined) {
+          const existing = parseStoredHostWorkspaceHold(this.connection.decodeRow(existingRow));
+          const nextFile = source.sessionFile ?? existing.sessionFile;
+          const nextGeneration = sourceGeneration ?? existing.sourceGeneration;
+          if (existing.sessionFile !== nextFile || existing.sourceGeneration !== nextGeneration || existing.cwd !== source.cwd) {
+            this.connection.database.prepare(
+              "UPDATE host_workspace_holds SET session_file = ?, cwd = ?, source_generation = ? WHERE session_id = ?",
+            ).run(nextFile, source.cwd, nextGeneration, source.sessionId);
+          }
+          return {
+            sessionId: existing.sessionId,
+            sessionFile: nextFile,
+            cwd: source.cwd,
+            sourceGeneration: nextGeneration,
+            createdAt: existing.createdAt,
+          };
+        }
+        const createdAt = Date.now();
+        this.connection.database.prepare(
+          "INSERT INTO host_workspace_holds (session_id, session_file, cwd, source_generation, created_at) VALUES (?, ?, ?, ?, ?)",
+        ).run(source.sessionId, source.sessionFile ?? null, source.cwd, sourceGeneration, createdAt);
+        return {
+          sessionId: source.sessionId,
+          sessionFile: source.sessionFile ?? null,
+          cwd: source.cwd,
+          sourceGeneration,
+          createdAt,
+        };
+      });
+    } finally {
+      if (access) this.releaseSourceAccess(access);
+    }
+  }
+
+  releaseHostWorkspaceHold(input: HostUseSourceRefV1, optionsInput?: ReleaseWorkspaceHoldOptionsV1): boolean {
+    this.connection.ensureOpen();
+    const source = parseHostUseSourceRef(input);
+    const options = parseReleaseWorkspaceHoldOptions(optionsInput);
+    return this.connection.transaction(() => {
+      const existingRow = this.connection.database.prepare(
+        `SELECT ${hostWorkspaceHoldColumns} FROM host_workspace_holds WHERE session_id = ?`,
+      ).get(source.sessionId);
+      if (existingRow === undefined) return false;
+      const existing = parseStoredHostWorkspaceHold(this.connection.decodeRow(existingRow));
+      const deleted = this.connection.database.prepare(
+        "DELETE FROM host_workspace_holds WHERE session_id = ?",
+      ).run(source.sessionId).changes === 1;
+      const sessionFile = source.sessionFile ?? existing.sessionFile;
+      if (deleted && options.enqueueDistill === true && sessionFile !== null) {
+        // An explicit workspace close supersedes interruptions, but never a live owner.
+        const owners = this.connection.database.prepare(
+          `SELECT ${sessionUsageColumns} FROM session_usages WHERE session_id = ? AND session_file = ? AND state <> 'released'`,
+        ).all(source.sessionId, sessionFile);
+        const releaseOwner = this.connection.database.prepare(
+          "UPDATE session_usages SET state = 'released' WHERE owner_id = ?",
+        );
+        for (const row of owners) {
+          const owner = parseStoredSessionUsage(this.connection.decodeRow(row));
+          if (processHasExited(owner.ownerPid)) releaseOwner.run(owner.ownerId);
+        }
+        const leafId = options.leafId ?? null;
+        const triggerId = createHash("sha256").update(JSON.stringify([
+          "pi-distill-close-trigger-v1", source.sessionId, sessionFile, leafId,
+        ])).digest("hex");
+        this.dependencies.distill.enqueueDistillTriggerInTransaction({
+          id: triggerId,
+          reason: "close",
+          sessionId: source.sessionId,
+          sessionFile,
+          cwd: source.cwd,
+          leafId,
+        });
+      }
+      return deleted;
+    });
+  }
+
+  listHostWorkspaceHolds(): HostWorkspaceHoldV1[] {
+    this.connection.ensureOpen();
+    const rows = this.connection.database.prepare(
+      `SELECT ${hostWorkspaceHoldColumns} FROM host_workspace_holds ORDER BY created_at, session_id LIMIT 1025`,
+    ).all().map(raw => parseStoredHostWorkspaceHold(this.connection.decodeRow(raw)));
+    if (rows.length > 1024) throw new RangeError("Host workspace holds exceed the reconciliation limit.");
+    return rows;
+  }
+
+  hasHostWorkspaceHold(sessionId: string, sessionFile?: string | null): boolean {
+    this.connection.ensureOpen();
+    validateText(sessionId, "session ID");
+    if (sessionFile !== undefined && sessionFile !== null) {
+      validateAbsolutePath(sessionFile, "session file");
+      return this.connection.database.prepare(
+        "SELECT 1 FROM host_workspace_holds WHERE session_id = ? OR session_file = ? LIMIT 1",
+      ).get(sessionId, sessionFile) !== undefined;
+    }
+    return this.connection.database.prepare(
+      "SELECT 1 FROM host_workspace_holds WHERE session_id = ? LIMIT 1",
+    ).get(sessionId) !== undefined;
+  }
+
   listPendingHostUses(): HostUseRecordV1[] {
     this.connection.ensureOpen();
     const rows = this.connection.database.prepare(
@@ -398,7 +522,8 @@ export class RetentionTasks {
       this.connection.database.prepare("SELECT 1 FROM distill_triggers WHERE status<>'complete' AND (json_extract(trigger_json,'$.sessionFile')=? OR json_extract(trigger_json,'$.sessionId')=?) LIMIT 1").get(path, sessionId) !== undefined;
     const known = this.connection.database.prepare("SELECT 1 FROM session_usages WHERE session_file=? OR session_id=? LIMIT 1").get(path, sessionId) !== undefined;
     const outstanding = this.connection.database.prepare("SELECT 1 FROM session_usages WHERE (session_file=? OR session_id=?) AND state<>'released' LIMIT 1").get(path, sessionId) !== undefined;
-    const hostUse = this.connection.database.prepare("SELECT 1 FROM host_session_uses WHERE session_file=? OR session_id=? LIMIT 1").get(path, sessionId) !== undefined;
+    const hostUse = this.connection.database.prepare("SELECT 1 FROM host_session_uses WHERE session_file=? OR session_id=? LIMIT 1").get(path, sessionId) !== undefined ||
+      this.connection.database.prepare("SELECT 1 FROM host_workspace_holds WHERE session_file=? OR session_id=? LIMIT 1").get(path, sessionId) !== undefined;
     return { pending, released: known && !outstanding && !hostUse, hostUse };
   }
 
@@ -421,10 +546,13 @@ export class RetentionTasks {
   reconcileExitedSessionOwners(scope?: readonly string[]): void {
     this.connection.transaction(() => {
       const filter = this.scopeFilter(scope);
-      const rows = this.connection.database.prepare(`SELECT ${sessionUsageColumns} FROM session_usages WHERE state != 'released' AND ${filter.sql("session_file")} ORDER BY rowid LIMIT 128`).all(...filter.values);
+      const rows = this.connection.database.prepare(`SELECT ${sessionUsageColumns} FROM session_usages WHERE state IN ('active', 'closing') AND ${filter.sql("session_file")} ORDER BY rowid LIMIT 128`).all(...filter.values);
       for (const raw of rows) {
         const owner = parseStoredSessionUsage(this.connection.decodeRow(raw));
-        if (processHasExited(owner.ownerPid)) this.connection.database.prepare("UPDATE session_usages SET state = 'released' WHERE owner_id = ?").run(owner.ownerId);
+        if (!processHasExited(owner.ownerPid)) continue;
+        // Only a graceful user close (closing) releases a session; an active PID dying is an unexpected crash/interruption.
+        const nextState = owner.state === "closing" ? "released" : "interrupted";
+        this.connection.database.prepare("UPDATE session_usages SET state = ? WHERE owner_id = ?").run(nextState, owner.ownerId);
       }
     });
   }

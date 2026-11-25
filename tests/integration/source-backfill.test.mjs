@@ -81,7 +81,7 @@ function oldV5Schema(path) {
         file_version TEXT NOT NULL,
         state TEXT NOT NULL CHECK (state IN ('deleting', 'complete'))
       ) STRICT;
-      DROP INDEX IF EXISTS source_access_by_file; DROP TABLE source_access; CREATE TABLE source_access (singleton INTEGER PRIMARY KEY NOT NULL CHECK (singleton = 1), token TEXT NOT NULL, owner_pid INTEGER NOT NULL CHECK (owner_pid > 0)) STRICT;
+      DROP INDEX IF EXISTS host_workspace_holds_by_file; DROP TABLE IF EXISTS host_workspace_holds; DROP TRIGGER IF EXISTS source_fence_session_usages_insert; DROP TRIGGER IF EXISTS source_fence_session_usages_update; DROP TRIGGER IF EXISTS source_fence_session_usages_delete; DROP INDEX IF EXISTS usages_source; ALTER TABLE session_usages RENAME TO session_usages_v16; CREATE TABLE session_usages (owner_id TEXT PRIMARY KEY NOT NULL, process_token TEXT NOT NULL, session_id TEXT NOT NULL, session_file TEXT NOT NULL, cwd TEXT NOT NULL, leaf_id TEXT, owner_pid INTEGER NOT NULL CHECK (owner_pid > 0), state TEXT NOT NULL CHECK (state IN ('active', 'closing', 'released'))) STRICT; INSERT INTO session_usages SELECT * FROM session_usages_v16; DROP TABLE session_usages_v16; DROP INDEX IF EXISTS source_access_by_file; DROP TABLE source_access; CREATE TABLE source_access (singleton INTEGER PRIMARY KEY NOT NULL CHECK (singleton = 1), token TEXT NOT NULL, owner_pid INTEGER NOT NULL CHECK (owner_pid > 0)) STRICT;
       PRAGMA user_version = 5;
     `);
 
@@ -146,7 +146,7 @@ function oldV6Schema(path) {
       UPDATE source_registry_state SET backfill_complete = 0 WHERE singleton = 1;
       UPDATE source_registry_cursors SET cursor_row = NULL;
       UPDATE source_backfill SET phase = 0, cursor_row = 128 WHERE singleton = 1;
-      DROP INDEX IF EXISTS source_access_by_file; DROP TABLE source_access; CREATE TABLE source_access (singleton INTEGER PRIMARY KEY NOT NULL CHECK (singleton = 1), token TEXT NOT NULL, owner_pid INTEGER NOT NULL CHECK (owner_pid > 0)) STRICT;
+      DROP INDEX IF EXISTS host_workspace_holds_by_file; DROP TABLE IF EXISTS host_workspace_holds; DROP TRIGGER IF EXISTS source_fence_session_usages_insert; DROP TRIGGER IF EXISTS source_fence_session_usages_update; DROP TRIGGER IF EXISTS source_fence_session_usages_delete; DROP INDEX IF EXISTS usages_source; ALTER TABLE session_usages RENAME TO session_usages_v16; CREATE TABLE session_usages (owner_id TEXT PRIMARY KEY NOT NULL, process_token TEXT NOT NULL, session_id TEXT NOT NULL, session_file TEXT NOT NULL, cwd TEXT NOT NULL, leaf_id TEXT, owner_pid INTEGER NOT NULL CHECK (owner_pid > 0), state TEXT NOT NULL CHECK (state IN ('active', 'closing', 'released'))) STRICT; INSERT INTO session_usages SELECT * FROM session_usages_v16; DROP TABLE session_usages_v16; CREATE INDEX usages_source ON session_usages (session_file); DROP INDEX IF EXISTS source_access_by_file; DROP TABLE source_access; CREATE TABLE source_access (singleton INTEGER PRIMARY KEY NOT NULL CHECK (singleton = 1), token TEXT NOT NULL, owner_pid INTEGER NOT NULL CHECK (owner_pid > 0)) STRICT;
       PRAGMA user_version = 6;
     `);
     assert.equal(db.prepare("PRAGMA user_version").get().user_version, 6);
@@ -199,7 +199,7 @@ test(`v${legacyVersion} legacy source backfill resumes in bounded passes across 
   store = f.open();
   const version = new DatabaseSync(f.path);
   try {
-    assert.equal(version.prepare("PRAGMA user_version").get().user_version, 15);
+    assert.equal(version.prepare("PRAGMA user_version").get().user_version, 16);
   } finally {
     version.close();
   }

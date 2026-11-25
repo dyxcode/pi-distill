@@ -94,6 +94,10 @@ export class SQLiteMemoryStore {
   readonly hostSourceGeneration: RetentionTasks['hostSourceGeneration'];
   readonly recoverHostUse: RetentionTasks['recoverHostUse'];
   readonly getCompletedDeletionFor: RetentionTasks['getCompletedDeletionFor'];
+  readonly holdHostWorkspaceSession: RetentionTasks['holdHostWorkspaceSession'];
+  readonly releaseHostWorkspaceHold: RetentionTasks['releaseHostWorkspaceHold'];
+  readonly listHostWorkspaceHolds: RetentionTasks['listHostWorkspaceHolds'];
+  readonly hasHostWorkspaceHold: RetentionTasks['hasHostWorkspaceHold'];
   readonly prepareDeletion: RetentionTasks['prepareDeletion'];
   readonly finishDeletion: RetentionTasks['finishDeletion'];
 
@@ -206,6 +210,10 @@ export class SQLiteMemoryStore {
       this.hostSourceGeneration = retention.hostSourceGeneration.bind(retention);
       this.recoverHostUse = retention.recoverHostUse.bind(retention);
       this.getCompletedDeletionFor = retention.getCompletedDeletionFor.bind(retention);
+      this.holdHostWorkspaceSession = retention.holdHostWorkspaceSession.bind(retention);
+      this.releaseHostWorkspaceHold = retention.releaseHostWorkspaceHold.bind(retention);
+      this.listHostWorkspaceHolds = retention.listHostWorkspaceHolds.bind(retention);
+      this.hasHostWorkspaceHold = retention.hasHostWorkspaceHold.bind(retention);
       this.prepareDeletion = retention.prepareDeletion.bind(retention);
       this.finishDeletion = retention.finishDeletion.bind(retention);
     } catch (error) { connection.close(); throw error; }

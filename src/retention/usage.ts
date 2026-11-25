@@ -162,12 +162,13 @@ export class SessionUsageCoordinator {
     } catch (error) { diagnose(this.options.diagnostics, {operation:"usage.observe",outcome:"failed",error}); this.state.uncertain.add(this.options.namespace); }
   }
 
-  shutdown(event: Shutdown, ctx: Context): void {
+  shutdown(event: Shutdown, ctx: Context, options?: { readonly interrupted?: boolean }): void {
     this.observe(ctx);
     const binding = this.binding;
     try {
       if (binding?.record.state === "active") {
-        this.save(binding, { ...binding.record, state: "closing" });
+        const nextState = options?.interrupted ? "interrupted" : "closing";
+        this.save(binding, { ...binding.record, state: nextState });
         binding.shutdown = event;
       }
       diagnose(this.options.diagnostics, {operation:"usage.stop",outcome:"ok"});

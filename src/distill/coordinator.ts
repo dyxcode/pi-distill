@@ -16,7 +16,7 @@ import { distillRetryContext } from "./retry-context.ts";
 import type { DistillRetryContext } from "./retry.ts";
 import type { DistillRuntime as Context } from "./runtime.ts";
 import type { DistillTrigger, DistillTriggerInput } from "./tasks.ts";
-import type { ConsolidationJob, SessionObservation, SourceBatch, SourcePart } from "./types.ts";
+import type { ConsolidationJob, SourceBatch, SourcePart } from "./types.ts";
 import { ConsolidationConflictError } from './types.ts';
 
 type ShutdownReason = "quit" | "reload" | "new" | "resume" | "fork";
@@ -55,7 +55,6 @@ interface ActiveClaim {
 class PendingSourceOverlapError extends Error { }
 
 const MAX_RECOVERY_ITEMS_PER_PASS = 4;
-const MAX_OBSERVATIONS_PER_PASS = 4;
 const MAX_PENDING_SCAN_PAGES = 4;
 const PENDING_SCAN_PAGE_SIZE = 32;
 const MAX_WORK_TURNS_PER_PASS = 2;
@@ -86,13 +85,8 @@ export class ConsolidationCoordinator {
   #foregroundBusy = false;
   #compactionBusy = false;
   #recoveryNeeded = false;
-  #lastObservation: string | undefined;
   #triggerCursor = 0;
   #triggerSweepEnd: number | undefined;
-  #observationCursor = 0;
-  #observationSweepEnd: number | undefined;
-  #unobservedCursor = 0;
-  #unobservedSweepEnd: number | undefined;
   #pendingTriggerCursor = 0;
   #probeWaiting = false;
 
@@ -208,7 +202,7 @@ export class ConsolidationCoordinator {
    * Close captures one frozen source reference, then fences and aborts without
    * waiting on the provider. Reload deliberately creates no semantic trigger.
    */
-  async shutdown(ctx: Context, reason: ShutdownReason): Promise<void> {
+  async shutdown(ctx: Context, reason: ShutdownReason, options?: { readonly interrupted?: boolean }): Promise<void> {
     if (this.#closed) return;
     this.#context = ctx;
     if (this.#timer) clearTimeout(this.#timer);
@@ -217,15 +211,17 @@ export class ConsolidationCoordinator {
     this.#resolveDeferredKick = undefined;
     this.#deferredKick = undefined;
 
-    if (reason !== "reload") {
+    if (reason !== "reload" && options?.interrupted !== true) {
       try {
         const source = this.#sourceReference(ctx);
         if (source) {
           const store = this.#database();
-          const id = closeTriggerId(source);
-          store.enqueueDistillTrigger(this.#triggerInput(source, "close", id));
-          store.acknowledgeObservation(source.sessionId, source.leafId);
-          diagnose(this.#options.diagnostics, {operation:"capture.close",outcome:"ok"});
+          if (!store.hasHostWorkspaceHold(source.sessionId, source.sessionFile)) {
+            const id = closeTriggerId(source);
+            store.enqueueDistillTrigger(this.#triggerInput(source, "close", id));
+            store.acknowledgeObservation(source.sessionId, source.leafId);
+            diagnose(this.#options.diagnostics, {operation:"capture.close",outcome:"ok"});
+          }
         }
       } catch (error) {
         diagnose(this.#options.diagnostics, {operation:"capture.close",outcome:"failed",error});
@@ -584,89 +580,9 @@ export class ConsolidationCoordinator {
     this.#triggerSweepEnd = triggerPage.nextCursor === undefined ? undefined : triggerPage.throughCursor;
     if (this.#triggerCursor !== 0) unresolved = true;
 
-    const unobserved = store.listUnobservedSessionUsages({
-      limit: MAX_OBSERVATIONS_PER_PASS,
-      ...(this.#unobservedSweepEnd === undefined ? {} : { throughCursor: this.#unobservedSweepEnd }),
-      ...(this.#unobservedCursor === 0 ? {} : { cursor: this.#unobservedCursor }),
-    });
-    for (const owner of unobserved.items) {
-      if (signal.aborted) return;
-      if (alive(owner.ownerPid) || !existsSync(owner.sessionFile)) continue;
-      try {
-        // Preserve the known boundary first. The observation recovery below owns
-        // the fenced, retry-controlled read of any tail persisted before a crash.
-        store.observeSession({
-          sessionId: owner.sessionId, sessionFile: owner.sessionFile,
-          cwd: owner.cwd, leafId: owner.leafId, ownerPid: owner.ownerPid
-        });
-      } catch { unresolved = true; }
-
-    }
-    this.#unobservedCursor = unobserved.nextCursor ?? 0;
-    this.#unobservedSweepEnd = unobserved.nextCursor === undefined ? undefined : unobserved.throughCursor;
-    if (this.#unobservedCursor !== 0) unresolved = true;
-
-    const observationPage = store.listObservedSessions({
-      limit: MAX_OBSERVATIONS_PER_PASS,
-      ...(this.#observationSweepEnd === undefined ? {} : { throughCursor: this.#observationSweepEnd }),
-      ...(this.#observationCursor === 0 ? {} : { cursor: this.#observationCursor }),
-    });
-    const observations = rotateObservations(observationPage.items, this.#lastObservation);
-    for (const observation of observations) {
-      if (signal.aborted) return;
-      this.#lastObservation = observation.sessionId;
-      if (alive(observation.ownerPid) || !observation.sessionFile) continue;
-      const source: SourceReference = {
-        sessionId: observation.sessionId, sessionFile: observation.sessionFile,
-        cwd: observation.cwd, leafId: observation.leafId,
-      };
-      let id = closeTriggerId(source);
-      store.enqueueDistillTrigger(this.#triggerInput(source, "close", id));
-      // A prior compact/close may already have prepared this exact boundary.
-      // Recovery still must inspect the possible crash tail before acknowledging it.
-      const original = store.readDistillTrigger(id);
-      if (original?.status === "prepared" || original?.status === "complete") {
-        id += "-recovery";
-        store.enqueueDistillTrigger(this.#triggerInput(source, "close", id));
-      }
-      const retryContext = await this.#retryContext(source.sessionFile);
-      const claim = store.claimDistillTrigger({
-        id, retryContext, workerId: this.#workerId,
-        now: this.#now(), leaseMs: this.#options.claimLeaseMs ?? DEFAULT_CLAIM_LEASE_MS
-      });
-      if (!claim) { unresolved = true; continue; }
-      this.#startClaim(store, claim.claimToken);
-      try {
-        const latest = await this.#load(source.sessionFile);
-        signal.throwIfAborted();
-        if (!validSnapshot(latest) || latest.sessionId !== source.sessionId || latest.cwd !== source.cwd) {
-          throw new DistillFailure("source_invalid", "Crash recovery source identity or coverage is unavailable.");
-        }
-        if (latest.leafId !== source.leafId) {
-          const tail = { ...source, leafId: latest.leafId };
-          store.enqueueDistillTrigger(this.#triggerInput(tail, "close", closeTriggerId(tail)));
-        }
-        store.acknowledgeObservation(observation.sessionId, observation.leafId);
-        if (source.leafId === null) {
-          // The recorded pre-message boundary contains no evidence. Its recovered
-          // tail is durable above before this empty boundary can enable cleanup.
-          store.prepareDistillTrigger({ id, claimToken: claim.claimToken, now: this.#now(), jobs: [] });
-        } else {
-          store.releaseDistillClaim({ claimToken: claim.claimToken, now: this.#now() });
-        }
-        diagnose(this.#options.diagnostics, {operation:"distill.recover",outcome:"ok",task:id,source:source.sessionId});
-      } catch (error) {
-        if (!signal.aborted && !(error instanceof SourceWorkPending)) diagnose(this.#options.diagnostics, {operation:"distill.recover",outcome:"failed",task:id,source:source.sessionId,error});
-        unresolved = true;
-        this.#releaseClaim(store, claim.claimToken, error, retryContext, signal);
-      } finally { this.#finishClaim(); }
-
-    }
-
-    this.#observationCursor = observationPage.nextCursor ?? 0;
-    this.#observationSweepEnd = observationPage.nextCursor === undefined ? undefined : observationPage.throughCursor;
-    if (this.#observationCursor !== 0) unresolved = true;
-    this.#recoveryNeeded = unresolved || this.#triggerCursor !== 0 || this.#observationCursor !== 0;
+    // Unexpected crashes, OS reboots, and dead PIDs without an explicit user close
+    // must not automatically enqueue distillation or delete session history.
+    this.#recoveryNeeded = unresolved || this.#triggerCursor !== 0;
   }
 
   async #prepareTrigger(trigger: DistillTrigger, claimToken: string, retryContext: DistillRetryContext, signal: AbortSignal): Promise<void> {
@@ -908,12 +824,6 @@ export class ConsolidationCoordinator {
   }
 }
 
-function rotateObservations(observations: readonly SessionObservation[], last: string | undefined): SessionObservation[] {
-  if (!last) return [...observations];
-  const index = observations.findIndex(observation => observation.sessionId === last);
-  return index < 0 ? [...observations] : [...observations.slice(index + 1), ...observations.slice(0, index + 1)];
-}
-
 function closeTriggerId(source: SourceReference): string {
   return createHash("sha256").update(JSON.stringify([
     "pi-distill-close-trigger-v1", source.sessionId, source.sessionFile, source.leafId,
@@ -941,12 +851,6 @@ function triggerLineageSessionIds(snapshot: SourceSnapshot): string[] {
   ])];
 }
 
-function alive(pid: number): boolean {
-  try { process.kill(pid, 0); return true; }
-  catch (error) {
-    return !(typeof error === "object" && error !== null && "code" in error && error.code === "ESRCH");
-  }
-}
 
 function sourceBoundary(snapshot: SourceSnapshot, evidence: readonly SourcePart[]): {
   sourceTime?: string;

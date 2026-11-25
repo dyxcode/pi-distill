@@ -8,6 +8,10 @@ import type { SessionUsageCoordinator } from '../retention/usage.ts';
 /** Pi owns event ordering; coordinators own durable work and resource lifetimes. */
 export function registerLifecycle(pi: ExtensionAPI, memoryTools: MemoryTools, consolidation: ConsolidationCoordinator,
   usage: SessionUsageCoordinator, cleanup: CleanupCoordinator, diagnostics?: DiagnosticSink & {close(): void}): void {
+  let signalInterrupted = false;
+  const onSignal = (): void => { signalInterrupted = true; };
+  const signals: NodeJS.Signals[] = process.platform === "win32" ? ["SIGTERM"] : ["SIGTERM", "SIGHUP"];
+  for (const signal of signals) process.prependListener(signal, onSignal);
   pi.on("agent_start", () => { memoryTools.reset(); consolidation.setForegroundBusy(true); });
   pi.on("agent_settled", (_event, ctx) => {
     consolidation.observe(ctx);
@@ -31,15 +35,17 @@ export function registerLifecycle(pi: ExtensionAPI, memoryTools: MemoryTools, co
   });
   pi.on("session_compact_failed", () => consolidation.compactFailed());
   pi.on("session_shutdown", async (event, ctx) => {
+    const interrupted = signalInterrupted;
     try {
       cleanup.close();
-      await consolidation.shutdown(ctx, event.reason);
-      usage.shutdown(event, ctx);
+      await consolidation.shutdown(ctx, event.reason, { interrupted });
+      usage.shutdown(event, ctx, { interrupted });
       memoryTools.close();
     } catch (error) {
       diagnose(diagnostics, {operation:"runtime.stop",outcome:"failed",reason:event.reason,error});
       throw error;
     } finally {
+      for (const signal of signals) process.off(signal, onSignal);
       try { diagnostics?.close(); } catch { /* Logging cannot delay shutdown. */ }
     }
   });
