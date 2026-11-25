@@ -225,3 +225,37 @@ test("durable host workspace holds survive restart, block retention and child sh
   assert.equal(store.hasUncapturedObservation([sessionFile]), false, "the queued close captures the same observed leaf");
   assert.equal(retentionAfterRelease.released, true, "explicit close supersedes exited owners' interruption protection");
 });
+
+test("schema v15 database migrates cleanly to v16 while preserving existing data", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "pi-distill-v15-migration-"));
+  const databasePath = join(directory, "memory.sqlite");
+  t.after(() => rm(directory, { recursive: true, force: true }));
+
+  const initial = new SQLiteMemoryStore(databasePath);
+  initial.save({ id: "v15-keep", content: "Survives v15 to v16 migration.", createdAt: "2026-11-25T00:00:00.000Z" });
+  initial.close();
+
+  const raw = new DatabaseSync(databasePath);
+  raw.exec(
+    SOURCE_COVERAGE_SCHEMAS.filter(s => s.name.startsWith("source_fence_session_usages_")).map(s => `DROP TRIGGER IF EXISTS ${s.name}; `).join("") +
+      "DROP INDEX IF EXISTS usages_source; " +
+      "ALTER TABLE session_usages RENAME TO session_usages_v16; " +
+      "CREATE TABLE session_usages (owner_id TEXT PRIMARY KEY NOT NULL, process_token TEXT NOT NULL, session_id TEXT NOT NULL, session_file TEXT NOT NULL, cwd TEXT NOT NULL, leaf_id TEXT, owner_pid INTEGER NOT NULL CHECK (owner_pid > 0), state TEXT NOT NULL CHECK (state IN ('active', 'closing', 'released'))) STRICT; " +
+      "INSERT INTO session_usages SELECT * FROM session_usages_v16; " +
+      "DROP TABLE session_usages_v16; " +
+      "CREATE INDEX usages_source ON session_usages (session_file); " +
+      SOURCE_COVERAGE_SCHEMAS.filter(s => s.name.startsWith("source_fence_session_usages_")).map(s => `${s.sql}; `).join("") +
+      "DROP INDEX IF EXISTS host_workspace_holds_by_file; DROP TABLE IF EXISTS host_workspace_holds; " +
+      "PRAGMA user_version = 15",
+  );
+  raw.close();
+
+  const migrated = openHostStorageV1(databasePath);
+  t.after(() => migrated.close());
+  const check = new DatabaseSync(databasePath);
+  assert.equal(check.prepare("PRAGMA user_version").get().user_version, 16);
+  check.close();
+  const store = new SQLiteMemoryStore(databasePath);
+  t.after(() => store.close());
+  assert.equal(store.get("v15-keep")?.content, "Survives v15 to v16 migration.");
+});

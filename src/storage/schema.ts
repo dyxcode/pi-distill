@@ -36,7 +36,7 @@ export class SchemaManager {
 
   initializeSchema(): void {
     const version = this.connection.database.prepare("PRAGMA user_version").get()?.["user_version"];
-    if (version !== 0 && version !== 1 && version !== 2 && version !== 3 && version !== 4 && version !== 5 && version !== 6 && version !== 7 && version !== 8 && version !== 9 && version !== 10 && version !== 11 && version !== 12 && version !== 13 && version !== 14 && version !== latestSchemaVersion) {
+    if (typeof version !== "number" || !Number.isSafeInteger(version) || version < 0 || version > latestSchemaVersion) {
       throw new Error("Unsupported memory database schema version: " + String(version) + ".");
     }
     if (version === latestSchemaVersion) {
