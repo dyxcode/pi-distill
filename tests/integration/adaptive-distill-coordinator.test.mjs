@@ -51,6 +51,119 @@ async function prepare(f, contextWindow = 128000) {
   return jobs;
 }
 
+const configKeys = ['PI_DISTILL_CONSOLIDATION_PROVIDER', 'PI_DISTILL_CONSOLIDATION_MODEL', 'PI_DISTILL_CONSOLIDATION_REASONING'];
+function configure(t, provider, model, effort) {
+  for (const [index, value] of [provider, model, effort].entries()) {
+    const key = configKeys[index];
+    const previous = process.env[key];
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+    t.after(() => { if (previous === undefined) delete process.env[key]; else process.env[key] = previous; });
+  }
+}
+
+test('configured model owns request sizing and reasoning on every tool round; missing model preserves pending work', async t => {
+  const f = await fixture(t);
+  const [job] = await prepare(f);
+  configure(t, 'synthetic', 'dedicated-v1', 'minimal');
+  // The foreground model cannot fit even one part.
+  const ctx = f.context(4500);
+  const dedicated = { ...ctx.model, id: 'dedicated-v1', contextWindow: 32_000 };
+  let available = false;
+  ctx.modelRegistry.find = (provider, id) => {
+    assert.deepEqual([provider, id], ['synthetic', 'dedicated-v1']);
+    return available ? dedicated : undefined;
+  };
+  ctx.modelRegistry.hasConfiguredAuth = () => true;
+  let calls = 0;
+  ctx.modelRegistry.complete = () => { assert.fail('Must not use raw complete with explicit reasoning'); };
+  ctx.modelRegistry.streamSimple = (model, request, options) => {
+    assert.equal(model, dedicated);
+    assert.equal(options.reasoning, 'minimal');
+    assert.equal(options.cacheRetention, 'short');
+    assert.ok(Buffer.byteLength(JSON.stringify(request)) <= dedicated.contextWindow - 4096);
+    calls++;
+    return { result: async () => calls === 1
+      ? fauxAssistantMessage(fauxToolCall('memory_search', { terms: ['Cedar'] }), { stopReason: 'toolUse' })
+      : fauxAssistantMessage('{"operations":[]}') };
+  };
+  const c = f.worker({});
+  await c.start(ctx); await c.whenIdle();
+  assert.equal(calls, 0);
+  f.inspect(store => {
+    assert.deepEqual(store.listConsolidationJobs(), [job]);
+    assert.deepEqual(store.processedSources(job.sourceKeys), []);
+    assert.equal(store.readDistillFailure('job', job.id)?.reason, 'model_unavailable');
+  });
+  available = true;
+  ctx.model = undefined;
+  await c.start(ctx); await c.whenIdle();
+  assert.ok(calls >= 2, 'a newly available configured model can recover without waiting for the previous failure cooldown');
+  assert.ok(f.inspect(store => store.processedSources(job.sourceKeys)).length > 0);
+});
+
+test('a registered model without configured auth blocks rather than spending on the chat model', async t => {
+  const f = await fixture(t);
+  const [job] = await prepare(f);
+  configure(t, 'synthetic', 'unauthenticated');
+  const ctx = f.context(128000);
+  const dedicated = { ...ctx.model, id: 'unauthenticated' };
+  ctx.modelRegistry.find = () => dedicated;
+  ctx.modelRegistry.hasConfiguredAuth = model => {
+    assert.equal(model, dedicated);
+    return false;
+  };
+  let calls = 0;
+  ctx.modelRegistry.complete = async () => { calls++; return fauxAssistantMessage('{"operations":[]}'); };
+  const worker = f.worker({});
+  await worker.start(ctx); await worker.whenIdle();
+  assert.equal(calls, 0);
+  f.inspect(store => {
+    assert.deepEqual(store.listConsolidationJobs(), [job]);
+    assert.equal(store.readDistillFailure('job', job.id)?.reason, 'model_unavailable');
+  });
+});
+
+test('reasoning off keeps the chat model and uses Pi’s no-reasoning option', async t => {
+  const f = await fixture(t);
+  const [job] = await prepare(f);
+  configure(t, undefined, undefined, 'off');
+  const ctx = f.context(128000);
+  let calls = 0;
+  ctx.modelRegistry.streamSimple = (model, _request, options) => {
+    assert.equal(model, ctx.model);
+    assert.equal(Object.hasOwn(options, 'reasoning'), false);
+    calls++;
+    return { result: async () => fauxAssistantMessage('{"operations":[]}') };
+  };
+  const worker = f.worker({});
+  await worker.start(ctx); await worker.whenIdle();
+  assert.equal(calls, 1);
+  assert.deepEqual(f.inspect(store => store.processedSources(job.sourceKeys)), job.sourceKeys);
+});
+
+for (const [provider, model, effort] of [
+  ['synthetic', undefined, undefined], [undefined, 'dedicated', undefined],
+  ['', 'dedicated', undefined], ['synthetic', ' dedicated', undefined],
+  [undefined, undefined, 'high'], [undefined, undefined, ''],
+]) {
+  test(`invalid consolidation settings ${JSON.stringify([provider, model, effort])} fail closed`, async t => {
+    const f = await fixture(t);
+    const [job] = await prepare(f);
+    configure(t, provider, model, effort);
+    const ctx = f.context(128000);
+    let calls = 0;
+    ctx.modelRegistry.complete = async () => { calls++; return fauxAssistantMessage('{"operations":[]}'); };
+    const worker = f.worker({});
+    await worker.start(ctx); await worker.whenIdle();
+    assert.equal(calls, 0);
+    f.inspect(store => {
+      assert.deepEqual(store.processedSources(job.sourceKeys), []);
+      assert.equal(store.readDistillFailure('job', job.id)?.reason, 'model_unavailable');
+    });
+  });
+}
+
 test('smaller-model takeover preserves committed prefixes across failure and restart and completes every source once', { timeout: 15000 }, async t => {
   const f = await fixture(t);
   const jobs = await prepare(f);

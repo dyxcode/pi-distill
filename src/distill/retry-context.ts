@@ -2,9 +2,9 @@ import { createHash } from "node:crypto";
 import { dirname, resolve } from "node:path";
 import { readSessionHeader } from "../sources/header.ts";
 import type { DistillRetryContext } from "./retry.ts";
-import type { ModelRuntime } from "./runtime.ts";
+import type { ConsolidationReasoning, ModelRuntime } from "./runtime.ts";
 
-const POLICY_VERSION = "distill-retry-context-v4";
+const POLICY_VERSION = "distill-retry-context-v5";
 const MAX_ANCESTRY_DEPTH = 128;
 const MAX_MODEL_TEXT_LENGTH = 4_096;
 const MAX_BASE_URL_LENGTH = 16_384;
@@ -18,10 +18,11 @@ const MAX_SESSION_PATH_LENGTH = 32_768;
 export function distillRetryContext(
   sessionFile: string,
   model: ModelRuntime["model"],
+  reasoning?: ConsolidationReasoning,
 ): DistillRetryContext {
   return {
     sourceVersion: sourceVersion(sessionFile),
-    modelKey: modelKey(model),
+    modelKey: modelKey(model, reasoning),
     policyVersion: POLICY_VERSION,
   };
 }
@@ -87,7 +88,7 @@ function invalidSessionPath(sessionFile: string): string {
   return fingerprint(["distill-source-v1", "invalid-session-path", fingerprint(["session-path-v1", sessionFile])]);
 }
 
-function modelKey(model: ModelRuntime["model"]): string {
+function modelKey(model: ModelRuntime["model"], reasoning?: ConsolidationReasoning): string {
   if (model === undefined) return fingerprint(["pi-model-v1", "unavailable"]);
 
   const baseUrlKey = typeof model.baseUrl === "string" && model.baseUrl.length <= MAX_BASE_URL_LENGTH
@@ -101,6 +102,7 @@ function modelKey(model: ModelRuntime["model"]): string {
     modelLimit(model.contextWindow) ? model.contextWindow : "invalid-context-window",
     modelLimit(model.maxTokens) ? model.maxTokens : "invalid-max-tokens",
     baseUrlKey,
+    reasoning ?? null,
   ]);
 }
 

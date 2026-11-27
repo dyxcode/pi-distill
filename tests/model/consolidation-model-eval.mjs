@@ -2,7 +2,7 @@ import { mkdir, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { assessCurrentMemories, assessRecall, countOutstandingDistillTriggers, evaluationFailureStatus, sanitizeEvaluationTrace, trackStreamCompletion, waitForConsolidation } from "./consolidation-model-eval-support.mjs";
+import { assessCurrentMemories, assessRecall, assessMemoryQuality, countOutstandingDistillTriggers, evaluationFailureStatus, sanitizeEvaluationTrace, trackStreamCompletion, waitForConsolidation } from "./consolidation-model-eval-support.mjs";
 import { assessTaskMemories, assessTaskRecall } from "./task-cancellation-eval-support.mjs";
 
 const repoRoot = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
@@ -11,6 +11,14 @@ const modelId = "gpt-6-luna";
 const defaultRequestLimit = 20;
 const deadlineMs = 150_000;
 const cases = {
+  quality: {
+    project: 'Quartz',
+    seeds: [
+      { id: 'snapshot-policy', content: '每周快照仅在恢复演练期间保留。' },
+      { id: 'quartz-rollout', content: 'For Quartz, the pilot requires a watch channel named #pilot-amber and two reviewers.' },
+    ],
+    initial: 'Ops/Quartz-readings.md in Obsidian is the Quartz source of truth for readings; only confirmed readings go there. The entries were 73.625 units on 2026-04-11 and 62.875 units on 2026-04-12. I entered and verified those two rows, deployed and restarted Quartz, and there was no reading supplied today. We keep weekly snapshots only during recovery drills. For Quartz the pilot is over: use #rollout-silver as the watch channel now. The two-reviewer requirement still applies. Briefly acknowledge.',
+  },
   cleanup: {
     project: "Birch", initialDays: 14, exceptionDays: 30,
     initial: "For our fictional Birch service, the agreed default log retention is 14 days, extended to 30 days during an incident investigation. Briefly acknowledge.",
@@ -144,17 +152,27 @@ async function runLifecycle(pi, SQLiteMemoryStore, modelRuntime, model, isolated
   const cwd = join(isolatedRoot, "synthetic-project");
   const databasePath = join(agentDir, "distill", "memories.sqlite");
   await Promise.all([
-    mkdir(agentDir, { recursive: true }),
+    mkdir(dirname(databasePath), { recursive: true }),
     mkdir(sessionDir, { recursive: true }),
     mkdir(cwd, { recursive: true }),
   ]);
 
+  const seeds = (fixture.seeds ?? []).map(record => ({ ...record, revision: 1, createdAt: '2026-01-01T00:00:00.000Z' }));
+  if (seeds.length) {
+    const store = new SQLiteMemoryStore(databasePath);
+    try { for (const seed of seeds) store.save({ id: seed.id, content: seed.content, createdAt: seed.createdAt }); }
+    finally { store.close(); }
+  }
+  const consolidationUsage = { responses: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0 };
+  runtimeRef.consolidationUsage = consolidationUsage;
   let inFlightRequests = 0;
   let completedRequests = 0;
   let lastRequestCompletion = Date.now();
   let requestLimitHit = false;
   const seenMessageCount = new WeakMap();
   let activeStage = "setup";
+  let bilingualSearchHit = false;
+  let bilingualMemoryReads = 0;
 
   const beginRequest = (kind) => {
     if (deadlineSignal.aborted) throw deadlineSignal.reason ?? new Error("Evaluation deadline exceeded.");
@@ -176,18 +194,30 @@ async function runLifecycle(pi, SQLiteMemoryStore, modelRuntime, model, isolated
     lastRequestCompletion = Date.now();
   };
 
-  const originalComplete = modelRuntime.complete.bind(modelRuntime);
-  modelRuntime.complete = async (requestedModel, context, options = {}) => {
+  const beginConsolidation = (requestedModel, context, options) => {
     const request = beginRequest("consolidation");
     const messages = Array.isArray(context?.messages) ? context.messages : [];
     const previouslySeen = seenMessageCount.get(messages) ?? 0;
     seenMessageCount.set(messages, messages.length);
+    const addedMessages = messages.slice(previouslySeen);
+    if (caseId === 'quality') {
+      const bilingualId = seeds[0].id;
+      for (const message of addedMessages) {
+        if (message.role === 'toolResult' && !message.isError && message.toolName === 'memory_search') {
+          const result = JSON.parse(message.content[0].text);
+          bilingualSearchHit ||= result.candidates?.some(candidate => candidate.id === bilingualId) === true;
+        } else if (message.role === 'assistant') {
+          bilingualMemoryReads += message.content.filter(block => block.type === 'toolCall' && block.name === 'memory_read' &&
+            block.arguments.id === bilingualId).length;
+        }
+      }
+    }
     const delta = {
       ...(previouslySeen === 0 && typeof context?.systemPrompt === "string" ? { systemPrompt: context.systemPrompt } : {}),
       ...(previouslySeen === 0 && Array.isArray(context?.tools)
         ? { tools: context.tools.map((tool) => ({ name: tool.name, description: tool.description })) }
         : {}),
-      messages: messages.slice(previouslySeen),
+      messages: addedMessages,
     };
     trace.push(sanitizeEvaluationTrace({
       stage: activeStage,
@@ -195,13 +225,19 @@ async function runLifecycle(pi, SQLiteMemoryStore, modelRuntime, model, isolated
       type: "request",
       requestId: request.id,
       model: { provider: requestedModel.provider, id: requestedModel.id },
+      effort: options.reasoning,
       delta,
     }));
+    return request;
+  };
+  const observeConsolidation = async (request, start) => {
     try {
-      const response = await originalComplete(requestedModel, context, {
-        ...options,
-        signal: signalFor(deadlineSignal, options.signal),
-      });
+      const response = await start();
+      const counters = ['input', 'output', 'cacheRead', 'cacheWrite', 'totalTokens'];
+      if (counters.every(key => Number.isSafeInteger(response.usage?.[key]) && response.usage[key] >= 0)) {
+        consolidationUsage.responses++;
+        for (const key of counters) consolidationUsage[key] += response.usage[key];
+      }
       trace.push(sanitizeEvaluationTrace({
         stage: activeStage,
         surface: "consolidation",
@@ -218,6 +254,32 @@ async function runLifecycle(pi, SQLiteMemoryStore, modelRuntime, model, isolated
     } finally {
       finishRequest(request);
     }
+  };
+
+  const originalComplete = modelRuntime.complete.bind(modelRuntime);
+  modelRuntime.complete = (requestedModel, context, options = {}) => {
+    const request = beginConsolidation(requestedModel, context, options);
+    return observeConsolidation(request, () => originalComplete(requestedModel, context, {
+      ...options, signal: signalFor(deadlineSignal, options.signal),
+    }));
+  };
+  // Observe the extension-facing facade, not the SDK runtime's foreground stream.
+  const originalStreamSimple = pi.ModelRegistry.prototype.streamSimple;
+  runtimeRef.restoreRegistry = () => { pi.ModelRegistry.prototype.streamSimple = originalStreamSimple; };
+  pi.ModelRegistry.prototype.streamSimple = function (requestedModel, context, options = {}) {
+    const request = beginConsolidation(requestedModel, context, options);
+    let stream;
+    try {
+      stream = originalStreamSimple.call(this, requestedModel, context, {
+        ...options, signal: signalFor(deadlineSignal, options.signal),
+      });
+    } catch (error) {
+      finishRequest(request);
+      throw error;
+    }
+    // Return the original stream; observation must not consume its events.
+    void observeConsolidation(request, () => stream.result()).catch(() => {});
+    return stream;
   };
 
   const settingsManager = pi.SettingsManager.inMemory({ compaction: { enabled: false, reserveTokens: 512, keepRecentTokens: 0 } });
@@ -439,6 +501,20 @@ async function runLifecycle(pi, SQLiteMemoryStore, modelRuntime, model, isolated
       { expandPromptTemplates: false },
     ), deadlineSignal);
 
+    if (caseId === 'quality') {
+      activeStage = 'quality_close';
+      const { state, settled } = await advanceBoundary(false);
+      const assessment = assessMemoryQuality(state.memories, seeds);
+      if (!bilingualSearchHit) {
+        assessment.accepted = false;
+        assessment.issues.push('bilingual_candidate_not_retrieved');
+      }
+      const status = !settled ? 'incomplete' : assessment.accepted ? 'completed' : 'needs_review';
+      stages.push({ name: activeStage, status: status === 'completed' ? 'passed' : status, ...state, assessment,
+        signals: { bilingualSearchHit, bilingualMemoryReads } });
+      return { ...runtimeRef.report, status };
+    }
+
     if (fixture.kind === "task") {
       const initial = await taskBoundary("initial_close", { cancelled: false });
       if (initial.status === "incomplete") return { ...runtimeRef.report, status: initial.status };
@@ -569,6 +645,7 @@ async function main() {
     deadlineController.abort(new Error("evaluation_finished"));
     clearTimeout(deadlineTimer);
     try { await runtimeRef.runtime?.dispose(); } catch { /* The bounded runner records the evaluation before cleanup. */ }
+    runtimeRef.restoreRegistry?.();
     if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
     else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
     if (originalSessionDir === undefined) delete process.env.PI_CODING_AGENT_SESSION_DIR;
@@ -583,13 +660,16 @@ async function main() {
   report.generatedAt = new Date().toISOString();
   report.node = process.version;
   report.reportPath = reportPath;
-  await writeFile(reportPath, `${JSON.stringify(sanitizeEvaluationTrace(report), null, 2)}\n`, { mode: 0o600 });
+  // Add only allowlisted aggregate numbers; raw response usage and reasoning stay out of the trace.
+  const consolidationUsage = runtimeRef.consolidationUsage ?? null;
+  await writeFile(reportPath, `${JSON.stringify({ ...sanitizeEvaluationTrace(report), consolidationUsage }, null, 2)}\n`, { mode: 0o600 });
   const summary = {
     status: report.status,
     case: report.case,
     model: report.model,
     node: report.node,
     providerRequests: report.providerRequests ?? 0,
+    consolidationUsage,
     stages: (report.stages ?? []).map(({ name, status, pendingJobs, pendingTriggers, assessment, signals }) => ({
       name,
       status,

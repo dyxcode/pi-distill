@@ -1,6 +1,31 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { assessCurrentMemories, assessRecall, policySignals, sanitizeEvaluationTrace } from "../model/consolidation-model-eval-support.mjs";
+import { assessCurrentMemories, assessRecall, assessMemoryQuality, policySignals, sanitizeEvaluationTrace } from "../model/consolidation-model-eval-support.mjs";
+
+const qualitySeeds = [
+  { id: 'snapshot', revision: 1, content: '每周快照仅在恢复演练期间保留。' },
+  { id: 'pilot', revision: 1, content: 'For Quartz, the pilot requires a watch channel named #pilot-amber and two reviewers.' },
+];
+const cleanQualityRecords = [
+  qualitySeeds[0],
+  { id: 'pilot', revision: 2, content: 'Quartz uses #rollout-silver for rollout and still requires two reviewers.' },
+  { id: 'pointer', revision: 1, content: 'Use Obsidian path Ops/Quartz-readings.md as the source of truth. Record only confirmed readings.' },
+];
+
+test('memory quality rubric checks pointer, diary, bilingual duplicate, and stale update independently', () => {
+  assert.equal(assessMemoryQuality(cleanQualityRecords, qualitySeeds).accepted, true);
+  for (const [records, issue] of [
+    [cleanQualityRecords.map(r => r.id === 'pointer' ? { ...r, content: `${r.content} 73.625 units on 2026-04-11.` } : r), 'duplicated_canonical_data'],
+    [[...cleanQualityRecords, { id: 'diary', revision: 1, content: 'Quartz was deployed and restarted on Apr 11.' }], 'operational_diary'],
+    [[...cleanQualityRecords, { id: 'duplicate', revision: 1, content: 'Keep weekly snapshots only during recovery drills.' }], 'bilingual_duplicate'],
+    [cleanQualityRecords.map(r => r.id === 'pilot' ? { ...r, content: `${r.content} It used to be #pilot-amber.` } : r), 'superseded_detail'],
+    [cleanQualityRecords.map(r => r.id === 'pilot' ? { ...r, content: 'Quartz uses #rollout-silver.' } : r), 'current_conditions_missing'],
+  ]) {
+    const result = assessMemoryQuality(records, qualitySeeds);
+    assert.equal(result.accepted, false);
+    assert.ok(result.issues.includes(issue), JSON.stringify(result));
+  }
+});
 
 test("policy rubric associates full day values with the default and incident exception", () => {
   const result = policySignals(
@@ -13,6 +38,13 @@ test("policy rubric associates full day values with the default and incident exc
     matchesDefault: true,
     preservesIncidentException: true,
   });
+});
+
+test('a reference to the default inside the incident exception is not a competing default', () => {
+  assert.deepEqual(policySignals(
+    'Cedar-72’s ordinary policy is to retain logs for **7 days**. During an active incident investigation, retain **relevant logs for 30 days**—an exception to the default.',
+    { defaultDays: 7, exceptionDays: 30 },
+  ), { namesProject: true, matchesDefault: true, preservesIncidentException: true });
 });
 
 test("a digit inside Cedar-72 cannot satisfy a seven-day rule", () => {

@@ -11,6 +11,7 @@ import { SourceWorkPending, type PagedSourceView } from "../storage/source-view.
 import { type SQLiteMemoryStore } from '../storage/store.ts';
 import { DistillFailure } from "./failure.ts";
 import { consolidateWithModel, fitsConsolidationRequest } from "./model.ts";
+import { selectConsolidationModel, type ConsolidationSelection } from "./model-selection.ts";
 import { planSources } from './preparation.ts';
 import { distillRetryContext } from "./retry-context.ts";
 import type { DistillRetryContext } from "./retry.ts";
@@ -249,8 +250,9 @@ export class ConsolidationCoordinator {
 
   #now(): number { return this.#options.now?.() ?? Date.now(); }
 
-  #retryContext(path: string, context = this.#context): Promise<DistillRetryContext> {
-    return withSourceAccess(this.#options.openStore, path, async () => distillRetryContext(path, context?.model), this.#controller?.signal);
+  #retryContext(path: string, selection: ConsolidationSelection): Promise<DistillRetryContext> {
+    return withSourceAccess(this.#options.openStore, path,
+      async () => distillRetryContext(path, selection.model, selection.reasoning), this.#controller?.signal);
   }
 
   #database(): SQLiteMemoryStore { return this.#store ??= this.#options.openStore(); }
@@ -315,7 +317,7 @@ export class ConsolidationCoordinator {
 
   #kick(): void {
     const context = this.#context;
-    if (this.#closed || this.#working || !context?.model) return;
+    if (this.#closed || this.#working || !context) return;
     if (this.#options.hasStore && !this.#options.hasStore() && !this.#store) return;
     if (!this.#canRun(context)) {
       if (this.#recoveryNeeded || this.#hasQueuedWork()) this.#retryWhenIdle();
@@ -447,7 +449,7 @@ export class ConsolidationCoordinator {
   }
 
   #retry(): void {
-    if (this.#closed || this.#timer || !this.#context?.model) return;
+    if (this.#closed || this.#timer || !this.#context) return;
     let delay = this.#sourceWorkPending ? 100 : 30_000;
     if (!this.#sourceWorkPending) {
       try { delay = this.#database().distillWakeDelay(this.#now()); } catch { /* Retry storage availability on the normal bounded poll. */ }
@@ -460,7 +462,7 @@ export class ConsolidationCoordinator {
   }
 
   #retryWhenIdle(): void {
-    if (this.#closed || this.#timer || !this.#context?.model) return;
+    if (this.#closed || this.#timer || !this.#context) return;
     const delay = this.#idleRetryMs;
     this.#idleRetryMs = Math.min(MAX_IDLE_RETRY_MS, this.#idleRetryMs * 2);
     this.#timer = setTimeout(() => {
@@ -488,8 +490,9 @@ export class ConsolidationCoordinator {
 
   async #runPass(context: Context, signal: AbortSignal): Promise<void> {
     this.#sourceWorkPending = false;
+    const selection = selectConsolidationModel(context);
     if (this.#recoveryNeeded) {
-      await this.#recover(signal);
+      await this.#recover(signal, selection);
       if (!this.#recoveryNeeded && !signal.aborted) this.observe(context);
     }
     if (signal.aborted || !this.#canRun(context)) return;
@@ -510,7 +513,7 @@ export class ConsolidationCoordinator {
         if (signal.aborted || !this.#canRun(context)) return;
         const key = JSON.stringify([candidate.kind, candidate.id]);
         if (visited.has(key)) continue;
-        const retryContext = await this.#retryContext(candidate.sessionFile ?? "", context);
+        const retryContext = await this.#retryContext(candidate.sessionFile ?? "", selection);
         if (signal.aborted || !this.#canRun(context)) return;
         const selected = store.claimScheduledDistill(candidate, {
           retryContext, workerId: this.#workerId, now: this.#now(),
@@ -523,7 +526,7 @@ export class ConsolidationCoordinator {
         this.#startClaim(store, selected.claim.claimToken);
         try {
           if (selected.kind === "job") {
-            await this.#processJob(selected.claim.job, selected.claim.claimToken, context, signal, store, retryContext);
+            await this.#processJob(selected.claim.job, selected.claim.claimToken, context, selection, signal, store, retryContext);
           } else {
             await this.#prepareTrigger(selected.claim.trigger, selected.claim.claimToken, retryContext, signal);
           }
@@ -544,7 +547,7 @@ export class ConsolidationCoordinator {
     this.#sourceWorkPending = !busy && (recoveryWorkPending || !backfilled || store.readyDistillWork(this.#now()));
   }
 
-  async #recover(signal: AbortSignal): Promise<void> {
+  async #recover(signal: AbortSignal, selection: ConsolidationSelection): Promise<void> {
     const store = this.#database();
     let unresolved = false;
     const triggerPage = store.listDistillTriggers({
@@ -555,7 +558,7 @@ export class ConsolidationCoordinator {
     for (const trigger of triggerPage.items) {
       if (signal.aborted) return;
       if (trigger.status !== "candidate") continue;
-      const retryContext = await this.#retryContext(trigger.sessionFile);
+      const retryContext = await this.#retryContext(trigger.sessionFile, selection);
       const claim = store.claimDistillTrigger({
         id: trigger.id, allowCandidate: true, retryContext,
         workerId: this.#workerId, now: this.#now(), leaseMs: this.#options.claimLeaseMs ?? DEFAULT_CLAIM_LEASE_MS
@@ -698,6 +701,7 @@ export class ConsolidationCoordinator {
     job: ConsolidationJob,
     claimToken: string,
     context: Context,
+    selection: ConsolidationSelection,
     signal: AbortSignal,
     store: SQLiteMemoryStore,
     retryContext: DistillRetryContext,
@@ -714,6 +718,10 @@ export class ConsolidationCoordinator {
         this.#notifyProgress();
         return;
       }
+      stage = "distill.model";
+      if (selection.error) throw selection.error;
+      const { model, reasoning } = selection;
+      stage = "distill.prepare";
       const sourceFile = job.sessionFile;
       if (typeof sourceFile !== "string" || sourceFile.length === 0) throw new DistillFailure("source_invalid", "A durable source file is unavailable.");
       const snapshot = await this.#load(sourceFile, job.leafId);
@@ -750,26 +758,27 @@ export class ConsolidationCoordinator {
       let batch: SourceBatch | undefined;
       for (let count = 1; count <= evidence.length; count++) {
         const candidate = makeBatch(evidence.slice(0, count));
-        if (!fitsConsolidationRequest(candidate, context.model, { reserveRetrieval: true })) break;
+        if (!fitsConsolidationRequest(candidate, model, { reserveRetrieval: true })) break;
         batch = candidate;
       }
       if (!batch) {
         const first = makeBatch(evidence.slice(0, 1));
-        if (fitsConsolidationRequest(first, context.model)) batch = first;
+        if (fitsConsolidationRequest(first, model)) batch = first;
       }
       if (!batch) throw new DistillFailure("model_unavailable", "The selected model cannot fit one source part and the required consolidation request.");
       for (const part of preceding.reverse()) {
         const interpretation = [part, ...batch.context];
         if (Buffer.byteLength(JSON.stringify(interpretation)) > CONTEXT_BYTES) break;
         const candidate: SourceBatch = { ...batch, context: interpretation };
-        if (!fitsConsolidationRequest(candidate, context.model, { reserveRetrieval: true })) break;
+        if (!fitsConsolidationRequest(candidate, model, { reserveRetrieval: true })) break;
         batch = candidate;
       }
       await this.#waitUntilIdle(signal);
       signal.throwIfAborted();
       const run = this.#options.runModel ?? consolidateWithModel;
       const changes = await abortable(
-        run(batch, context, store, signal, {
+        run(batch, { model, modelRegistry: context.modelRegistry }, store, signal, {
+          ...(reasoning === undefined ? {} : { reasoning }),
           ...(this.#options.diagnostics ? {diagnostics:this.#options.diagnostics} : {}),
           waitUntilIdle: requestSignal => this.#waitUntilIdle(requestSignal),
           ...(view ? { isSiblingOrigin: origin => view.isSibling(origin) } : {})
@@ -791,7 +800,7 @@ export class ConsolidationCoordinator {
       if (!signal.aborted && !(error instanceof SourceWorkPending)) diagnose(this.#options.diagnostics, {
         operation:stage,outcome:error instanceof DistillFailure && ["model_unavailable","model_budget"].includes(error.reason)?"blocked":"failed",
         task:job.id,source:job.sessionId,error,durationMs:performance.now()-started,
-        ...(context.model ? {model:context.model.id} : {}),
+        ...(selection.model ? {model:selection.model.id} : {}),
         ...(error instanceof DistillFailure ? {reason:error.reason,...(error.retryAfterMs===undefined?{}:{retryAfterMs:error.retryAfterMs})} : {}),
       });
       if (!this.#closed) this.#releaseClaim(store, claimToken, error, retryContext, signal);

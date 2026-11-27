@@ -82,6 +82,76 @@ test('allows a valid no-change result without issuing user-visible memory comman
   );
 });
 
+test('requests short caching with a stable private scope and prefix across tool rounds', async t => {
+  const store = await fixture(t);
+  let prefix;
+  let cacheScope;
+  const registry = scriptedRegistry([
+    response('toolUse', toolCall('memory_search', { terms: ['synthetic'] })),
+    textResponse('{"operations":[]}'),
+  ], ({ request, options, current }) => {
+    assert.equal(options.cacheRetention, 'short');
+    assert.equal(Object.hasOwn(options, 'reasoning'), false);
+    assert.ok(options.sessionId);
+    const initial = { ...request, messages: request.messages.slice(0, 1) };
+    if (current === 0) {
+      prefix = structuredClone(initial);
+      cacheScope = options.sessionId;
+    } else {
+      assert.deepEqual(initial, prefix);
+      assert.equal(options.sessionId, cacheScope);
+    }
+  });
+  await consolidateWithModel(sourceBatch(), modelContext(registry), store, new AbortController().signal);
+  assert.equal(registry.calls, 2);
+  const next = scriptedRegistry([textResponse('{"operations":[]}')], ({ options }) => {
+    assert.notEqual(options.sessionId, cacheScope);
+  });
+  await consolidateWithModel(sourceBatch(), modelContext(next), store, new AbortController().signal);
+});
+
+test('consolidation permits complete previews for no change but requires a provenance read before mutation', async t => {
+  const store = await fixture(t);
+  store.save({ id: 'preference', content: 'The user prefers concise explanations.', createdAt: time });
+  const search = response('toolUse', toolCall('memory_search', { terms: ['concise'] }));
+  const registry = scriptedRegistry([search, textResponse('{"operations":[]}')], ({ current, request }) => {
+    if (current === 0) {
+      assert.match(request.systemPrompt, /preview.*omittedBefore.*omittedAfter.*false/u);
+      assert.match(request.systemPrompt, /before.*(?:update|delete).*memory_read|memory_read.*before.*(?:update|delete)/iu);
+    } else {
+      const [candidate] = JSON.parse(request.messages.at(-1).content[0].text).candidates;
+      assert.deepEqual(candidate.preview, { text: 'The user prefers concise explanations.', omittedBefore: false, omittedAfter: false });
+    }
+  });
+  assert.deepEqual(await consolidateWithModel(sourceBatch(), modelContext(registry), store, new AbortController().signal),
+    { creates: [], updates: [], deletes: [] });
+  for (const action of ['update', 'delete']) {
+    const operation = { action, id: 'preference', expectedRevision: 1, sourceKeys: ['source-1'],
+      ...(action === 'update' ? { content: 'Changed preference.' } : {}) };
+    await assert.rejects(consolidateWithModel(sourceBatch(), modelContext(scriptedRegistry([
+      search, textResponse(JSON.stringify({ operations: [operation] })),
+    ])), store, new AbortController().signal), /fully read at the same current revision/u);
+  }
+});
+
+test('provider-signed reasoning and text survive an explicitly configured thinking round trip', async t => {
+  const store = await fixture(t);
+  const signed = [
+    { type: 'thinking', thinking: '', thinkingSignature: 'opaque-encrypted-content', redacted: true },
+    { type: 'text', text: 'I will check the memory.', textSignature: 'opaque-text-signature' },
+    toolCall('memory_search', { terms: ['synthetic'] }),
+  ];
+  let calls = 0;
+  const registry = { streamSimple(_model, request, options) {
+    assert.equal(options.reasoning, 'low');
+    if (calls++ === 0) return { result: async () => response('toolUse', signed) };
+    assert.deepEqual(request.messages.at(-2).content, signed);
+    return { result: async () => textResponse('{"operations":[]}') };
+  } };
+  await consolidateWithModel(sourceBatch(), modelContext(registry), store, new AbortController().signal, { reasoning: 'low' });
+  assert.equal(calls, 2);
+});
+
 test('long evidence identities use short unambiguous model references without changing durable source keys', async () => {
   const key = 'a'.repeat(64);
   const batch = sourceBatch([
@@ -106,7 +176,23 @@ test('long evidence identities use short unambiguous model references without ch
 test('a mistyped long evidence citation is rejected rather than matched approximately', async () => {
   const key = 'a'.repeat(64);
   const registry = scriptedRegistry([textResponse(JSON.stringify({operations:[{action:'create',content:'A proposed policy.',sourceKeys:[key.slice(0,-1)]}]}))]);
-  await assert.rejects(consolidateWithModel(sourceBatch([{key,entryId:'entry',role:'user',text:'A confirmed policy.'}]),modelContext(registry),{},new AbortController().signal));
+  await assert.rejects(consolidateWithModel(sourceBatch([{key,entryId:'entry',role:'user',text:'A confirmed policy.'}]),modelContext(registry),{},new AbortController().signal),
+    { message: 'An operation cited an unknown or repeated source key.' });
+});
+
+test('citations accept only exact wire keys, not original digests, context keys, or repeated aliases', async () => {
+  const digest = 'a'.repeat(64);
+  const batch = sourceBatch([
+    { key: digest, entryId: 'entry-1', role: 'user', text: 'A durable preference.' },
+    { key: 'short', entryId: 'entry-2', role: 'user', text: 'A durable exception.' },
+  ], [{ key: 'e1', entryId: 'entry-3', role: 'user', text: 'Older context.' }]);
+  for (const keys of [[digest], ['e1'], ['e2', 'e2'], ['E2']]) {
+    const registry = scriptedRegistry([textResponse(JSON.stringify({
+      operations: [{ action: 'create', content: 'A proposed policy.', sourceKeys: keys }],
+    }))]);
+    await assert.rejects(consolidateWithModel(batch, modelContext(registry), {}, new AbortController().signal),
+      { message: 'An operation cited an unknown or repeated source key.' });
+  }
 });
 
 test('consolidation exposes literal-miss feedback and accepts a correction after broader search and full read', async t => {

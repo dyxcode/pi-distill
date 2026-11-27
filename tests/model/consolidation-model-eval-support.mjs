@@ -107,7 +107,12 @@ function associatedDayValues(parts, defaultCue, incidentCue) {
   ];
   for (const part of parts) {
     const foundCues = cues.flatMap(({ kind, pattern }) =>
-      [...part.matchAll(pattern)].map((match) => ({ kind, index: match.index ?? 0 })),
+      [...part.matchAll(pattern)].flatMap((match) => {
+        const index = match.index ?? 0;
+        // "An exception to the default" references a base policy; it does not state its duration.
+        if (kind === "default" && /\bexceptions?\s+(?:to|from)\s+(?:(?:the|its)\s+)?$/iu.test(part.slice(0, index))) return [];
+        return [{ kind, index }];
+      }),
     );
     for (const duration of part.matchAll(allDayCounts)) {
       const durationValue = Number(duration[1]);
@@ -188,6 +193,34 @@ export function assessRecall(answer, results, { memory, ...policy }) {
     });
   });
   return { accepted: signals.matchesDefault && signals.preservesIncidentException && evidenceFound, signals, evidenceFound };
+}
+
+// Synthetic fixture-specific checks; the exact canaries detect copied rows and stale state.
+export function assessMemoryQuality(records, seeds) {
+  const [snapshot, pilot] = seeds;
+  const issues = [];
+  const currentSnapshot = records.find(record => record.id === snapshot.id);
+  if (currentSnapshot?.revision !== snapshot.revision || currentSnapshot.content !== snapshot.content) {
+    issues.push('bilingual_original_changed');
+  }
+  if (records.some(record => record.id !== snapshot.id && /weekly\s+(?:backup\s+)?snapshots?|每周.{0,4}快照/iu.test(record.content))) {
+    issues.push('bilingual_duplicate');
+  }
+  const current = records.find(record => record.id === pilot.id);
+  if (current?.revision !== pilot.revision + 1 || !/#rollout-silver\b/iu.test(current.content) ||
+      !/(?:two|2)[\s-]+reviewers?|(?:两|2)\s*(?:名|位)?\s*审阅/iu.test(current.content)) {
+    issues.push('current_conditions_missing');
+  }
+  if (records.some(record => /#pilot-amber\b/iu.test(record.content))) issues.push('superseded_detail');
+  const pointers = records.filter(record => record.id !== pilot.id && record.id !== snapshot.id &&
+    record.content.includes('Ops/Quartz-readings.md'));
+  if (pointers.length !== 1 || !/confirm|verif|确认|核实/iu.test(pointers[0]?.content ?? '')) issues.push('canonical_pointer_missing');
+  if (records.some(record => /73\.625|62\.875|2026-04-11|2026-04-12/u.test(record.content))) issues.push('duplicated_canonical_data');
+  if (records.some(record => /was deployed|restarted|entered and verified|no reading (?:was )?(?:supplied|provided)|重启|未提供读数/iu.test(record.content))) {
+    issues.push('operational_diary');
+  }
+  if (records.length !== 3) issues.push('unexpected_memory_count');
+  return { accepted: issues.length === 0, issues };
 }
 
 function sanitizeString(value) {
