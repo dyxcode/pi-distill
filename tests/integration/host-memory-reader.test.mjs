@@ -47,6 +47,34 @@ test("host reader is exported and searches literal bilingual text with bounded p
   assert.throws(() => r.search({ query: "x".repeat(129) }), { code: "invalid_input" });
   assert.throws(() => r.search({ query: "SQLite", limit: 21 }), { code: "invalid_input" });
 });
+test("recent memories page by update time and then ascending ID", async (t) => {
+  const f = await fixture(t);
+  const r = f.open();
+  assert.deepEqual(r.list(), { items: [] });
+  f.save("z", "old");
+  f.save("b", "second");
+  f.save("a", "first");
+  const updatedAt = "2026-11-18T00:00:00.000Z";
+  f.writer.update({ id: "z", expectedRevision: 1, content: "知识😀".repeat(200), updatedAt });
+  const first = r.list({ limit: 2 });
+  assert.deepEqual(first.items, [
+    { id: "z", revision: 2, updatedAt, preview: [..."知识😀".repeat(200)].slice(0, 500).join("") },
+    { id: "a", revision: 1, updatedAt: createdAt, preview: "first" },
+  ]);
+  assert.ok(first.nextCursor);
+  assert.deepEqual(r.list({ cursor: first.nextCursor }), {
+    items: [{ id: "b", revision: 1, updatedAt: createdAt, preview: "second" }],
+  });
+  for (const limit of [0, 21, 1.5, null]) assert.throws(() => r.list({ limit }), { code: "invalid_input" });
+  const search = r.search({ query: "s", limit: 1 });
+  assert.ok(search.nextCursor);
+  for (const cursor of ["", "invalid", first.nextCursor + "x", search.nextCursor])
+    assert.throws(() => r.list({ cursor }), { code: "invalid_cursor" });
+  assert.throws(() => f.open().list({ cursor: first.nextCursor }), { code: "invalid_cursor" });
+  assert.throws(() => r.search({ query: "first", cursor: first.nextCursor }), { code: "invalid_cursor" });
+  r.close();
+  assert.throws(() => r.list(), { code: "memory_unavailable" });
+});
 test("search resumes after an empty bounded scan and never loses matching rows at a limit", async (t) => {
   const f = await fixture(t);
   for (let i = 0; i < 140; i++) f.save(String(i).padStart(3, "0"), i >= 129 ? "needle" : "noise");
@@ -119,6 +147,7 @@ test("reader opens only existing compatible stores and does not mutate data", as
   const before = await readFile(f.path);
   const r = f.open();
   r.search({ query: "content" });
+  assert.equal(r.list().items[0].id, "a");
   r.read({ id: "a", expectedRevision: 1 });
   r.close();
   assert.deepEqual(await readFile(f.path), before);

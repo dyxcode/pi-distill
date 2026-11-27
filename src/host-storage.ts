@@ -198,4 +198,4 @@ export function openHostStorageV1(databasePath: string): HostStorageV1 {
   return new HostStorage(databasePath);
 }
 
-export { openMemoryReaderV1, HostMemoryError, type HostMemoryReaderV1, type HostMemorySearchRequestV1, type HostMemorySearchResponseV1, type HostMemoryReadRequestV1, type HostMemoryReadResponseV1 } from "./memory/host-reader.ts";
+export { openMemoryReaderV1, HostMemoryError, type HostMemoryReaderV1, type HostMemoryListRequestV1, type HostMemoryListItemV1, type HostMemoryListResponseV1, type HostMemorySearchRequestV1, type HostMemorySearchResponseV1, type HostMemoryReadRequestV1, type HostMemoryReadResponseV1 } from "./memory/host-reader.ts";

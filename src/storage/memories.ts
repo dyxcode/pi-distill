@@ -114,6 +114,20 @@ export class Memories {
     return row === undefined ? undefined : parseMemory(this.connection.decodeRow(row));
   }
 
+  listRecent(limit: number, after?: Pick<Memory, "updatedAt" | "id">): readonly Memory[] {
+    this.connection.ensureOpen();
+    const statement = this.connection.database.prepare(`
+      SELECT ${memoryColumns} FROM memories
+      ${after ? "WHERE updated_at < ? OR (updated_at = ? AND id COLLATE BINARY > ?)" : ""}
+      ORDER BY updated_at DESC, id COLLATE BINARY ASC
+      LIMIT ?
+    `);
+    const rows = after
+      ? statement.all(after.updatedAt, after.updatedAt, after.id, limit)
+      : statement.all(limit);
+    return rows.map((row) => parseMemory(this.connection.decodeRow(row)));
+  }
+
   searchBatch(request: MemorySearchRequest): readonly MemorySearchRow[] {
     this.connection.ensureOpen();
     const search = parseSearchRequest(request);

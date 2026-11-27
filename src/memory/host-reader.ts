@@ -17,6 +17,17 @@ export interface HostMemorySearchResponseV1 {
   readonly items: readonly HostMemorySearchItemV1[];
   readonly nextCursor?: string;
 }
+export interface HostMemoryListRequestV1 {
+  readonly cursor?: string;
+  readonly limit?: number;
+}
+export interface HostMemoryListItemV1 extends HostMemorySearchItemV1 {
+  readonly updatedAt: string;
+}
+export interface HostMemoryListResponseV1 {
+  readonly items: readonly HostMemoryListItemV1[];
+  readonly nextCursor?: string;
+}
 export interface HostMemoryReadRequestV1 {
   readonly id: string;
   readonly expectedRevision: number;
@@ -30,6 +41,7 @@ export interface HostMemoryReadResponseV1 {
 }
 export interface HostMemoryReaderV1 {
   readonly version: 1;
+  list(request?: HostMemoryListRequestV1): HostMemoryListResponseV1;
   search(request: HostMemorySearchRequestV1): HostMemorySearchResponseV1;
   read(request: HostMemoryReadRequestV1): HostMemoryReadResponseV1;
   close(): void;
@@ -133,6 +145,35 @@ class HostMemoryReader implements HostMemoryReaderV1 {
     } catch {
       return fail("invalid_cursor");
     }
+  }
+  list(input: HostMemoryListRequestV1 = {}): HostMemoryListResponseV1 {
+    const request = object(input, ["cursor", "limit"]);
+    const limit = request["limit"] === undefined ? 20 : request["limit"];
+    if (typeof limit !== "number" || !Number.isSafeInteger(limit) || limit < 1 || limit > 20)
+      fail("invalid_input");
+    const cursor = optionalCursor(request["cursor"]);
+    let after: { updatedAt: string; id: string } | undefined;
+    if (cursor) {
+      const decoded = this.#decode(cursor);
+      const { kind, updatedAt, id } = decoded;
+      if (kind !== "list" || typeof updatedAt !== "string" || typeof id !== "string")
+        fail("invalid_cursor");
+      after = { updatedAt, id };
+    }
+    return this.#execute(() => {
+      const rows = this.#memories.listRecent(limit + 1, after);
+      const items = rows.slice(0, limit).map(({ id, revision, content, updatedAt }) => {
+        if ([...id].length > 512) fail("memory_unavailable");
+        return { id, revision, updatedAt, preview: [...content].slice(0, 500).join("") };
+      });
+      const last = items.at(-1);
+      return {
+        items,
+        ...(rows.length > limit && last
+          ? { nextCursor: this.#encode({ kind: "list", updatedAt: last.updatedAt, id: last.id }) }
+          : {}),
+      };
+    });
   }
   search(input: HostMemorySearchRequestV1): HostMemorySearchResponseV1 {
     const request = object(input, ["query", "cursor", "limit"]);
